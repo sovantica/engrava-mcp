@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev, "release/**"]
+  pull_request:
+    branches: [main, dev, "release/**"]
+
+permissions:
+  contents: read
+
+# ---------------------------------------------------------------------------
+# engrava dependency resolution
+# ---------------------------------------------------------------------------
+# engrava-mcp depends on `engrava>=0.5,<0.6` (and the `engrava[vec]` extra).
+# engrava 0.5.0 is published on PyPI, so every job installs the package normally
+# with `pip install -e ".[dev]"`, which resolves engrava (and engrava[vec]) from
+# PyPI. CI therefore exercises the exact install path a real user gets.
+#
+# HARDENING (H2, follow-up — not implemented yet): add a job that resolves the
+# LATEST in-range engrava from PyPI side by side with the pinned resolution, so a
+# stability-guarantee violation in an engrava 0.5.x patch is caught early.
+# ---------------------------------------------------------------------------
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: Ruff check
+        run: ruff check src/ tests/
+      - name: Ruff format
+        run: ruff format --check src/ tests/
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: Mypy
+        run: mypy --strict src/
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: Run tests
+        run: pytest --cov --cov-fail-under=90 -q

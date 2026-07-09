@@ -1,3 +1,5 @@
+<!-- mcp-name: ai.sovantica/engrava -->
+
 # Engrava MCP
 
 **The [Model Context Protocol](https://modelcontextprotocol.io) server for

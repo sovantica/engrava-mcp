@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "engrava-mcp"
-version = "0.5.0"
+version = "0.5.1"
 description = "Model Context Protocol server for Engrava — expose an agent memory database to any MCP client over stdio."
 readme = "README.md"
 license = {text = "MIT"}

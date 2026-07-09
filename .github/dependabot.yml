@@ -29,3 +29,9 @@ updates:
     commit-message:
       prefix: "chore"
       include: scope
+    # Batch all GitHub Actions bumps into a single PR instead of one per action,
+    # so routine maintenance lands as one review rather than a stream of PRs.
+    groups:
+      github-actions:
+        patterns:
+          - "*"

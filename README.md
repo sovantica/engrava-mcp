@@ -2,6 +2,11 @@
 
 # Engrava MCP
 
+[![CI](https://github.com/sovantica/engrava-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/sovantica/engrava-mcp/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/engrava-mcp.svg)](https://pypi.org/project/engrava-mcp/)
+[![Python](https://img.shields.io/pypi/pyversions/engrava-mcp.svg)](https://pypi.org/project/engrava-mcp/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 **The [Model Context Protocol](https://modelcontextprotocol.io) server for
 [Engrava](https://github.com/sovantica/engrava)** — expose an agent memory
 database to any MCP client (Claude Desktop, Claude Code, Cursor, Windsurf,

@@ -1,0 +1,70 @@
+# Branching — engrava-mcp
+
+This repository uses a three-tier `<type>/<kebab-description> → release/vX.Y.Z → main`
+flow with a **manual, tag-triggered release**. There is **no `dev` branch and no
+semantic-release**: the version is set by hand in `pyproject.toml` (and `server.json`),
+`CHANGELOG.md` is hand-maintained, and a maintainer-created `vX.Y.Z` tag **on `main`**
+is what triggers the publish workflow.
+
+## Branches
+
+| Branch | Role | Who pushes |
+|---|---|---|
+| `main` | Stable mirror — the branch users land on when cloning, and the branch releases are tagged from. Updated only by forward-merging the active `release/vX.Y.Z` branch once a version is ready; `main` never originates a release on its own. | Maintainers (via PR) |
+| `release/v<X.Y.Z>` | The active integration and stabilisation branch for the next version, and the default PR target while that version is in preparation. Feature branches are squash-merged here; when the version is ready it is forward-merged into `main`. | Maintainers |
+| `<type>/<kebab-description>` | Feature, fix, chore, docs branches. | Contributors |
+
+## Feature / fix / chore branch naming
+
+- Format: `<type>/<kebab-description>`
+- Type values: `feature`, `fix`, `chore`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `revert`, `content` (matches Conventional Commits types).
+- Description: plain English, kebab-case, ≤ 50 chars total.
+- No internal-looking identifiers. No abbreviations that wouldn't make sense to a first-time reader.
+
+### Examples
+
+| Type | Branch | Conventional Commit subject |
+|---|---|---|
+| Feature | `feature/priority-signal-hybrid-search` | `feat(dreaming): add priority signal to hybrid search` |
+| Bug fix | `fix/empty-count-on-mindql` | `fix(mindql): handle empty COUNT result without error` |
+| Docs | `docs/quickstart-update` | `docs(quickstart): clarify install steps for fresh venv` |
+| Chore | `chore/bump-ruff-to-0.8` | `chore: bump ruff to 0.8` |
+
+## Flow
+
+```
+                ┌───────────────────────┐
+                │  <type>/<description>  │   contributor branches
+                └───────────┬───────────┘
+                            │  PR (squash)
+                            ▼
+                ┌───────────────────────┐
+                │     release/vX.Y.Z     │   active integration branch (default PR target)
+                └───────────┬───────────┘
+                            │  forward-merge, when the version is ready
+                            ▼
+                ┌───────────────────────┐
+                │          main          │   stable trunk
+                └───────────┬───────────┘
+                            │  maintainer creates the vX.Y.Z tag ON main
+                            ▼
+                ┌───────────────────────┐
+                │    publish workflow    │   build → PyPI → MCP Registry
+                └───────────────────────┘
+```
+
+## Pull request expectations
+
+- PRs target the active `release/vX.Y.Z` branch (not `main` directly). `main` is updated only by forward-merging that branch once the version is ready.
+- CI must be green before review.
+- Commits in the PR use Conventional Commits format.
+- Squash-merge by default unless a maintainer requests preserving commit history.
+- PR description explains *why* (the diff shows *what*). Keep it concise.
+
+## Releases
+
+Releasing is manual — there is no semantic-release:
+
+1. Set the version by hand in `pyproject.toml` (and `server.json`) and add the release's hand-written `CHANGELOG.md` section (Keep a Changelog format).
+2. Forward-merge the active `release/vX.Y.Z` branch into `main`.
+3. Create the matching `vX.Y.Z` tag **on `main`**. Pushing that tag runs the publish workflow (build → PyPI → MCP Registry).

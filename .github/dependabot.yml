@@ -1,0 +1,31 @@
+# Dependabot — version-updates config
+# See: https://docs.github.com/code-security/dependabot/dependabot-version-updates
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore"
+      include: scope
+    ignore:
+      # engrava is pinned to a deliberate one-way mirror range (engrava>=0.5,<0.6);
+      # the range is widened by hand only after the new engrava minor is tested.
+      # Dependabot must not try to bump engrava out of that range.
+      - dependency-name: "engrava"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+      include: scope

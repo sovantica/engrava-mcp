@@ -1,0 +1,164 @@
+# Manual, tag-triggered release pipeline for engrava-mcp.
+#
+# The version is set by hand in pyproject.toml + server.json; a maintainer
+# creates the matching vX.Y.Z tag on `main`, and pushing that tag runs this
+# workflow. There is NO semantic-release here — the version mirrors the engrava
+# library it wraps and is not computed from commit history.
+#
+# The jobs run STRICTLY IN SEQUENCE (guard -> build -> pypi-publish -> verify
+# -> registry-publish). This ordering is load-bearing: the MCP Registry
+# validates that the referenced PyPI package version actually exists, so the
+# registry entry must not be published until the PyPI package is live and
+# visible. Running the two publishes off the same tag in parallel would race.
+#
+# This file MUST stay named `release.yml`: the PyPI Trusted Publisher is bound
+# to this workflow filename plus the `pypi` environment.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Provenance guard: refuse to release a tag that is not on `main`.
+  #    There is no manual-approval reviewer on this repo, so this is the gate
+  #    that keeps an off-branch tag from publishing.
+  # ---------------------------------------------------------------------------
+  guard:
+    name: Verify tag is on main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Assert tag version matches pyproject.toml and server.json
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          PYPROJECT_VERSION="$(grep -E '^version = ' pyproject.toml | head -1 | sed -E 's/^version = "(.*)"/\1/')"
+          SERVER_VERSION="$(jq -r '.version' server.json)"
+          echo "tag=${TAG_VERSION} pyproject=${PYPROJECT_VERSION} server.json=${SERVER_VERSION}"
+          if [ "$TAG_VERSION" != "$PYPROJECT_VERSION" ]; then
+            echo "::error::tag v${TAG_VERSION} != pyproject ${PYPROJECT_VERSION}"
+            exit 1
+          fi
+          if [ "$TAG_VERSION" != "$SERVER_VERSION" ]; then
+            echo "::error::tag v${TAG_VERSION} != server.json ${SERVER_VERSION}"
+            exit 1
+          fi
+          echo "OK: tag, pyproject.toml, and server.json all agree on ${TAG_VERSION}."
+      - name: Fetch main
+        run: git fetch origin refs/heads/main:refs/remotes/origin/main
+      - name: Assert the tagged commit is reachable from main
+        run: |
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "OK: $GITHUB_SHA is reachable from origin/main."
+          else
+            echo "::error::Tagged commit $GITHUB_SHA is not on origin/main; refusing to release."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # 2. Build sdist + wheel. Does not need engrava installed.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build sdist + wheel
+    needs: [guard]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install build backend
+        run: python -m pip install --upgrade build
+      - name: Build distributions
+        run: python -m build
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 3. Publish to PyPI via OIDC Trusted Publishing (no API token).
+  #    `environment: pypi` + `id-token: write` are both mandatory: the PyPI
+  #    pending Trusted Publisher is bound to workflow `release.yml` + env `pypi`.
+  # ---------------------------------------------------------------------------
+  pypi-publish:
+    name: Publish to PyPI
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  # ---------------------------------------------------------------------------
+  # 4. Verify the package is actually visible on PyPI before touching the
+  #    registry. Poll the JSON API with a capped backoff.
+  # ---------------------------------------------------------------------------
+  verify:
+    name: Verify package on PyPI
+    needs: [pypi-publish]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Poll PyPI for the released version
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          URL="https://pypi.org/pypi/engrava-mcp/${VERSION}/json"
+          echo "Waiting for engrava-mcp==${VERSION} at ${URL}"
+          delay=10
+          for attempt in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$URL")
+            if [ "$code" = "200" ]; then
+              echo "engrava-mcp==${VERSION} is visible on PyPI (attempt ${attempt})."
+              exit 0
+            fi
+            echo "Attempt ${attempt}: HTTP ${code}; retrying in ${delay}s..."
+            sleep "$delay"
+            if [ "$delay" -lt 30 ]; then
+              delay=$((delay + 5))
+            fi
+          done
+          echo "::error::engrava-mcp==${VERSION} did not become visible on PyPI in time."
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  # 5. Publish the server entry to the MCP Registry (DNS auth). Only runs once
+  #    the PyPI package is confirmed live, so the registry's package-existence
+  #    validation always passes. The namespace ai.sovantica/* is verified by a
+  #    TXT record on the apex of sovantica.ai; the Ed25519 private key is the
+  #    repo secret MCP_DNS_PRIVATE_KEY.
+  # ---------------------------------------------------------------------------
+  registry-publish:
+    name: Publish to MCP Registry
+    needs: [verify]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+      - name: Sync server.json version to the release tag
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          jq --arg v "$VERSION" '.version = $v | (.packages[] | .version) = $v' server.json > server.tmp
+          mv server.tmp server.json
+      - name: Authenticate to MCP Registry (DNS)
+        run: ./mcp-publisher login dns --domain sovantica.ai --private-key "$MCP_DNS_PRIVATE_KEY"
+        env:
+          MCP_DNS_PRIVATE_KEY: ${{ secrets.MCP_DNS_PRIVATE_KEY }}
+      - name: Publish server to MCP Registry
+        run: ./mcp-publisher publish

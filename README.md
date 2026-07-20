@@ -36,10 +36,11 @@ are independent.
 | engrava-mcp | Works with engrava |
 |---|---|
 | `0.5.x` | `>=0.5,<0.6` |
+| `0.6.x` | `>=0.6,<0.7` |
 
 The dependency range is the source of truth. Normal installs resolve a compatible
 `engrava` automatically; if you pin `engrava` yourself, keep it within that range. If no
-matching `engrava-mcp` exists yet for a newer `engrava` (e.g. a fresh `engrava 0.6`), that
+matching `engrava-mcp` exists yet for a newer `engrava` (e.g. a fresh `engrava 0.7`), that
 pairing is **not yet verified/supported** — not broken; stay on a supported pair until a
 matching `engrava-mcp` ships.
 

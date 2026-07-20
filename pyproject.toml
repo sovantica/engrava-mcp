@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "engrava-mcp"
-version = "0.5.1"
+version = "0.6.0"
 description = "Model Context Protocol server for Engrava — expose an agent memory database to any MCP client over stdio."
 readme = "README.md"
 license = {text = "MIT"}
@@ -28,9 +28,10 @@ classifiers = [
 
 dependencies = [
     # Same-minor range on engrava's public API (engrava guarantees no breaking
-    # change within an X.Y.x patch range). 0.5.0 is the first release that ships
-    # engrava as a pure library with the public API this server consumes.
-    "engrava>=0.5,<0.6",
+    # change within an X.Y.x patch range). 0.6.0 is the first release carrying
+    # the public API this server's 0.6 surface consumes (edge reads, edge
+    # metadata, transaction-time recency).
+    "engrava>=0.6,<0.7",
     # Cap the MCP SDK major so a future incompatible release can't silently
     # break `uvx engrava-mcp`; widen only after testing a new major. mcp>=1.27
     # transitively constrains pydantic>=2.11,<3 (the floor engrava also targets).
@@ -40,7 +41,7 @@ dependencies = [
     # so semantic search and OpenAI/Ollama embeddings work out of the box once
     # an embedding provider is declared in engrava.yaml. Heavy local providers
     # (torch / sentence-transformers, HuggingFace Hub) stay opt-in extras.
-    "engrava[vec]>=0.5,<0.6",
+    "engrava[vec]>=0.6,<0.7",
     "httpx>=0.27.0",
 ]
 
@@ -48,10 +49,10 @@ dependencies = [
 # Mirror engrava's embedding-provider extras so users can install the matching
 # provider dependencies alongside the server, e.g.
 # `uvx --from "engrava-mcp[local]" engrava-mcp`.
-openai = ["engrava[embeddings-openai]>=0.5,<0.6"]
-ollama = ["engrava[embeddings-ollama]>=0.5,<0.6"]
-hf = ["engrava[embeddings-hf]>=0.5,<0.6"]
-local = ["engrava[embeddings-local]>=0.5,<0.6"]
+openai = ["engrava[embeddings-openai]>=0.6,<0.7"]
+ollama = ["engrava[embeddings-ollama]>=0.6,<0.7"]
+hf = ["engrava[embeddings-hf]>=0.6,<0.7"]
+local = ["engrava[embeddings-local]>=0.6,<0.7"]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",

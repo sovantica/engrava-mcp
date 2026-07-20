@@ -102,6 +102,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager
@@ -185,6 +186,13 @@ DEFAULT_LIST_LIMIT = 50
 #: better default over the wire than a bulk dump.  Callers that genuinely want
 #: more can raise ``limit`` explicitly.
 DEFAULT_EDGE_LIST_LIMIT = 100
+
+#: A metadata-filter key accepted on ``list_edges``.  The thin surface accepts
+#: only simple, top-level field names — a dotted or bracketed key (``a.b``,
+#: ``tags[0]``) would build a nested engrava JSONPath (``$.a.b``, ``$.tags[0]``)
+#: and reach nested metadata the MCP surface deliberately does not support, so
+#: it is rejected at the boundary before any path is constructed.
+METADATA_FIELD_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 
 #: Default number of recent thoughts the ``summarize_recent_memory`` prompt
 #: asks the assistant to consider when the caller omits ``limit``.  Kept
@@ -862,6 +870,14 @@ def _metadata_filter(
     entirely here and never exposed over the wire — a caller supplies only
     plain field names and JSON scalars.
 
+    Every key is first validated against
+    :data:`METADATA_FIELD_NAME_PATTERN`: only simple, top-level field names
+    are accepted.  A dotted or bracketed key would otherwise build a nested
+    engrava JSONPath and reach nested metadata the thin surface does not
+    expose, so such a key is rejected here — before any path is constructed —
+    with the same :class:`~engrava.domain.exceptions.InvalidFilterPathError`
+    that a malformed value uses, keeping the grammar entirely off the wire.
+
     Args:
         metadata_equals: Field-name to required-value mapping; each pair
             must match exactly.
@@ -879,12 +895,32 @@ def _metadata_filter(
     """
     predicates: list[FieldPredicate] = []
     for key, value in (metadata_equals or {}).items():
-        predicates.append(FieldPredicate(f"$.{key}", FieldOp.EQ, value))
+        predicates.append(FieldPredicate(_metadata_path(key), FieldOp.EQ, value))
     for key, values in (metadata_in or {}).items():
-        predicates.append(FieldPredicate(f"$.{key}", FieldOp.IN, tuple(values)))
+        predicates.append(FieldPredicate(_metadata_path(key), FieldOp.IN, tuple(values)))
     if not predicates:
         return None
     return MetadataFilter(predicates)
+
+
+def _metadata_path(key: str) -> str:
+    """Build the JSONPath for a validated simple metadata field name.
+
+    Args:
+        key: A metadata field name supplied over the wire.
+
+    Returns:
+        The ``$.<key>`` JSONPath for a key that is a simple field name.
+
+    Raises:
+        InvalidFilterPathError: If ``key`` is not a simple field name
+            (matching :data:`METADATA_FIELD_NAME_PATTERN`); a dotted or
+            bracketed key that would reach nested metadata is rejected here.
+
+    """
+    if not METADATA_FIELD_NAME_PATTERN.fullmatch(key):
+        raise InvalidFilterPathError(key)
+    return f"$.{key}"
 
 
 async def list_edges_impl(

@@ -67,6 +67,40 @@ async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[ClientSession]:
         yield client
 
 
+def _error_text(content: object) -> str:
+    """Extract the text of a tool error result's first content block.
+
+    Args:
+        content: The ``content`` sequence of a ``CallToolResult``.
+
+    Returns:
+        The ``text`` attribute of the first content block.
+
+    """
+    assert isinstance(content, list)
+    assert content, "an error result must carry a content block"
+    text = content[0].text  # type: ignore[union-attr]
+    assert isinstance(text, str)
+    return text
+
+
+def _assert_grammar_free_filter_error(text: str) -> None:
+    """Assert a filter error message is clean and leaks no JSONPath grammar.
+
+    Args:
+        text: The client-facing error message to inspect.
+
+    """
+    assert "metadata filter is invalid" in text.lower()
+    # None of engrava's JSONPath grammar may reach the client: not the "$."/"$["
+    # path syntax, not the accepted regex, not the "JSONPath" term itself.
+    assert "$." not in text
+    assert "$[" not in text
+    assert "paths must match" not in text
+    assert "^\\$" not in text
+    assert "JSONPath" not in text
+
+
 def _thought(thought_id: str) -> CoreThoughtRecord:
     """Build a minimal active thought to anchor edges.
 
@@ -270,6 +304,41 @@ class TestListEdges:
         assert "metadata filter is invalid" in text.lower()
         assert "FieldOp" not in text
         assert "$" not in text
+
+    @pytest.mark.parametrize("smuggling_key", ["outer.inner", "tags[0]"])
+    async def test_nested_metadata_key_is_rejected_on_equals(
+        self, edge_store: SqliteEngravaCore, smuggling_key: str
+    ) -> None:
+        # A dotted/bracketed key would smuggle a nested JSONPath ($.outer.inner,
+        # $.tags[0]) past the thin surface. It must be rejected at the boundary,
+        # and the client-facing message must never echo the JSONPath grammar.
+        with pytest.raises(ToolError) as excinfo:
+            async with _tool_errors():
+                await list_edges_impl(edge_store, metadata_equals={smuggling_key: "x"})
+        _assert_grammar_free_filter_error(str(excinfo.value))
+
+    @pytest.mark.parametrize("smuggling_key", ["outer.inner", "tags[0]"])
+    async def test_nested_metadata_key_is_rejected_on_in(
+        self, edge_store: SqliteEngravaCore, smuggling_key: str
+    ) -> None:
+        # The same smuggling guard applies to metadata_in keys.
+        with pytest.raises(ToolError) as excinfo:
+            async with _tool_errors():
+                await list_edges_impl(edge_store, metadata_in={smuggling_key: ["x"]})
+        _assert_grammar_free_filter_error(str(excinfo.value))
+
+    async def test_nested_metadata_key_rejected_over_the_wire(
+        self, edge_store: SqliteEngravaCore
+    ) -> None:
+        # End to end: a nested key rejected through the real tool boundary
+        # surfaces the same clean, grammar-free ToolError.
+        async with _client_for(edge_store) as client:
+            result = await client.call_tool(
+                "list_edges",
+                {"metadata_equals": {"outer.inner": "x"}},
+            )
+        assert result.isError is True
+        _assert_grammar_free_filter_error(_error_text(result.content))
 
 
 class TestEdgeToolsOverTheWire:

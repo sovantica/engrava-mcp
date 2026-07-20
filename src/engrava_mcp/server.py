@@ -1058,6 +1058,7 @@ async def link_thoughts_impl(
     *,
     weight: float = DEFAULT_EDGE_WEIGHT,
     edge_id: str | None = None,
+    metadata: dict[str, JsonScalar] | None = None,
 ) -> dict[str, Any]:
     """Create a typed edge between two existing thoughts.
 
@@ -1072,11 +1073,15 @@ async def link_thoughts_impl(
         weight: Relation strength in ``[0.0, 1.0]``.
         edge_id: Optional caller-supplied identifier.  When omitted a
             fresh UUID4 is generated.
+        metadata: Optional JSON object of extra fields to store on the edge,
+            keyed by simple field names with JSON-scalar values.  This is the
+            same metadata that ``list_edges`` filters on; when omitted the
+            edge is stored with empty metadata.
 
     Returns:
         A dict with an ``edge`` entry carrying the persisted edge's
-        ``edge_id``, ``from_thought_id``, ``to_thought_id``, ``edge_type``
-        and ``weight``.
+        ``edge_id``, ``from_thought_id``, ``to_thought_id``, ``edge_type``,
+        ``weight`` and ``metadata``.
 
     Raises:
         ReferentialIntegrityError: If either endpoint does not exist.
@@ -1093,6 +1098,7 @@ async def link_thoughts_impl(
         edge_type=edge_type,
         weight=weight,
         created_cycle=INITIAL_CYCLE,
+        metadata=dict(metadata) if metadata else {},
     )
     created = await store.create_edge(record)
     return {
@@ -1102,6 +1108,7 @@ async def link_thoughts_impl(
             "to_thought_id": created.to_thought_id,
             "edge_type": created.edge_type.value,
             "weight": created.weight,
+            "metadata": created.metadata,
         }
     }
 
@@ -1699,9 +1706,11 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         description=(
             "Create a typed edge between two existing thoughts, identified by "
             "their identifiers. Choose the edge type and optionally a weight "
-            "in [0.0, 1.0]. Both endpoints must already exist. An edge is "
-            "unique per (source, target, type): linking the same pair with the "
-            "same type twice is rejected rather than ignored."
+            "in [0.0, 1.0]. Optionally attach a metadata object (simple field "
+            "names to JSON scalars) that list_edges can later filter on. Both "
+            "endpoints must already exist. An edge is unique per (source, "
+            "target, type): linking the same pair with the same type twice is "
+            "rejected rather than ignored."
         ),
         annotations=_WRITE,
     )
@@ -1712,6 +1721,7 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         weight: float = DEFAULT_EDGE_WEIGHT,
         *,
         edge_id: str | None = None,
+        metadata: dict[str, JsonScalar] | None = None,
     ) -> dict[str, Any]:
         async with _tool_errors():
             return await link_thoughts_impl(
@@ -1721,6 +1731,7 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
                 edge_type,
                 weight=weight,
                 edge_id=edge_id,
+                metadata=metadata,
             )
 
     @server.tool(

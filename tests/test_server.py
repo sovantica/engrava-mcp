@@ -41,6 +41,8 @@ READ_TOOL_NAMES = frozenset(
         "list_memory",
         "query_memory",
         "memory_stats",
+        "get_edges",
+        "list_edges",
     }
 )
 WRITE_TOOL_NAMES = frozenset(

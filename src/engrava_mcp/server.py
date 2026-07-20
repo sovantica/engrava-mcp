@@ -6,7 +6,7 @@ consumer*, not an engrava extension: it registers no hooks, manifests, or
 MindQL extension commands.  Think of it as a sibling of the command-line
 interface that speaks MCP over stdio.
 
-Six read-only tools are exposed:
+Eight read-only tools are exposed:
 
 ``get_thought``
     Fetch a single thought by identifier.
@@ -31,6 +31,13 @@ Six read-only tools are exposed:
     grammar has no ``OFFSET``, so this tool paginates by ``limit`` only).
 ``memory_stats``
     Aggregate counts and store-health metrics.
+``get_edges``
+    Fetch the edges connected to a thought (``IN`` / ``OUT`` / ``BOTH``),
+    returning full edge records including their metadata.
+``list_edges``
+    Browse stored edges filtered by edge type, knowledge source, and
+    edge metadata (``metadata_equals`` / ``metadata_in``), returning full
+    edge records including their metadata.
 
 Five write tools complete the surface:
 
@@ -95,18 +102,23 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import anyio
 from engrava import (
     EdgeRecord,
     EdgeType,
+    FieldOp,
+    FieldPredicate,
     InvalidTransitionError,
+    KnowledgeSource,
     LifecycleStatus,
+    MetadataFilter,
     MindQLCommand,
     MindQLParseError,
     MindQLQuery,
@@ -119,8 +131,16 @@ from engrava import (
 
 # ``ReferentialIntegrityError`` is part of engrava's public API but is
 # intentionally not re-exported from the top-level ``engrava`` package; the
-# documented way to catch it is to import it from ``engrava.domain.exceptions``.
-from engrava.domain.exceptions import ReferentialIntegrityError
+# documented way to catch these is to import them from
+# ``engrava.domain.exceptions``.  The metadata-filter and recency errors below
+# are surfaced by ``list_edges`` / ``search_memory`` and are mapped to clean
+# ``ToolError`` messages in :func:`_tool_errors`.
+from engrava.domain.exceptions import (
+    InvalidFilterError,
+    InvalidFilterPathError,
+    InvalidRecencyArgumentError,
+    ReferentialIntegrityError,
+)
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
@@ -133,6 +153,18 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
     from engrava import SqliteEngravaCore
+
+#: Direction of edge traversal for ``get_edges``.  ``OUT`` follows edges whose
+#: source is the given thought, ``IN`` follows edges whose target is it, and
+#: ``BOTH`` returns either.  Declaring it as a :data:`~typing.Literal` makes the
+#: MCP tool schema enumerate the three accepted values.
+EdgeDirection = Literal["IN", "OUT", "BOTH"]
+
+#: A JSON scalar accepted as a metadata filter value on ``list_edges`` and as a
+#: metadata value on ``link_thoughts``.  The metadata surface is deliberately
+#: kept to plain JSON scalars over the wire: nested objects and the typed filter
+#: machinery are never exposed to clients.
+JsonScalar = str | int | float | bool | None
 
 #: Server name advertised to MCP clients.
 SERVER_NAME = "engrava"
@@ -147,6 +179,20 @@ DEFAULT_RECENT_LIMIT = 10
 #: store's own ``list_thoughts`` default so an unpaged listing behaves the
 #: same whether driven through MCP or the core API directly.
 DEFAULT_LIST_LIMIT = 50
+
+#: Default number of edges returned by the ``list_edges`` browse tool.
+#: Deliberately smaller than the store's own ``list_edges`` default (5000):
+#: an MCP response is read into an agent's context, so a focused page is a
+#: better default over the wire than a bulk dump.  Callers that genuinely want
+#: more can raise ``limit`` explicitly.
+DEFAULT_EDGE_LIST_LIMIT = 100
+
+#: A metadata-filter key accepted on ``list_edges``.  The thin surface accepts
+#: only simple, top-level field names — a dotted or bracketed key (``a.b``,
+#: ``tags[0]``) would build a nested engrava JSONPath (``$.a.b``, ``$.tags[0]``)
+#: and reach nested metadata the MCP surface deliberately does not support, so
+#: it is rejected at the boundary before any path is constructed.
+METADATA_FIELD_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 
 #: Default number of recent thoughts the ``summarize_recent_memory`` prompt
 #: asks the assistant to consider when the caller omits ``limit``.  Kept
@@ -232,8 +278,13 @@ class UnsupportedQueryError(ValueError):
         )
 
 
+# C901: the mccabe count is inflated by the flat list of ``except`` branches —
+# one per recognised typed failure translated to a curated message — not by
+# nested branching logic (only the single ``if "UNIQUE"`` guard branches).
+# Splitting the translation table into helpers would scatter the error contract
+# these tests pin, so the complexity cap is waived here deliberately.
 @asynccontextmanager
-async def _tool_errors() -> AsyncIterator[None]:
+async def _tool_errors() -> AsyncIterator[None]:  # noqa: C901
     """Translate known typed failures into clean, actionable MCP errors.
 
     Wraps the body of a tool handler so that the typed exceptions raised by
@@ -320,6 +371,26 @@ async def _tool_errors() -> AsyncIterator[None]:
             f"{exc.referenced_id!r}. Create that thought first, or correct "
             "the identifier."
         )
+        raise ToolError(msg) from exc
+    except (InvalidFilterError, InvalidFilterPathError) as exc:
+        # A malformed ``metadata_equals`` / ``metadata_in`` filter on list_edges.
+        # The raw messages spell out the internal JSONPath grammar (the accepted
+        # regex and ``$.key`` examples) or name a rejected engrava internal
+        # value shape; neither may reach the client. State the filter contract
+        # in plain terms — simple field names as keys, JSON scalars as values —
+        # without echoing the grammar.
+        msg = (
+            "The metadata filter is invalid. Use simple field names as keys "
+            "(for example 'session_id' or 'topic') and JSON scalars — a string, "
+            "number, or boolean — as values. Nested paths and structured values "
+            "are not accepted here."
+        )
+        raise ToolError(msg) from exc
+    except InvalidRecencyArgumentError as exc:
+        # An unparseable ``recency_now`` on search_memory. The raw message echoes
+        # the rejected value with engrava's own phrasing; surface a clean, format
+        # -only hint instead.
+        msg = "recency_now must be an ISO-8601 timestamp, for example '2026-07-20T14:30:00Z'."
         raise ToolError(msg) from exc
     except ValidationError as exc:
         # A field value rejected by the domain model (e.g. an essence below the
@@ -483,6 +554,7 @@ async def search_memory_impl(
     thought_type: ThoughtType | None = None,
     lifecycle_status: LifecycleStatus | None = None,
     priority: Priority | None = None,
+    recency_now: str | None = None,
 ) -> dict[str, Any]:
     """Run a hybrid ranked search over stored memory.
 
@@ -506,6 +578,10 @@ async def search_memory_impl(
         thought_type: When set, keep only hits of this type.
         lifecycle_status: When set, keep only hits in this lifecycle state.
         priority: When set, keep only hits at this priority level.
+        recency_now: Optional ISO-8601 timestamp used as "now" for the
+            recency signal, letting a stateless consumer score recency by
+            transaction time instead of a cognitive-cycle clock.  When
+            omitted the ranker uses its own default.
 
     Returns:
         A dict with a ``results`` list of ``{"thought_id", "score"}``
@@ -516,11 +592,16 @@ async def search_memory_impl(
         ``matched`` / ``dropped`` counts over the ranked window, so a
         short or empty list is never mistaken for "no hits ranked".
 
+    Raises:
+        InvalidRecencyArgumentError: If ``recency_now`` is not a valid
+            ISO-8601 timestamp.
+
     """
     result = await store.search_hybrid(
         query_text,
         top_k=top_k,
         include_reflections=include_reflections,
+        recency_now=recency_now,
     )
     backends_used = sorted(result.backends_used)
 
@@ -745,6 +826,152 @@ async def list_memory_impl(
     }
 
 
+async def get_edges_impl(
+    store: SqliteEngravaCore,
+    thought_id: str,
+    *,
+    direction: EdgeDirection = "BOTH",
+) -> dict[str, Any]:
+    """Return the edges connected to a thought.
+
+    A direct pass-through to the public
+    :meth:`~engrava.SqliteEngravaCore.get_edges`.  This is the read
+    counterpart to :func:`link_thoughts_impl` / :func:`delete_edge_impl`:
+    the write surface can create and remove edges but, without this, a
+    client could never read them back.
+
+    Args:
+        store: The store to query.
+        thought_id: Identifier of the thought whose edges to fetch.
+        direction: Which edges to return — ``OUT`` for edges leaving the
+            thought, ``IN`` for edges arriving at it, or ``BOTH`` for
+            either.  An unknown ``thought_id`` simply has no edges.
+
+    Returns:
+        A dict with an ``edges`` list of JSON-serialisable edge records
+        (each including its ``metadata``) and their ``count``.
+
+    """
+    edges = await store.get_edges(thought_id, direction=direction)
+    serialised = [edge.model_dump(mode="json") for edge in edges]
+    return {"edges": serialised, "count": len(serialised)}
+
+
+def _metadata_filter(
+    metadata_equals: dict[str, JsonScalar] | None,
+    metadata_in: dict[str, list[JsonScalar]] | None,
+) -> MetadataFilter | None:
+    """Translate JSON-friendly metadata filters into engrava's typed filter.
+
+    Each ``metadata_equals`` entry becomes an equality predicate and each
+    ``metadata_in`` entry a membership predicate; the predicates are
+    AND-conjoined into a single :class:`~engrava.MetadataFilter`.  The
+    typed predicate machinery and its JSONPath grammar are constructed
+    entirely here and never exposed over the wire — a caller supplies only
+    plain field names and JSON scalars.
+
+    Every key is first validated against
+    :data:`METADATA_FIELD_NAME_PATTERN`: only simple, top-level field names
+    are accepted.  A dotted or bracketed key would otherwise build a nested
+    engrava JSONPath and reach nested metadata the thin surface does not
+    expose, so such a key is rejected here — before any path is constructed —
+    with the same :class:`~engrava.domain.exceptions.InvalidFilterPathError`
+    that a malformed value uses, keeping the grammar entirely off the wire.
+
+    Args:
+        metadata_equals: Field-name to required-value mapping; each pair
+            must match exactly.
+        metadata_in: Field-name to allowed-values mapping; each field must
+            equal one of the listed values.
+
+    Returns:
+        A ``MetadataFilter`` combining every supplied predicate, or
+        ``None`` when neither argument carries any entry (match-all).
+
+    Raises:
+        InvalidFilterPathError: If a key is not a simple field name.
+        InvalidFilterError: If a value is not an accepted scalar.
+
+    """
+    predicates: list[FieldPredicate] = []
+    for key, value in (metadata_equals or {}).items():
+        predicates.append(FieldPredicate(_metadata_path(key), FieldOp.EQ, value))
+    for key, values in (metadata_in or {}).items():
+        predicates.append(FieldPredicate(_metadata_path(key), FieldOp.IN, tuple(values)))
+    if not predicates:
+        return None
+    return MetadataFilter(predicates)
+
+
+def _metadata_path(key: str) -> str:
+    """Build the JSONPath for a validated simple metadata field name.
+
+    Args:
+        key: A metadata field name supplied over the wire.
+
+    Returns:
+        The ``$.<key>`` JSONPath for a key that is a simple field name.
+
+    Raises:
+        InvalidFilterPathError: If ``key`` is not a simple field name
+            (matching :data:`METADATA_FIELD_NAME_PATTERN`); a dotted or
+            bracketed key that would reach nested metadata is rejected here.
+
+    """
+    if not METADATA_FIELD_NAME_PATTERN.fullmatch(key):
+        raise InvalidFilterPathError(key)
+    return f"$.{key}"
+
+
+async def list_edges_impl(
+    store: SqliteEngravaCore,
+    *,
+    edge_type: EdgeType | None = None,
+    source: KnowledgeSource | None = None,
+    metadata_equals: dict[str, JsonScalar] | None = None,
+    metadata_in: dict[str, list[JsonScalar]] | None = None,
+    limit: int = DEFAULT_EDGE_LIST_LIMIT,
+) -> dict[str, Any]:
+    """List edges deterministically with optional filters.
+
+    A pass-through to the public
+    :meth:`~engrava.SqliteEngravaCore.list_edges` that translates the
+    JSON-friendly ``metadata_equals`` / ``metadata_in`` arguments into
+    engrava's typed :class:`~engrava.MetadataFilter` internally (see
+    :func:`_metadata_filter`), so the typed predicate machinery and its
+    JSONPath grammar never appear on the wire.  ``edge_type`` and
+    ``source`` are applied server-side by engrava.
+
+    Args:
+        store: The store to query.
+        edge_type: When set, keep only edges of this relationship type.
+        source: When set, keep only edges from this knowledge source.
+        metadata_equals: Field-name to required-value mapping applied to
+            each edge's metadata (exact match on every pair).
+        metadata_in: Field-name to allowed-values mapping applied to each
+            edge's metadata (the field must equal one of the values).
+        limit: Maximum number of edges to return.
+
+    Returns:
+        A dict with an ``edges`` list of JSON-serialisable edge records
+        (each including its ``metadata``) and their ``count``.
+
+    Raises:
+        InvalidFilterPathError: If a metadata key is not a simple field name.
+        InvalidFilterError: If a metadata value is not an accepted scalar.
+
+    """
+    filters = _metadata_filter(metadata_equals, metadata_in)
+    edges = await store.list_edges(
+        edge_type=edge_type,
+        source=source,
+        filters=filters,
+        limit=limit,
+    )
+    serialised = [edge.model_dump(mode="json") for edge in edges]
+    return {"edges": serialised, "count": len(serialised)}
+
+
 async def store_thought_impl(
     store: SqliteEngravaCore,
     essence: str,
@@ -877,6 +1104,7 @@ async def link_thoughts_impl(
     *,
     weight: float = DEFAULT_EDGE_WEIGHT,
     edge_id: str | None = None,
+    metadata: dict[str, JsonScalar] | None = None,
 ) -> dict[str, Any]:
     """Create a typed edge between two existing thoughts.
 
@@ -891,11 +1119,15 @@ async def link_thoughts_impl(
         weight: Relation strength in ``[0.0, 1.0]``.
         edge_id: Optional caller-supplied identifier.  When omitted a
             fresh UUID4 is generated.
+        metadata: Optional JSON object of extra fields to store on the edge,
+            keyed by simple field names with JSON-scalar values.  This is the
+            same metadata that ``list_edges`` filters on; when omitted the
+            edge is stored with empty metadata.
 
     Returns:
         A dict with an ``edge`` entry carrying the persisted edge's
-        ``edge_id``, ``from_thought_id``, ``to_thought_id``, ``edge_type``
-        and ``weight``.
+        ``edge_id``, ``from_thought_id``, ``to_thought_id``, ``edge_type``,
+        ``weight`` and ``metadata``.
 
     Raises:
         ReferentialIntegrityError: If either endpoint does not exist.
@@ -912,6 +1144,7 @@ async def link_thoughts_impl(
         edge_type=edge_type,
         weight=weight,
         created_cycle=INITIAL_CYCLE,
+        metadata=dict(metadata) if metadata else {},
     )
     created = await store.create_edge(record)
     return {
@@ -921,6 +1154,7 @@ async def link_thoughts_impl(
             "to_thought_id": created.to_thought_id,
             "edge_type": created.edge_type.value,
             "weight": created.weight,
+            "metadata": created.metadata,
         }
     }
 
@@ -1123,7 +1357,10 @@ def build_server() -> FastMCP:
             "store statistics. Hybrid search (search_memory) can also be "
             "narrowed by thought type, lifecycle status, or priority, but it "
             "filters after ranking; for an exhaustive unranked listing by "
-            "those fields use list_memory. Unless the server is started in "
+            "those fields use list_memory. Read the edges of the memory graph "
+            "with get_edges (the edges connected to a thought) and list_edges "
+            "(browse edges filtered by type, source, or metadata). Unless the "
+            "server is started in "
             "read-only mode, you can also store new thoughts, update existing "
             "thoughts, link thoughts with typed edges, and delete thoughts or "
             "edges. Read-only resources are also available as attachable "
@@ -1265,9 +1502,10 @@ def register_prompts(server: FastMCP, provider: StoreProvider) -> None:
 def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C901
     """Register the MCP tools on a server.
 
-    The six read tools (``get_thought``, ``search_memory``,
+    The eight read tools (``get_thought``, ``search_memory``,
     ``search_keywords``, ``list_memory``, ``query_memory``,
-    ``memory_stats``) are always registered.  The five write tools are
+    ``memory_stats``, ``get_edges``, ``list_edges``) are always
+    registered.  The five write tools are
     registered only when the server is not in read-only mode (see
     :func:`_read_only_enabled`); in read-only mode they are never
     advertised to clients.
@@ -1297,7 +1535,9 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
             "these filters are applied after ranking, so a filtered call may "
             "return fewer than top_k results and reports how many ranked hits "
             "were dropped. For an exhaustive, unranked, paginated listing by "
-            "those same fields, use list_memory instead."
+            "those same fields, use list_memory instead. Pass recency_now as an "
+            "ISO-8601 timestamp to score recency against that moment (transaction "
+            "time) rather than the store's default."
         ),
         annotations=_READ_ONLY,
     )
@@ -1309,6 +1549,7 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         thought_type: ThoughtType | None = None,
         lifecycle_status: LifecycleStatus | None = None,
         priority: Priority | None = None,
+        recency_now: str | None = None,
     ) -> dict[str, Any]:
         async with _tool_errors():
             return await search_memory_impl(
@@ -1319,6 +1560,7 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
                 thought_type=thought_type,
                 lifecycle_status=lifecycle_status,
                 priority=priority,
+                recency_now=recency_now,
             )
 
     @server.tool(
@@ -1395,6 +1637,54 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         async with _tool_errors():
             return await memory_stats_impl(provider.require())
 
+    @server.tool(
+        name="get_edges",
+        description=(
+            "Fetch the edges connected to a thought by its identifier. Choose "
+            "the direction: OUT for edges leaving the thought, IN for edges "
+            "arriving at it, or BOTH (the default) for either. Returns full edge "
+            "records including their metadata, and a count. This is the read "
+            "companion to link_thoughts and delete_edge."
+        ),
+        annotations=_READ_ONLY,
+    )
+    async def get_edges(
+        thought_id: str,
+        direction: EdgeDirection = "BOTH",
+    ) -> dict[str, Any]:
+        async with _tool_errors():
+            return await get_edges_impl(provider.require(), thought_id, direction=direction)
+
+    @server.tool(
+        name="list_edges",
+        description=(
+            "List stored edges with optional filters. Filter by edge type, by "
+            "knowledge source, and by edge metadata: metadata_equals takes a "
+            "mapping of field name to a required value (exact match on every "
+            "pair), and metadata_in takes a mapping of field name to a list of "
+            "allowed values (the field must equal one of them). Metadata keys "
+            "are simple field names and values are JSON scalars. Returns full "
+            "edge records including their metadata, and a count."
+        ),
+        annotations=_READ_ONLY,
+    )
+    async def list_edges(
+        edge_type: EdgeType | None = None,
+        source: KnowledgeSource | None = None,
+        metadata_equals: dict[str, JsonScalar] | None = None,
+        metadata_in: dict[str, list[JsonScalar]] | None = None,
+        limit: int = DEFAULT_EDGE_LIST_LIMIT,
+    ) -> dict[str, Any]:
+        async with _tool_errors():
+            return await list_edges_impl(
+                provider.require(),
+                edge_type=edge_type,
+                source=source,
+                metadata_equals=metadata_equals,
+                metadata_in=metadata_in,
+                limit=limit,
+            )
+
     if _read_only_enabled():
         return
 
@@ -1466,9 +1756,11 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         description=(
             "Create a typed edge between two existing thoughts, identified by "
             "their identifiers. Choose the edge type and optionally a weight "
-            "in [0.0, 1.0]. Both endpoints must already exist. An edge is "
-            "unique per (source, target, type): linking the same pair with the "
-            "same type twice is rejected rather than ignored."
+            "in [0.0, 1.0]. Optionally attach a metadata object (simple field "
+            "names to JSON scalars) that list_edges can later filter on. Both "
+            "endpoints must already exist. An edge is unique per (source, "
+            "target, type): linking the same pair with the same type twice is "
+            "rejected rather than ignored."
         ),
         annotations=_WRITE,
     )
@@ -1479,6 +1771,7 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         weight: float = DEFAULT_EDGE_WEIGHT,
         *,
         edge_id: str | None = None,
+        metadata: dict[str, JsonScalar] | None = None,
     ) -> dict[str, Any]:
         async with _tool_errors():
             return await link_thoughts_impl(
@@ -1488,6 +1781,7 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
                 edge_type,
                 weight=weight,
                 edge_id=edge_id,
+                metadata=metadata,
             )
 
     @server.tool(

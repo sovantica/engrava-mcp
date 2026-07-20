@@ -546,6 +546,7 @@ async def search_memory_impl(
     thought_type: ThoughtType | None = None,
     lifecycle_status: LifecycleStatus | None = None,
     priority: Priority | None = None,
+    recency_now: str | None = None,
 ) -> dict[str, Any]:
     """Run a hybrid ranked search over stored memory.
 
@@ -569,6 +570,10 @@ async def search_memory_impl(
         thought_type: When set, keep only hits of this type.
         lifecycle_status: When set, keep only hits in this lifecycle state.
         priority: When set, keep only hits at this priority level.
+        recency_now: Optional ISO-8601 timestamp used as "now" for the
+            recency signal, letting a stateless consumer score recency by
+            transaction time instead of a cognitive-cycle clock.  When
+            omitted the ranker uses its own default.
 
     Returns:
         A dict with a ``results`` list of ``{"thought_id", "score"}``
@@ -579,11 +584,16 @@ async def search_memory_impl(
         ``matched`` / ``dropped`` counts over the ranked window, so a
         short or empty list is never mistaken for "no hits ranked".
 
+    Raises:
+        InvalidRecencyArgumentError: If ``recency_now`` is not a valid
+            ISO-8601 timestamp.
+
     """
     result = await store.search_hybrid(
         query_text,
         top_k=top_k,
         include_reflections=include_reflections,
+        recency_now=recency_now,
     )
     backends_used = sorted(result.backends_used)
 
@@ -1489,7 +1499,9 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
             "these filters are applied after ranking, so a filtered call may "
             "return fewer than top_k results and reports how many ranked hits "
             "were dropped. For an exhaustive, unranked, paginated listing by "
-            "those same fields, use list_memory instead."
+            "those same fields, use list_memory instead. Pass recency_now as an "
+            "ISO-8601 timestamp to score recency against that moment (transaction "
+            "time) rather than the store's default."
         ),
         annotations=_READ_ONLY,
     )
@@ -1501,6 +1513,7 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         thought_type: ThoughtType | None = None,
         lifecycle_status: LifecycleStatus | None = None,
         priority: Priority | None = None,
+        recency_now: str | None = None,
     ) -> dict[str, Any]:
         async with _tool_errors():
             return await search_memory_impl(
@@ -1511,6 +1524,7 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
                 thought_type=thought_type,
                 lifecycle_status=lifecycle_status,
                 priority=priority,
+                recency_now=recency_now,
             )
 
     @server.tool(

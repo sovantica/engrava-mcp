@@ -29,6 +29,8 @@ EXPECTED_TOOL_NAMES = frozenset(
         "list_memory",
         "query_memory",
         "memory_stats",
+        "get_edges",
+        "list_edges",
         "store_thought",
         "update_thought",
         "link_thoughts",
@@ -63,7 +65,7 @@ def _server_params(db_path: Path) -> StdioServerParameters:
 async def test_stdio_subprocess_serves_tools(tmp_path: Path) -> None:
     """Spawn the real server and round-trip a tool call over stdio.
 
-    Asserts the client initialises, the full 11-tool surface is advertised,
+    Asserts the client initialises, the full 13-tool surface is advertised,
     and a ``memory_stats`` call returns a valid result for the empty store.
 
     Args:

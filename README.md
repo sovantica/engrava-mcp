@@ -145,16 +145,23 @@ uvx --from "engrava-mcp[ollama]" engrava-mcp   # Ollama embeddings deps
 
 ## The surface
 
-- **Tools (11):** `get_thought`, `search_memory`, `search_keywords`,
-  `list_memory`, `query_memory`, `memory_stats` (read); `store_thought`,
-  `update_thought`, `link_thoughts`, `delete_thought`, `delete_edge` (write,
-  gated by `ENGRAVA_MCP_READ_ONLY`).
+- **Tools (13):** `get_thought`, `search_memory`, `search_keywords`,
+  `list_memory`, `query_memory`, `memory_stats`, `get_edges`, `list_edges`
+  (read); `store_thought`, `update_thought`, `link_thoughts`, `delete_thought`,
+  `delete_edge` (write, gated by `ENGRAVA_MCP_READ_ONLY`).
 - **Resources (3):** `engrava://thought/{thought_id}`, `engrava://stats`,
   `engrava://recent`.
 - **Prompts (3):** `summarize_recent_memory`, `find_related`, `reflect_on_topic`.
 
 `query_memory` accepts only MindQL `FIND` queries; raw SQL and every other
 command are rejected.
+
+`get_edges` traverses a thought's edges by direction (`IN` / `OUT` / `BOTH`);
+`list_edges` browses edges filtered by type, source, or metadata.
+
+`link_thoughts` accepts optional edge `metadata` (JSON fields that `list_edges`
+can filter on). `search_memory` accepts an optional `recency_now` (ISO-8601
+timestamp) to score recency against transaction time.
 
 ## Development
 

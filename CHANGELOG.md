@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows a one-way version mirror of [Engrava](https://github.com/sovantica/engrava)
 (`engrava-mcp X.Y.z` targets `engrava X.Y`).
 
+## [0.6.0]
+
+### Added
+
+- `get_edges` and `list_edges` tools — read and browse the memory graph's edges: traverse a thought's edges by direction, or filter edges by type, source, or metadata.
+- Optional `metadata` on `link_thoughts` — attach JSON fields to an edge that `list_edges` can filter on.
+- Optional `recency_now` on `search_memory` — score recency against a caller-supplied timestamp (transaction time).
+
+### Changed
+
+- Target Engrava 0.6 — now requires `engrava >=0.6,<0.7`.
+
 ## [0.5.1]
 
 ### Added

@@ -107,7 +107,7 @@ import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 import anyio
 from engrava import (
@@ -146,7 +146,7 @@ from engrava.domain.exceptions import (
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
 from engrava_mcp._compat import warn_if_engrava_out_of_range
 from engrava_mcp.config import ResolvedStore, resolve_store
@@ -188,6 +188,32 @@ DEFAULT_LIST_LIMIT = 50
 #: better default over the wire than a bulk dump.  Callers that genuinely want
 #: more can raise ``limit`` explicitly.
 DEFAULT_EDGE_LIST_LIMIT = 100
+
+#: Largest page size any wire-supplied ``limit`` may request (``list_memory``,
+#: ``list_edges``, ``query_memory``, and the recent-thoughts listing).  Mirrors
+#: engrava's own ``list_edges`` ceiling.  A bound crossing the wire is a *scan
+#: cap*: without an upper bound a caller can request the whole store in one
+#: call, and without a lower bound a negative value reaches SQLite, which reads
+#: ``LIMIT -1`` as "no limit" and defeats the cap entirely.
+MAX_PAGE_LIMIT = 5000
+
+#: Largest ``top_k`` the ranked search tools accept.  Lower than
+#: :data:`MAX_PAGE_LIMIT` because a ranked window is read into an agent's
+#: context rather than paged through.
+MAX_TOP_K = 1000
+
+#: A page size supplied over the wire: at least one row, never more than the
+#: scan cap.  Expressed as an annotated type so the bound lands in the
+#: *advertised* MCP tool schema and pydantic enforces it at the protocol layer.
+PageLimit = Annotated[int, Field(ge=1, le=MAX_PAGE_LIMIT)]
+
+#: A ranked-window size supplied over the wire.
+TopK = Annotated[int, Field(ge=1, le=MAX_TOP_K)]
+
+#: A page offset supplied over the wire.  Zero is a valid page start, and an
+#: offset has no natural ceiling (it cannot widen a scan), so only the lower
+#: bound is constrained.
+PageOffset = Annotated[int, Field(ge=0)]
 
 #: A metadata-filter key accepted on ``list_edges``.  The thin surface accepts
 #: only simple, top-level field names — a dotted or bracketed key (``a.b``,
@@ -291,6 +317,50 @@ class UnsupportedQueryError(ValueError):
         )
 
 
+class OutOfRangeBoundError(ValueError):
+    """Raised when a wire-supplied numeric bound falls outside its domain.
+
+    The MCP protocol layer validates an argument's *type*, not its *domain*:
+    ``-1`` is a valid ``int``, and SQLite reads ``LIMIT -1`` as "no limit", so
+    an unvalidated negative bound silently defeats the scan cap it was meant to
+    impose.  An excessive upper value is equally unbounded in effect.  Each
+    implementation therefore re-checks its own bounds rather than trusting the
+    protocol layer's coercion, which also covers direct callers.
+
+    Args:
+        name: The offending argument's name, as the caller supplied it.
+        value: The rejected value.
+        minimum: Smallest accepted value.
+        maximum: Largest accepted value, or ``None`` when unbounded above.
+
+    """
+
+    def __init__(self, name: str, value: int, minimum: int, maximum: int | None) -> None:
+        self.name = name
+        self.value = value
+        self.minimum = minimum
+        self.maximum = maximum
+        allowed = f"at least {minimum}" if maximum is None else f"between {minimum} and {maximum}"
+        super().__init__(f"{name} must be {allowed}; received {value}.")
+
+
+def _check_bound(name: str, value: int, *, minimum: int, maximum: int | None = None) -> None:
+    """Validate a wire-supplied numeric bound against its domain.
+
+    Args:
+        name: The argument's name, used verbatim in the error message.
+        value: The supplied value.
+        minimum: Smallest accepted value.
+        maximum: Largest accepted value, or ``None`` when unbounded above.
+
+    Raises:
+        OutOfRangeBoundError: If ``value`` is outside ``[minimum, maximum]``.
+
+    """
+    if value < minimum or (maximum is not None and value > maximum):
+        raise OutOfRangeBoundError(name, value, minimum, maximum)
+
+
 # C901: the mccabe count is inflated by the flat list of ``except`` branches —
 # one per recognised typed failure translated to a curated message — not by
 # nested branching logic (only the single ``if "UNIQUE"`` guard branches).
@@ -346,6 +416,11 @@ async def _tool_errors() -> AsyncIterator[None]:  # noqa: C901
         # The exception text already states the FIND-only contract and shows
         # a valid FIND example; echoing it keeps the guard's wording intact
         # and never invites raw SQL.
+        raise ToolError(str(exc)) from exc
+    except OutOfRangeBoundError as exc:
+        # A numeric bound outside its accepted domain. The message names only
+        # the caller's own argument, its value, and the accepted range — no
+        # internal symbols — so echoing it is safe and directly actionable.
         raise ToolError(str(exc)) from exc
     except MindQLParseError as exc:
         # Do NOT echo the parser's raw message: for an unrecognised verb the
@@ -608,10 +683,12 @@ async def search_memory_impl(
         short or empty list is never mistaken for "no hits ranked".
 
     Raises:
+        OutOfRangeBoundError: If ``top_k`` is outside its accepted range.
         InvalidRecencyArgumentError: If ``recency_now`` is not a valid
             ISO-8601 timestamp.
 
     """
+    _check_bound("top_k", top_k, minimum=1, maximum=MAX_TOP_K)
     result = await store.search_hybrid(
         query_text,
         top_k=top_k,
@@ -676,7 +753,11 @@ async def search_keywords_impl(
         A dict with a ``results`` list of ``{"thought_id", "score"}``
         entries ordered by descending relevance.
 
+    Raises:
+        OutOfRangeBoundError: If ``top_k`` is outside its accepted range.
+
     """
+    _check_bound("top_k", top_k, minimum=1, maximum=MAX_TOP_K)
     matches = await store.search_fts(query, top_k=top_k)
     return {
         "results": [{"thought_id": thought_id, "score": score} for thought_id, score in matches],
@@ -705,12 +786,20 @@ async def query_memory_impl(
 
     Raises:
         UnsupportedQueryError: If the query is not a ``FIND`` command.
+        OutOfRangeBoundError: If ``limit`` is outside its accepted range.
         MindQLParseError: If the query is malformed.
 
     """
     parsed = parse(query)
     if parsed.command is not MindQLCommand.FIND:
         raise UnsupportedQueryError(parsed.command.value)
+
+    # A value crossing the wire never becomes a query-object identifier: the
+    # bound is validated *before* it is built into a MindQLQuery, because the
+    # executor interpolates the limit into the SQL string rather than binding
+    # it. Never rely on the protocol layer's coercion to have done this.
+    if limit is not None:
+        _check_bound("limit", limit, minimum=1, maximum=MAX_PAGE_LIMIT)
 
     effective = parsed if limit is None else _with_limit(parsed, limit)
 
@@ -772,7 +861,11 @@ async def recent_thoughts_impl(
         A dict with a ``thoughts`` list of JSON-serialisable thoughts
         (newest first) and the ``limit`` that was applied.
 
+    Raises:
+        OutOfRangeBoundError: If ``limit`` is outside its accepted range.
+
     """
+    _check_bound("limit", limit, minimum=1, maximum=MAX_PAGE_LIMIT)
     thoughts = await store.list_thoughts(limit=limit)
     return {
         "thoughts": [thought.model_dump(mode="json") for thought in thoughts],
@@ -821,7 +914,13 @@ async def list_memory_impl(
         ``limit`` / ``offset`` that were applied so the caller can drive
         pagination.
 
+    Raises:
+        OutOfRangeBoundError: If ``limit`` or ``offset`` is outside its
+            accepted range.
+
     """
+    _check_bound("limit", limit, minimum=1, maximum=MAX_PAGE_LIMIT)
+    _check_bound("offset", offset, minimum=0)
     thoughts = await store.list_thoughts(
         thought_type=thought_type.value if thought_type is not None else None,
         lifecycle_status=lifecycle_status.value if lifecycle_status is not None else None,
@@ -972,10 +1071,12 @@ async def list_edges_impl(
         (each including its ``metadata``) and their ``count``.
 
     Raises:
+        OutOfRangeBoundError: If ``limit`` is outside its accepted range.
         InvalidFilterPathError: If a metadata key is not a simple field name.
         InvalidFilterError: If a metadata value is not an accepted scalar.
 
     """
+    _check_bound("limit", limit, minimum=1, maximum=MAX_PAGE_LIMIT)
     filters = _metadata_filter(metadata_equals, metadata_in)
     edges = await store.list_edges(
         edge_type=edge_type,
@@ -1488,9 +1589,14 @@ def register_prompts(server: FastMCP, provider: StoreProvider) -> None:
             "how many recent thoughts to consider."
         ),
     )
-    async def summarize_recent_memory(limit: int = DEFAULT_SUMMARY_LIMIT) -> str:
-        recent = await recent_thoughts_impl(provider.require(), limit=limit)
-        return _summarize_recent_prompt(limit, recent)
+    async def summarize_recent_memory(limit: PageLimit = DEFAULT_SUMMARY_LIMIT) -> str:
+        # Guarded like the tools: ``limit`` is wire-supplied, so an out-of-range
+        # value must surface as a curated message rather than a raw typed error.
+        # The protocol layer normally rejects it first, but the domain guard
+        # exists precisely for the paths where that layer does not apply.
+        async with _tool_errors():
+            recent = await recent_thoughts_impl(provider.require(), limit=limit)
+            return _summarize_recent_prompt(limit, recent)
 
     @server.prompt(
         name="find_related",
@@ -1558,7 +1664,7 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
     )
     async def search_memory(
         query_text: str,
-        top_k: int = DEFAULT_TOP_K,
+        top_k: TopK = DEFAULT_TOP_K,
         *,
         include_reflections: bool = True,
         thought_type: ThoughtType | None = None,
@@ -1599,8 +1705,8 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         min_cycle: int | None = None,
         max_cycle: int | None = None,
         include_expired: bool = False,
-        limit: int = DEFAULT_LIST_LIMIT,
-        offset: int = 0,
+        limit: PageLimit = DEFAULT_LIST_LIMIT,
+        offset: PageOffset = 0,
     ) -> dict[str, Any]:
         async with _tool_errors():
             return await list_memory_impl(
@@ -1623,7 +1729,7 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         ),
         annotations=_READ_ONLY,
     )
-    async def search_keywords(query: str, top_k: int = DEFAULT_TOP_K) -> dict[str, Any]:
+    async def search_keywords(query: str, top_k: TopK = DEFAULT_TOP_K) -> dict[str, Any]:
         async with _tool_errors():
             return await search_keywords_impl(provider.require(), query, top_k=top_k)
 
@@ -1636,7 +1742,7 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         ),
         annotations=_READ_ONLY,
     )
-    async def query_memory(query: str, limit: int | None = None) -> dict[str, Any]:
+    async def query_memory(query: str, limit: PageLimit | None = None) -> dict[str, Any]:
         async with _tool_errors():
             return await query_memory_impl(provider.require(), query, limit=limit)
 
@@ -1688,7 +1794,7 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         source: KnowledgeSource | None = None,
         metadata_equals: dict[str, JsonScalar] | None = None,
         metadata_in: dict[str, list[JsonScalar]] | None = None,
-        limit: int = DEFAULT_EDGE_LIST_LIMIT,
+        limit: PageLimit = DEFAULT_EDGE_LIST_LIMIT,
     ) -> dict[str, Any]:
         async with _tool_errors():
             return await list_edges_impl(

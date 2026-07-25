@@ -17,6 +17,7 @@ and this project follows a one-way version mirror of [Engrava](https://github.co
 ### Changed
 
 - Target Engrava 0.6 — now requires `engrava >=0.6,<0.7`.
+- Validate the numeric bounds accepted by the search, list, and query tools — a negative, zero, or excessively large `limit`, `top_k`, or `offset` is now rejected instead of silently returning an unbounded result. Callers that previously passed a value outside the accepted range now get an error.
 
 ## [0.5.1]
 

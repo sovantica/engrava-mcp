@@ -361,13 +361,24 @@ def _check_bound(name: str, value: int, *, minimum: int, maximum: int | None = N
         raise OutOfRangeBoundError(name, value, minimum, maximum)
 
 
-# C901: the mccabe count is inflated by the flat list of ``except`` branches —
-# one per recognised typed failure translated to a curated message — not by
-# nested branching logic (only the single ``if "UNIQUE"`` guard branches).
-# Splitting the translation table into helpers would scatter the error contract
-# these tests pin, so the complexity cap is waived here deliberately.
+# C901 (mccabe complexity) and PLR0912 (branch count) are both waived here, and
+# for the same reason: this function is a flat translation table, not branching
+# logic. Its "branches" are one ``except`` clause per recognised typed failure,
+# each mapping that failure to a curated, client-facing message; the only real
+# branch is the single ``if "UNIQUE"`` guard. The count therefore grows by one
+# every time a new failure mode is given a curated message — which is the
+# function working as intended, not accruing complexity.
+#
+# Splitting the table into helpers or a dict-based lookup was considered and
+# rejected: it would scatter the error contract that the tests pin, and it does
+# not actually fit the shape of the code. Several branches read attributes off
+# the specific exception they caught (``thought_id``, ``referenced_id``,
+# ``current_state`` / ``target_state``) rather than formatting a fixed string,
+# and the ``sqlite3.IntegrityError`` branch deliberately re-raises anything that
+# is not a recognised UNIQUE violation so it is never silently masked. A lookup
+# table would express neither, fragmenting one mechanism into two.
 @asynccontextmanager
-async def _tool_errors() -> AsyncIterator[None]:  # noqa: C901
+async def _tool_errors() -> AsyncIterator[None]:  # noqa: C901, PLR0912
     """Translate known typed failures into clean, actionable MCP errors.
 
     Wraps the body of a tool handler so that the typed exceptions raised by

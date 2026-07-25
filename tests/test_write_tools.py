@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import aiosqlite
 import pytest
 from engrava import (
     EdgeType,
@@ -17,7 +16,7 @@ from engrava import (
     ThoughtNotFoundError,
     ThoughtType,
 )
-from engrava.domain.exceptions import ReferentialIntegrityError
+from engrava.domain.exceptions import DuplicateEdgeError, ReferentialIntegrityError
 
 from engrava_mcp.server import (
     get_thought_impl,
@@ -230,7 +229,7 @@ class TestLinkThoughts:
             "thought-beta",
             EdgeType.ASSOCIATED,
         )
-        with pytest.raises(aiosqlite.IntegrityError):
+        with pytest.raises(DuplicateEdgeError):
             await link_thoughts_impl(
                 store,
                 "thought-alpha",

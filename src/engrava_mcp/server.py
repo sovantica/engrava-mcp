@@ -133,9 +133,11 @@ from engrava import (
 # intentionally not re-exported from the top-level ``engrava`` package; the
 # documented way to catch these is to import them from
 # ``engrava.domain.exceptions``.  The metadata-filter and recency errors below
-# are surfaced by ``list_edges`` / ``search_memory`` and are mapped to clean
-# ``ToolError`` messages in :func:`_tool_errors`.
+# are surfaced by ``list_edges`` / ``search_memory``, and ``DuplicateEdgeError``
+# by ``link_thoughts``; all are mapped to clean ``ToolError`` messages in
+# :func:`_tool_errors`.
 from engrava.domain.exceptions import (
+    DuplicateEdgeError,
     InvalidFilterError,
     InvalidFilterPathError,
     InvalidRecencyArgumentError,
@@ -218,6 +220,17 @@ INITIAL_CYCLE = 0
 #: a client back onto the supported path; it deliberately demonstrates only
 #: the ``FIND`` command, never raw SQL.
 FIND_QUERY_EXAMPLE = "FIND thoughts WHERE lifecycle_status = 'ACTIVE' LIMIT 10"
+
+#: Client-facing message for a duplicate ``link_thoughts`` edge.  The store may
+#: report the duplicate either as a typed ``DuplicateEdgeError`` or as a raw
+#: database ``UNIQUE`` violation depending on the code path taken; both are
+#: mapped to this one wording so the two are indistinguishable to a client and
+#: neither exposes the store's internal phrasing or schema names.
+DUPLICATE_EDGE_MESSAGE = (
+    "An edge of that type already links those two thoughts. Edges "
+    "are unique per (source, target, type), so this link already "
+    "exists — no change was made."
+)
 
 #: Environment variable that, when truthy, suppresses registration of the
 #: write tools so the server exposes a read-only surface.
@@ -407,6 +420,13 @@ async def _tool_errors() -> AsyncIterator[None]:  # noqa: C901
             "types and ranges."
         )
         raise ToolError(msg) from exc
+    except DuplicateEdgeError as exc:
+        # The store's typed duplicate-edge signal from link_thoughts. Its own
+        # message spells out the endpoints in engrava's phrasing, which is the
+        # store's to change at will — so it is mapped to our curated wording
+        # rather than forwarded, keeping this path indistinguishable from the
+        # raw-constraint one below.
+        raise ToolError(DUPLICATE_EDGE_MESSAGE) from exc
     except sqlite3.IntegrityError as exc:
         # A constraint violation from the database. The raw message names the
         # internal table and columns (e.g. a UNIQUE constraint over the edge
@@ -415,12 +435,7 @@ async def _tool_errors() -> AsyncIterator[None]:  # noqa: C901
         # other integrity error is re-raised unchanged rather than silently
         # described, so it is never masked.
         if "UNIQUE" in str(exc):
-            msg = (
-                "An edge of that type already links those two thoughts. Edges "
-                "are unique per (source, target, type), so this link already "
-                "exists — no change was made."
-            )
-            raise ToolError(msg) from exc
+            raise ToolError(DUPLICATE_EDGE_MESSAGE) from exc
         raise
 
 

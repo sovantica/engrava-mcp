@@ -10,6 +10,11 @@ were deliberately *deferred* for the 0.6 minor:
 * **D4** — the concrete store's ``fts_match_failure_count`` diagnostic is NOT
   surfaced on the public ``memory_stats`` payload.
 
+A third suite observes that ``search_memory``'s ``recency_now`` genuinely
+reaches engrava's ranker: it runs a control search over a corpus whose only
+differing scored field is the transaction timestamp, then the same search with
+``recency_now``, and asserts the ranking moves.
+
 Suite 2 also pins that engrava 0.6's FTS query-normalization keeps the MCP
 keyword-search surface robust: a syntactically odd FTS5 query is sanitized and
 falls back inside engrava and never propagates as an error to the client.
@@ -21,8 +26,17 @@ import json
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
+import aiosqlite
 import pytest
-from engrava import EdgeType
+from engrava import (
+    CoreThoughtRecord,
+    EdgeType,
+    LifecycleStatus,
+    Priority,
+    SearchConfig,
+    SqliteEngravaCore,
+    ThoughtType,
+)
 from mcp.server.fastmcp import FastMCP
 from mcp.shared.memory import create_connected_server_and_client_session as connect_client
 
@@ -39,15 +53,27 @@ from engrava_mcp.server import (
     search_memory_impl,
     store_thought_impl,
 )
+from tests.recency_corpus import (
+    RECENCY_EXPECTED_ORDER,
+    RECENCY_NOW,
+    RECENCY_QUERY,
+    RECENCY_THOUGHT_IDS,
+    seed_recency_corpus,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-    from engrava import SqliteEngravaCore
     from mcp import ClientSession
 
-#: A transaction-time "now" for the recency passthrough (valid ISO-8601).
-RECENCY_NOW = "2026-07-20T00:00:00Z"
+#: The cycle MCP writes stamp: the origin, not the store's high-water mark.
+#: A literal rather than the server's own constant, so the expectation is
+#: independent of the value the production code happens to hold.
+ORIGIN_CYCLE = 0
+
+#: A cycle well above the origin, seeded to raise the store's high-water mark
+#: so ``max_cycle()`` and the origin cycle are distinguishable numbers.
+HIGH_WATER_CYCLE = 7
 
 #: Syntactically odd but VERIFIED-clean FTS inputs: each is sanitized/fallback
 #: -handled inside engrava 0.6 and returns cleanly (0 hits) rather than raising.
@@ -67,6 +93,60 @@ RISKY_FTS_QUERIES = [
     "*",
     "café",
 ]
+
+
+@pytest.fixture
+async def recency_store() -> AsyncIterator[SqliteEngravaCore]:
+    """Yield a store under engrava's default search policy, seeded for recency.
+
+    Deliberately not the shared ``store`` fixture.  That fixture builds its
+    store with no ``SearchConfig``, which resolves the recency fusion weight to
+    ``0.0`` — the very condition that makes a recency assertion undetectable —
+    and it seeds unrelated thoughts that would rank alongside the corpus.
+    Changing it would alter what the rest of the suite exercises for the benefit
+    of one test, so the dedicated fixture is the narrower change.
+
+    Yields:
+        A ``SqliteEngravaCore`` holding the recency corpus.
+
+    """
+    connection = await aiosqlite.connect(":memory:")
+    connection.row_factory = aiosqlite.Row
+    await connection.execute("PRAGMA foreign_keys=ON")
+    backend = SqliteEngravaCore(connection, search_config=SearchConfig())
+    await backend.ensure_schema()
+    await seed_recency_corpus(backend)
+
+    try:
+        yield backend
+    finally:
+        await connection.close()
+
+
+async def _raise_high_water(store: SqliteEngravaCore) -> None:
+    """Seed one thought at :data:`HIGH_WATER_CYCLE` to lift ``max_cycle()``.
+
+    Seeded here rather than in the shared ``store`` fixture: the fixture backs
+    the rest of the suite, and moving its cycles would change what every other
+    test exercises for the benefit of two.
+
+    Args:
+        store: The store whose high-water cycle should be raised.
+
+    """
+    await store.create_thought(
+        CoreThoughtRecord(
+            thought_id="thought-high-water",
+            thought_type=ThoughtType.BELIEF,
+            essence="high water mark",
+            content="a thought written on a later cognitive cycle",
+            priority=Priority.P2,
+            lifecycle_status=LifecycleStatus.ACTIVE,
+            created_cycle=HIGH_WATER_CYCLE,
+            updated_cycle=HIGH_WATER_CYCLE,
+            source="test",
+        )
+    )
 
 
 @asynccontextmanager
@@ -132,11 +212,36 @@ class TestEdgeRoundTripIntegration:
         target_out = await get_edges_impl(store, to_id, direction="OUT")
         assert target_out["edges"] == []
 
-    async def test_d3_writes_stamp_origin_cycle_not_max_cycle(
+    async def test_d3_thought_writes_stamp_origin_cycle_not_max_cycle(
         self, store: SqliteEngravaCore
     ) -> None:
-        # D3 lock: MCP edge writes stamp the origin cycle, and the server did
-        # not adopt max_cycle() write-stamping — so both stay 0.
+        # D3 lock, thought path: an MCP write stamps the origin cycle and the
+        # server did NOT adopt max_cycle() write-stamping.
+        #
+        # The high-water seed is what makes this discriminating. The shared
+        # fixture seeds everything at cycle 0, so both behaviours would produce
+        # the same 0 and the test could not fail. Raising the store's high-water
+        # mark first separates them: origin-stamping keeps 0, max_cycle()
+        # -stamping would write HIGH_WATER_CYCLE.
+        await _raise_high_water(store)
+        assert await store.max_cycle() == HIGH_WATER_CYCLE
+
+        created = await store_thought_impl(store, essence="cycle source", content="source body")
+        stored = await store.get_thought(created["thought"]["thought_id"])
+        assert stored is not None
+        assert stored.created_cycle == ORIGIN_CYCLE
+        assert stored.updated_cycle == ORIGIN_CYCLE
+
+    async def test_d3_edge_writes_stamp_origin_cycle_not_max_cycle(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # D3 lock, edge path: the same, for the edge write. Separate from the
+        # thought path so a mutation of either is isolated — pytest halts at
+        # the first failing assertion, so one test covering both would leave
+        # the second path unobserved whenever the first reddens.
+        await _raise_high_water(store)
+        assert await store.max_cycle() == HIGH_WATER_CYCLE
+
         first = await store_thought_impl(store, essence="cycle source", content="source body")
         second = await store_thought_impl(store, essence="cycle target", content="target body")
         from_id = first["thought"]["thought_id"]
@@ -144,14 +249,32 @@ class TestEdgeRoundTripIntegration:
         await link_thoughts_impl(store, from_id, to_id, EdgeType.DEPENDS_ON)
 
         out = await get_edges_impl(store, from_id, direction="OUT")
-        assert out["edges"][0]["created_cycle"] == 0
-        assert await store.max_cycle() == 0
+        assert out["edges"][0]["created_cycle"] == ORIGIN_CYCLE
 
-    async def test_recency_now_passthrough_over_real_store(self, store: SqliteEngravaCore) -> None:
-        # Transaction-time recency executes end to end and returns well-formed.
-        result = await search_memory_impl(store, "coffee", recency_now=RECENCY_NOW)
-        assert isinstance(result["results"], list)
-        assert isinstance(result["backends_used"], list)
+
+class TestRecencyPassthrough:
+    """``recency_now`` reaches engrava's ranker and changes what comes back."""
+
+    async def test_recency_now_reorders_over_a_real_store(
+        self, recency_store: SqliteEngravaCore
+    ) -> None:
+        # A well-formed response is not evidence: the tool would return one just
+        # the same if recency_now were dropped on the way through. What
+        # discriminates is the corpus moving.
+        #
+        # The control runs first and is load-bearing — it pins that the corpus
+        # carries no latent ordering that would produce the ranked order below
+        # on its own.
+        control = await search_memory_impl(recency_store, RECENCY_QUERY)
+        assert "recency" not in control["backends_used"]
+        control_order = [entry["thought_id"] for entry in control["results"]]
+        assert sorted(control_order) == sorted(RECENCY_THOUGHT_IDS)
+        assert len({entry["score"] for entry in control["results"]}) == 1
+        assert control_order != RECENCY_EXPECTED_ORDER
+
+        ranked = await search_memory_impl(recency_store, RECENCY_QUERY, recency_now=RECENCY_NOW)
+        assert "recency" in ranked["backends_used"]
+        assert [entry["thought_id"] for entry in ranked["results"]] == RECENCY_EXPECTED_ORDER
 
 
 class TestFtsNormalizationRegression:

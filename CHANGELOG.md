@@ -14,6 +14,10 @@ and this project follows a one-way version mirror of [Engrava](https://github.co
 - Optional `metadata` on `link_thoughts` — attach JSON fields to an edge that `list_edges` can filter on.
 - Optional `recency_now` on `search_memory` — score recency against a caller-supplied timestamp (transaction time).
 
+### Fixed
+
+- Honour `recency_now` on the `ENGRAVA_DB_PATH` quick-start — recency is now scored against the supplied timestamp there, where the argument was previously accepted and silently ignored.
+
 ### Changed
 
 - Target Engrava 0.6 — now requires `engrava >=0.6,<0.7`.

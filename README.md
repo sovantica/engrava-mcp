@@ -80,7 +80,7 @@ The server resolves its store from environment variables, in priority order:
 | Variable | Meaning |
 |---|---|
 | `ENGRAVA_MCP_CONFIG` | Path to an `engrava.yaml`. Built with the full configuration — embedding provider, vector backend, journal, TTL. **Recommended.** |
-| `ENGRAVA_DB_PATH` | Path to a bare SQLite database file. Zero-config quick-start; no embedding provider is configured, so semantic (vector) search is inert — full-text search, the graph, MindQL, and the audit trail still work. |
+| `ENGRAVA_DB_PATH` | Path to a bare SQLite database file. Zero-config quick-start; no embedding provider is configured, so semantic (vector) search is inert — full-text search, the graph, MindQL, and the audit trail still work. "Zero-config" means Engrava's default search policy, so `search_memory`'s `recency_now` is honoured on this route too — recency is scored against the timestamp you supply, under Engrava's default search weights. |
 | `ENGRAVA_MCP_READ_ONLY` | When set to `1` / `true` / `yes`, the write tools are not registered, so the server exposes a read-only surface. |
 
 **Recommended:** give the MCP server the same `engrava.yaml` your application

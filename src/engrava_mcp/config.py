@@ -16,7 +16,8 @@ Two environment variables are recognised, in priority order:
     Path to a SQLite database file.  When set (and ``ENGRAVA_MCP_CONFIG``
     is not), a connection is opened directly and the core schema is
     ensured.  No embedding provider or vector backend is configured, so
-    hybrid search degrades to its lexical backend.
+    hybrid search runs without its vector arm.  Search itself runs under
+    engrava's default search policy (see :func:`_resolve_from_db_path`).
 
 :func:`resolve_store` returns a :class:`ResolvedStore` that bundles the
 store with an :meth:`~ResolvedStore.aclose` coroutine.  Closing the
@@ -34,7 +35,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import aiosqlite
-from engrava import SqliteEngravaCore, load_config
+from engrava import SearchConfig, SqliteEngravaCore, load_config
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -131,15 +132,47 @@ async def resolve_store() -> ResolvedStore:
     raise StoreResolutionError(msg)
 
 
+async def _configure_connection(connection: aiosqlite.Connection) -> None:
+    """Bring a freshly opened connection to the state store resolution needs.
+
+    Applies the concurrency pragmas that put the connection at parity with
+    :meth:`SqliteEngravaCore.from_config` — WAL journal, enforced foreign keys,
+    ``busy_timeout`` so a contended write waits for the lock instead of failing
+    immediately, and ``synchronous=NORMAL`` (the safe, faster WAL setting) — and
+    installs the row factory the store expects.
+
+    Factored out of :func:`_resolve_from_db_path` so a caller that needs a
+    connection prepared *identically* to the resolved one gets it from here
+    rather than re-listing the pragmas, which would drift.
+
+    Args:
+        connection: The connection to configure, in place.
+
+    """
+    await connection.execute("PRAGMA journal_mode=WAL")
+    await connection.execute("PRAGMA foreign_keys=ON")
+    await connection.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    await connection.execute("PRAGMA synchronous=NORMAL")
+    connection.row_factory = aiosqlite.Row
+
+
 async def _resolve_from_db_path(db_path: str) -> ResolvedStore:
     """Open a database file and build a store over it.
 
-    The connection is brought to parity with
-    :meth:`SqliteEngravaCore.from_config`'s concurrency pragmas: WAL journal,
-    enforced foreign keys, ``busy_timeout`` so a contended write waits for the
-    lock instead of failing immediately, and ``synchronous=NORMAL`` (the safe,
-    faster WAL setting).  The bare-database path configures no embedding
-    provider, so semantic search is inert and a warning is logged.
+    The connection is configured by :func:`_configure_connection`.  The
+    bare-database path configures no embedding provider, so semantic search is
+    inert and a warning is logged.
+
+    **"Zero-config" here means engrava's default search policy**, not "a store
+    handed no search configuration".  The two are not the same: a store built
+    without a :class:`~engrava.SearchConfig` resolves its recency fusion weight
+    to ``0.0``, which silently disables the transaction-time recency signal that
+    ``search_memory``'s ``recency_now`` argument selects — the argument would be
+    accepted and have no effect.  Passing a default ``SearchConfig`` gives this
+    launch the search policy an ``engrava.yaml`` declaring no ``search`` section
+    resolves to.  It equalises the *policy* only: a yaml that also configures an
+    embedding provider or a vector backend can rank differently, because this
+    launch configures neither.
 
     Args:
         db_path: Filesystem path to a SQLite database file.
@@ -151,12 +184,8 @@ async def _resolve_from_db_path(db_path: str) -> ResolvedStore:
     """
     connection = await aiosqlite.connect(str(Path(db_path)))
     try:
-        await connection.execute("PRAGMA journal_mode=WAL")
-        await connection.execute("PRAGMA foreign_keys=ON")
-        await connection.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-        await connection.execute("PRAGMA synchronous=NORMAL")
-        connection.row_factory = aiosqlite.Row
-        store = SqliteEngravaCore(connection)
+        await _configure_connection(connection)
+        store = SqliteEngravaCore(connection, search_config=SearchConfig())
         await store.ensure_schema()
     except Exception:
         await connection.close()

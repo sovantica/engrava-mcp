@@ -86,8 +86,34 @@ The server resolves its store from environment variables, in priority order:
 **Recommended:** give the MCP server the same `engrava.yaml` your application
 uses. The `yaml` is the only place to declare an embedding provider (and its
 model / key), which the server needs to embed a *new query* at search time for
-semantic search. With only `ENGRAVA_DB_PATH` set, the server logs a startup
+semantic search. With only `ENGRAVA_DB_PATH` set, the server emits a startup
 warning that semantic search is inert and points you at `ENGRAVA_MCP_CONFIG`.
+
+### Store-hook extensions need the config path
+
+Engrava extensions that hook the store — anything wired through an
+`engrava.yaml`'s `hooks:` section — are attached only on the
+`ENGRAVA_MCP_CONFIG` launch. `ENGRAVA_DB_PATH` opens a bare database and carries
+no configuration, so it runs with Engrava's default hooks and cannot attach a
+store-hook extension. That is deliberate: it is an intentionally minimal
+read/write facade.
+
+Installing such an extension and starting with `ENGRAVA_DB_PATH` therefore
+leaves its store hooks unattached in this server. When an installed package
+advertises any extension, the server emits a startup warning naming it — it
+reports what is advertised, not what each one does, since it never loads them
+itself — so you can tell the difference between "nothing advertised" and
+"advertised but nothing wired it here". If reading the installed-package
+metadata raises an ordinary error, the server attempts to log that instead and
+carries on starting. Both go through Python's `logging`, so whether and where
+they surface is up to your logging configuration. To wire a store hook, launch
+with `ENGRAVA_MCP_CONFIG` pointing at an `engrava.yaml` with a `hooks:`
+section:
+
+```yaml
+hooks:
+  class: "my_package.hooks.MyHooks"
+```
 
 ### Example `engrava.yaml`
 

@@ -13,6 +13,7 @@ and this project follows a one-way version mirror of [Engrava](https://github.co
 - `get_edges` and `list_edges` tools — read and browse the memory graph's edges: traverse a thought's edges by direction, or filter edges by type, source, or metadata.
 - Optional `metadata` on `link_thoughts` — attach JSON fields to an edge that `list_edges` can filter on.
 - Optional `recency_now` on `search_memory` — score recency against a caller-supplied timestamp (transaction time).
+- Report the Engrava extensions advertised by installed packages at startup on the `ENGRAVA_DB_PATH` launch, which attaches no extension hooks and so leaves a store-hook extension inactive.
 
 ### Fixed
 

@@ -35,7 +35,7 @@ dependencies = [
     # Cap the MCP SDK major so a future incompatible release can't silently
     # break `uvx engrava-mcp`; widen only after testing a new major. mcp>=1.27
     # transitively constrains pydantic>=2.11,<3 (the floor engrava also targets).
-    "mcp>=1.27,<2",
+    "mcp>=1.27,<3",
     # Default bundle for the bare `uvx engrava-mcp` (the registry one-click):
     # the vector backend plus the http-based embedding providers' dependency,
     # so semantic search and OpenAI/Ollama embeddings work out of the box once

@@ -54,9 +54,6 @@ jobs:
   dependency-audit:
     name: Dependency CVE audit
     runs-on: ubuntu-latest
-    env:
-      TARGET_VENV: ${{ runner.temp }}/target-venv
-      AUDIT_VENV: ${{ runner.temp }}/pip-audit-venv
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -85,17 +82,17 @@ jobs:
       # with one of the tools would be imported in preference to it.
       - name: Install package
         run: |
-          python -I -m venv "${TARGET_VENV}"
+          python -I -m venv "${RUNNER_TEMP}/target-venv"
           # pip lives in that site directory too, so it is inside the audited
           # set, and the runner image can ship one with a freshly disclosed CVE.
           # Upgrading clears such a finding for real rather than suppressing it.
-          "${TARGET_VENV}/bin/python" -I -m pip install --upgrade pip
-          "${TARGET_VENV}/bin/python" -I -m pip install .
+          "${RUNNER_TEMP}/target-venv/bin/python" -I -m pip install --upgrade pip
+          "${RUNNER_TEMP}/target-venv/bin/python" -I -m pip install .
           # A dependency gate is only worth running if the dependencies arrived.
           # An install that skipped them would leave the root and pip alone in
           # here, and that audits clean for want of anything to audit — so ask
           # pip whether every requirement it resolved is actually satisfied.
-          "${TARGET_VENV}/bin/python" -I -m pip check
+          "${RUNNER_TEMP}/target-venv/bin/python" -I -m pip check
       # Installing the package is how the dependency closure gets resolved; the
       # package itself is not part of what this job checks. It is ours, built
       # from this very checkout, and an advisory against it is not something a
@@ -117,17 +114,17 @@ jobs:
           # spellings of one name cannot compare unequal.
           root="$(python -I -c 'import pathlib, re, tomllib; name = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["name"]; print(re.sub(r"[-_.]+", "-", name).lower())')"
           names='import importlib.metadata as m, re; print("\n".join(sorted({re.sub(r"[-_.]+", "-", d.name).lower() for d in m.distributions()})))'
-          "${TARGET_VENV}/bin/python" -I -c "$names" > "${RUNNER_TEMP}/before.txt"
-          if ! "${TARGET_VENV}/bin/python" -I -m pip show "$root" > /dev/null 2>&1; then
+          "${RUNNER_TEMP}/target-venv/bin/python" -I -c "$names" > "${RUNNER_TEMP}/before.txt"
+          if ! "${RUNNER_TEMP}/target-venv/bin/python" -I -m pip show "$root" > /dev/null 2>&1; then
             echo "::error::'$root' is not installed; the audited set was never what this job assumes"
             exit 1
           fi
-          "${TARGET_VENV}/bin/python" -I -m pip uninstall -y "$root"
-          if "${TARGET_VENV}/bin/python" -I -m pip show "$root" > /dev/null 2>&1; then
+          "${RUNNER_TEMP}/target-venv/bin/python" -I -m pip uninstall -y "$root"
+          if "${RUNNER_TEMP}/target-venv/bin/python" -I -m pip show "$root" > /dev/null 2>&1; then
             echo "::error::'$root' is still installed after uninstall"
             exit 1
           fi
-          "${TARGET_VENV}/bin/python" -I -c "$names" > "${RUNNER_TEMP}/after.txt"
+          "${RUNNER_TEMP}/target-venv/bin/python" -I -c "$names" > "${RUNNER_TEMP}/after.txt"
           removed="$(comm -23 "${RUNNER_TEMP}/before.txt" "${RUNNER_TEMP}/after.txt")"
           added="$(comm -13 "${RUNNER_TEMP}/before.txt" "${RUNNER_TEMP}/after.txt")"
           if [ "$removed" != "$root" ] || [ -n "$added" ]; then
@@ -142,8 +139,8 @@ jobs:
       # repaired and the audit then reports a clean tree it should have failed.
       - name: Run pip-audit
         run: |
-          python -I -m venv "${AUDIT_VENV}"
-          "${AUDIT_VENV}/bin/python" -I -m pip install pip-audit
+          python -I -m venv "${RUNNER_TEMP}/pip-audit-venv"
+          "${RUNNER_TEMP}/pip-audit-venv/bin/python" -I -m pip install pip-audit
           # The site directory is asked of the interpreter that owns it, and
           # assigned rather than substituted inline so a failure to answer stops
           # the step: pip-audit does not descend into subdirectories, so a wrong
@@ -153,7 +150,7 @@ jobs:
           # than of virtualenvs: the scheme templates differ — purelib hangs off
           # base, platlib off platbase and platlibdir — so where they resolve
           # apart, compiled distributions would sit outside a single-path audit.
-          sites="$("${TARGET_VENV}/bin/python" -I -c 'import sysconfig; p = sysconfig.get_paths(); print("\n".join(dict.fromkeys((p["purelib"], p["platlib"]))))')"
+          sites="$("${RUNNER_TEMP}/target-venv/bin/python" -I -c 'import sysconfig; p = sysconfig.get_paths(); print("\n".join(dict.fromkeys((p["purelib"], p["platlib"]))))')"
           # pip-audit does not descend into subdirectories, so a path one level
           # out audits nothing and reports it clean. Each path is therefore only
           # worth passing if distributions are actually visible at it.
@@ -170,7 +167,7 @@ jobs:
           # --strict also fails on a dependency that could NOT be audited, not
           # only on one with a known CVE, so a silently skipped distribution
           # cannot pass for a clean one.
-          "${AUDIT_VENV}/bin/python" -I -m pip_audit --strict "${audit_args[@]}"
+          "${RUNNER_TEMP}/pip-audit-venv/bin/python" -I -m pip_audit --strict "${audit_args[@]}"
 
   test:
     runs-on: ubuntu-latest

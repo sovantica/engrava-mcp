@@ -18,6 +18,7 @@ from engrava import (
     SqliteEngravaCore,
     ThoughtType,
 )
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session as connect_client
 
 from engrava_mcp import build_server
@@ -503,3 +504,36 @@ class TestStoreResolution:
         monkeypatch.delenv(DB_PATH_ENV_VAR, raising=False)
         with pytest.raises(StoreResolutionError):
             await resolve_store()
+
+
+class TestSurfaceAfterShutdown:
+    """A tool called after the lifespan has ended answers, it does not crash."""
+
+    async def test_a_tool_called_after_shutdown_reports_the_store_is_unavailable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # Shutdown forgets the store as well as closing the connection. If it
+        # only closed the connection, the surface would keep handing out a store
+        # whose connection is gone and a late call would surface the driver's
+        # own text instead of the curated "not available yet" message. Asserting
+        # the curated wording is what tells the two apart: both raise.
+        monkeypatch.setenv(DB_PATH_ENV_VAR, str(tmp_path / "shutdown.db"))
+        monkeypatch.delenv(CONFIG_ENV_VAR, raising=False)
+        monkeypatch.delenv(READ_ONLY_ENV_VAR, raising=False)
+
+        server = build_server()
+        lifespan = server.settings.lifespan
+        assert lifespan is not None, "the built server must carry a lifespan"
+        async with lifespan(server):
+            # Serving: the same call succeeds while the lifespan is running, so
+            # the failure below is attributable to shutdown and not to the call.
+            assert await server.call_tool("memory_stats", {}) is not None
+
+        with pytest.raises(ToolError) as excinfo:
+            await server.call_tool("memory_stats", {})
+
+        text = str(excinfo.value)
+        assert "The engrava memory store is not available yet" in text
+        assert DB_PATH_ENV_VAR in text

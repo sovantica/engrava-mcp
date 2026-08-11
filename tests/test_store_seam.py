@@ -33,6 +33,14 @@ observable change and no black-box test can fail on it:
 ``journal_mode`` and ``synchronous`` have no such backstop: deleting either line
 changes the connection and fails these tests directly.
 
+The seam also carries the promise this module's docstring makes about *cleanup*:
+closing the ``ResolvedStore`` releases the underlying connection whichever path
+produced it.  ``TestConnectionRelease`` observes the release on the connection
+itself rather than the call that is supposed to perform it — closing the store
+object instead of the connection is a plausible refactor (a caller-supplied
+connection is not owned by the store, so ``store.close()`` is a documented
+no-op) and leaves every "``aclose`` was called" assertion green.
+
 The same seam carries the **search policy** the bare-database launch runs under.
 A store built with no ``SearchConfig`` resolves its recency fusion weight to
 ``0.0``, which silently disables ``search_memory``'s ``recency_now``; the
@@ -233,6 +241,34 @@ class TestBareDatabasePragmas:
             assert await _read_pragma(captured.connection, "synchronous") == SYNCHRONOUS_NORMAL
         finally:
             await captured.resolved.aclose()
+
+
+class TestConnectionRelease:
+    """Closing the resolved store releases the connection it was built over."""
+
+    async def test_closing_the_resolved_store_releases_the_connection(
+        self, monkeypatch: pytest.MonkeyPatch, bare_db_env: None
+    ) -> None:
+        # The claim under test is *release*, not "a close coroutine ran", so the
+        # subject is the connection this route opened rather than the call that
+        # was supposed to close it. Usable before and unusable afterwards is the
+        # whole assertion: the "before" half is what stops the "after" half from
+        # passing for some unrelated reason, and a teardown that closes the
+        # store object instead leaves the connection working and fails here.
+        #
+        # Neither the exception type nor its text is pinned — those belong to
+        # the driver — only that the operation stops working.
+        captured = await _resolve_capturing_connection(monkeypatch)
+
+        assert await _read_pragma(captured.connection, "foreign_keys") == FOREIGN_KEYS_ON
+        assert await captured.resolved.store.count_thoughts() == 0
+
+        await captured.resolved.aclose()
+
+        with pytest.raises(Exception):
+            await captured.connection.execute("PRAGMA foreign_keys;")
+        with pytest.raises(Exception):
+            await captured.resolved.store.count_thoughts()
 
 
 class TestResolvedStoreBehaviour:

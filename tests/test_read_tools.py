@@ -100,11 +100,20 @@ class TestSearchMemoryRecency:
     ) -> None:
         # At the tool boundary the recency error becomes a clean, format-only
         # ToolError that names no engrava internals.
+        #
+        # The leading sentence alone does not discriminate: engrava's own text
+        # opens with the same words and then echoes the rejected value, which is
+        # precisely what this arm exists to stop. The two assertions that tell
+        # the curated message from the raw one are therefore the example it
+        # offers instead, and the absence of the caller's rejected value.
+        rejected = "yesterday-ish"
         with pytest.raises(ToolError) as excinfo:
             async with _tool_errors():
-                await search_memory_impl(store, "coffee", recency_now="not-a-timestamp")
+                await search_memory_impl(store, "coffee", recency_now=rejected)
         text = str(excinfo.value)
         assert "recency_now must be an ISO-8601 timestamp" in text
+        assert "2026-07-20T14:30:00Z" in text
+        assert rejected not in text
         assert "InvalidRecencyArgumentError" not in text
 
 

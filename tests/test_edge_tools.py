@@ -31,6 +31,7 @@ from mcp.shared.memory import create_connected_server_and_client_session as conn
 
 from engrava_mcp.server import (
     DEFAULT_EDGE_LIST_LIMIT,
+    READ_ONLY_ENV_VAR,
     SERVER_NAME,
     StoreProvider,
     _tool_errors,
@@ -360,6 +361,110 @@ class TestEdgeToolsOverTheWire:
         assert result.isError is False
         assert result.structuredContent is not None
         assert {edge["edge_id"] for edge in result.structuredContent["edges"]} == {"e1", "e3"}
+
+
+class TestEdgeMetadataCrossesTheWire:
+    """Edge metadata supplied by a client reaches the store and comes back."""
+
+    async def test_link_thoughts_metadata_survives_the_wire(
+        self, edge_store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Metadata on link_thoughts is guarded at the implementation level only,
+        # so a wire handler that stopped forwarding the argument would keep the
+        # feature's own tests green while the shipped tool silently dropped it.
+        # The read-back is a second wire call, so the metadata is observed as
+        # stored rather than echoed out of the write's own response.
+        monkeypatch.delenv(READ_ONLY_ENV_VAR, raising=False)
+        metadata = {"topic": "wire", "batch": 9}
+
+        async with _client_for(edge_store) as client:
+            created = await client.call_tool(
+                "link_thoughts",
+                {
+                    "from_thought_id": "t3",
+                    "to_thought_id": "t1",
+                    "edge_type": "ASSOCIATED",
+                    "metadata": metadata,
+                },
+            )
+            assert created.isError is False
+            assert created.structuredContent is not None
+            assert created.structuredContent["edge"]["metadata"] == metadata
+            edge_id = created.structuredContent["edge"]["edge_id"]
+
+            listed = await client.call_tool("list_edges", {"metadata_equals": {"topic": "wire"}})
+
+        assert listed.structuredContent is not None
+        assert [edge["edge_id"] for edge in listed.structuredContent["edges"]] == [edge_id]
+        assert listed.structuredContent["edges"][0]["metadata"] == metadata
+
+
+class TestEdgeReadDefaultsAtTheWire:
+    """The defaults a client actually gets, not only the constants behind them."""
+
+    async def test_get_edges_without_a_direction_returns_both_ends(
+        self, edge_store: SqliteEngravaCore
+    ) -> None:
+        # t2 is the target of e1 and the source of e2, so the default is
+        # observable: BOTH returns the pair, either one-way default returns one.
+        async with _client_for(edge_store) as client:
+            result = await client.call_tool("get_edges", {"thought_id": "t2"})
+
+        assert result.isError is False
+        assert result.structuredContent is not None
+        assert {edge["edge_id"] for edge in result.structuredContent["edges"]} == {"e1", "e2"}
+
+    async def test_list_edges_without_a_limit_returns_one_default_page(
+        self, edge_store: SqliteEngravaCore
+    ) -> None:
+        # Seed past the default page so the cap is observable: unparameterised,
+        # a client gets DEFAULT_EDGE_LIST_LIMIT rows, not the whole store.
+        for index in range(DEFAULT_EDGE_LIST_LIMIT):
+            await edge_store.create_thought(_thought(f"bulk-{index}"))
+            await edge_store.create_edge(
+                EdgeRecord(
+                    edge_id=f"bulk-e{index}",
+                    from_thought_id=f"bulk-{index}",
+                    to_thought_id="t1",
+                    edge_type=EdgeType.ASSOCIATED,
+                    weight=1.0,
+                    created_cycle=0,
+                )
+            )
+        # The store really holds more than one page, so the count below is a cap
+        # and not the whole store.
+        total = await list_edges_impl(edge_store, limit=DEFAULT_EDGE_LIST_LIMIT + 3)
+        assert total["count"] == DEFAULT_EDGE_LIST_LIMIT + 3
+
+        async with _client_for(edge_store) as client:
+            result = await client.call_tool("list_edges", {})
+
+        assert result.isError is False
+        assert result.structuredContent is not None
+        assert result.structuredContent["count"] == DEFAULT_EDGE_LIST_LIMIT
+
+    async def test_an_unknown_direction_is_rejected_at_the_boundary(
+        self, edge_store: SqliteEngravaCore
+    ) -> None:
+        # Widened from an enumeration to a plain string, an unknown direction is
+        # no longer rejected anywhere: engrava returns no edges for one, so a
+        # typo stops being an error and becomes a silent empty result — the
+        # worst answer of the three, because it reads as "no such edges".
+        #
+        # The rejection is asserted, not the shape of the generated schema that
+        # produces it: which of enum / const / a referenced definition pydantic
+        # emits is not this server's contract, and the accepted value alongside
+        # it keeps the rejection from being a tool that simply never works.
+        async with _client_for(edge_store) as client:
+            rejected = await client.call_tool(
+                "get_edges", {"thought_id": "t2", "direction": "SIDEWAYS"}
+            )
+            accepted = await client.call_tool("get_edges", {"thought_id": "t2", "direction": "IN"})
+
+        assert rejected.isError is True
+        assert accepted.isError is False
+        assert accepted.structuredContent is not None
+        assert {edge["edge_id"] for edge in accepted.structuredContent["edges"]} == {"e1"}
 
 
 def test_default_edge_list_limit_is_documented() -> None:

@@ -31,6 +31,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.exceptions import McpError
 from mcp.shared.memory import create_connected_server_and_client_session as connect_client
 
+import engrava_mcp.server as server_module
 from engrava_mcp.server import (
     MAX_PAGE_LIMIT,
     MAX_TOP_K,
@@ -314,14 +315,40 @@ class TestBoundErrorsAreCleanAtTheBoundary:
         assert result.structuredContent is not None
         assert result.structuredContent["limit"] == 2
 
-    async def test_negative_prompt_limit_is_rejected_over_the_wire(
-        self, store: SqliteEngravaCore
+    async def test_negative_prompt_limit_is_rejected_before_the_body_runs(
+        self,
+        store: SqliteEngravaCore,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # The prompt's limit crosses the wire too, so it is bounded as well.
-        # Here the advertised schema rejects it before the body runs.
+        # The prompt's limit crosses the wire too, so it is bounded twice over:
+        # by the advertised annotation, and by the domain guard inside the body
+        # for the paths where the protocol layer does not apply. The claim here
+        # is the first of those — and the error alone cannot carry it, because
+        # the in-body guard also surfaces as an McpError mentioning "limit".
+        #
+        # What tells them apart is whether the body ran at all. The store call
+        # the body makes is recorded, so with the bound dropped from the
+        # annotation the body proceeds, the call is recorded, and this fails.
+        reached_the_body: list[int] = []
+        real_recent_thoughts = server_module.recent_thoughts_impl
+
+        async def _recording_recent_thoughts(
+            store: SqliteEngravaCore, *, limit: int
+        ) -> dict[str, object]:
+            reached_the_body.append(limit)
+            return await real_recent_thoughts(store, limit=limit)
+
+        monkeypatch.setattr(server_module, "recent_thoughts_impl", _recording_recent_thoughts)
+
         async with _client_for(store) as client:
             with pytest.raises(McpError) as excinfo:
                 await client.get_prompt("summarize_recent_memory", {"limit": "-1"})
+            # Control: an in-range limit does reach the body through the same
+            # recorder, so the emptiness asserted below is the rejection and not
+            # a recorder that never observes anything.
+            await client.get_prompt("summarize_recent_memory", {"limit": "2"})
+
+        assert reached_the_body == [2]
         # The rejection names the offending argument, not our internal symbol.
         text = str(excinfo.value)
         assert "limit" in text.lower()

@@ -885,3 +885,10 @@ class TestFakeExtensionsDoNotLeak:
             assert _unwired_warnings(captured_warnings) == []
         finally:
             await resolved.aclose()
+
+
+def test_extensions_entry_point_group_is_the_name_engrava_publishes_under() -> None:
+    # The group name is a contract with engrava, not a local label: every test
+    # above reads the constant, so renaming it keeps them green while no
+    # installed extension is ever detected again. The literal is the contract.
+    assert EXTENSIONS_ENTRY_POINT_GROUP == "engrava.extensions"

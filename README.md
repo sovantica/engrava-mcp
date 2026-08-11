@@ -187,7 +187,8 @@ command are rejected.
 
 `link_thoughts` accepts optional edge `metadata` (JSON fields that `list_edges`
 can filter on). `search_memory` accepts an optional `recency_now` (ISO-8601
-timestamp) to score recency against transaction time.
+timestamp) giving the moment to measure age against (transaction time); recency
+takes part in the ranking only when you pass it.
 
 ## Development
 

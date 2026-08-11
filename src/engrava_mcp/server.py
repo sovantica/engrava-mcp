@@ -681,8 +681,13 @@ async def search_memory_impl(
         priority: When set, keep only hits at this priority level.
         recency_now: Optional ISO-8601 timestamp used as "now" for the
             recency signal, letting a stateless consumer score recency by
-            transaction time instead of a cognitive-cycle clock.  When
-            omitted the ranker uses its own default.
+            transaction time instead of a cognitive-cycle clock.  This
+            server runs no such clock, so this argument is the only
+            recency reference it can supply: when it is omitted the
+            recency signal takes no part in ranking and ``recency`` does
+            not appear in ``backends_used``.  Supplying it is necessary
+            rather than sufficient — a store whose configuration gives
+            the recency signal no weight still ranks without it.
 
     Returns:
         A dict with a ``results`` list of ``{"thought_id", "score"}``
@@ -1667,9 +1672,9 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
             "these filters are applied after ranking, so a filtered call may "
             "return fewer than top_k results and reports how many ranked hits "
             "were dropped. For an exhaustive, unranked, paginated listing by "
-            "those same fields, use list_memory instead. Pass recency_now as an "
-            "ISO-8601 timestamp to score recency against that moment (transaction "
-            "time) rather than the store's default."
+            "those same fields, use list_memory instead. Recency takes part in "
+            "the ranking only when you pass recency_now: an ISO-8601 timestamp "
+            "giving the moment to measure age against (transaction time)."
         ),
         annotations=_READ_ONLY,
     )

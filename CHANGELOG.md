@@ -22,6 +22,7 @@ and this project follows a one-way version mirror of [Engrava](https://github.co
 ### Changed
 
 - Target Engrava 0.6 — now requires `engrava >=0.6,<0.7`.
+- Point the `Documentation` project URL at the MCP server guide instead of the repository.
 - Validate the numeric bounds accepted by the search, list, and query tools — a negative, zero, or excessively large `limit`, `top_k`, or `offset` is now rejected instead of silently returning an unbounded result. Callers that previously passed a value outside the accepted range now get an error.
 
 ## [0.5.1]
@@ -47,5 +48,6 @@ First standalone release of the Engrava MCP server.
 
 - Extracted from the former `engrava[mcp]` extra into this standalone package. Install `engrava-mcp` (or `uvx engrava-mcp`) instead of `pip install "engrava[mcp]"`, and update any pinned `engrava[mcp]` requirements to depend on `engrava-mcp`.
 
+[0.6.0]: https://github.com/sovantica/engrava-mcp/releases/tag/v0.6.0
 [0.5.1]: https://github.com/sovantica/engrava-mcp/releases/tag/v0.5.1
 [0.5.0]: https://github.com/sovantica/engrava-mcp/releases/tag/v0.5.0

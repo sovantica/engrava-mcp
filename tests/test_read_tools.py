@@ -17,13 +17,16 @@ from engrava import (
     SqliteEngravaCore,
     ThoughtType,
 )
+from engrava.domain.exceptions import InvalidRecencyArgumentError
 from engrava.mindql.parser import MindQLParseError
+from mcp.server.fastmcp.exceptions import ToolError
 
 from engrava_mcp.server import (
     DEFAULT_TOP_K,
     StoreNotReadyError,
     StoreProvider,
     UnsupportedQueryError,
+    _tool_errors,
     get_thought_impl,
     list_memory_impl,
     memory_stats_impl,
@@ -74,6 +77,44 @@ class TestSearchMemory:
     async def test_exclude_reflections_flag_is_passed(self, store: SqliteEngravaCore) -> None:
         result = await search_memory_impl(store, "tea", include_reflections=False)
         assert [entry["thought_id"] for entry in result["results"]] == ["thought-beta"]
+
+
+class TestSearchMemoryRecency:
+    """Tests for the optional ``recency_now`` argument on ``search_memory``."""
+
+    async def test_valid_iso_timestamp_is_accepted(self, store: SqliteEngravaCore) -> None:
+        # A well-formed ISO-8601 "now" is threaded into the ranker and the call
+        # returns its normal shape (results + backends), unchanged.
+        result = await search_memory_impl(store, "coffee", recency_now="2026-07-20T00:00:00Z")
+        assert [entry["thought_id"] for entry in result["results"]] == ["thought-alpha"]
+        assert "fts5" in result["backends_used"]
+
+    async def test_invalid_timestamp_reaches_the_store(self, store: SqliteEngravaCore) -> None:
+        # An unparseable timestamp raises engrava's recency error — proving the
+        # argument is actually passed through to the ranker, not dropped.
+        with pytest.raises(InvalidRecencyArgumentError):
+            await search_memory_impl(store, "coffee", recency_now="not-a-timestamp")
+
+    async def test_invalid_timestamp_maps_to_clean_tool_error(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # At the tool boundary the recency error becomes a clean, format-only
+        # ToolError that names no engrava internals.
+        #
+        # The leading sentence alone does not discriminate: engrava's own text
+        # opens with the same words and then echoes the rejected value, which is
+        # precisely what this arm exists to stop. The two assertions that tell
+        # the curated message from the raw one are therefore the example it
+        # offers instead, and the absence of the caller's rejected value.
+        rejected = "yesterday-ish"
+        with pytest.raises(ToolError) as excinfo:
+            async with _tool_errors():
+                await search_memory_impl(store, "coffee", recency_now=rejected)
+        text = str(excinfo.value)
+        assert "recency_now must be an ISO-8601 timestamp" in text
+        assert "2026-07-20T14:30:00Z" in text
+        assert rejected not in text
+        assert "InvalidRecencyArgumentError" not in text
 
 
 class TestSearchKeywords:

@@ -25,6 +25,8 @@ READ_TOOL_NAMES = frozenset(
         "list_memory",
         "query_memory",
         "memory_stats",
+        "get_edges",
+        "list_edges",
     }
 )
 
@@ -86,3 +88,10 @@ class TestTruthyParsing:
     def test_unset_keeps_writes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(READ_ONLY_ENV_VAR, raising=False)
         assert _read_only_enabled() is False
+
+
+def test_read_only_env_var_is_the_documented_name() -> None:
+    # Every other test here reads the constant, so a rename would keep them all
+    # green while silently ignoring the variable in every deployed client
+    # configuration that names it. The literal is the contract.
+    assert READ_ONLY_ENV_VAR == "ENGRAVA_MCP_READ_ONLY"

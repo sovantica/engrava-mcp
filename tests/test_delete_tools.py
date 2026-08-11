@@ -19,6 +19,7 @@ from engrava_mcp.server import (
     delete_thought_impl,
     get_thought_impl,
     link_thoughts_impl,
+    list_edges_impl,
 )
 
 if TYPE_CHECKING:
@@ -94,3 +95,23 @@ class TestDeleteEdge:
     async def test_unknown_id_is_not_an_error(self, store: SqliteEngravaCore) -> None:
         result = await delete_edge_impl(store, "never-existed")
         assert result == {"deleted": False}
+
+    async def test_only_the_named_edge_is_removed(self, store: SqliteEngravaCore) -> None:
+        # The blast radius of a destructive tool. Every other case here holds a
+        # single edge, where "delete the named edge" and "delete every edge" are
+        # indistinguishable — both report deleted=True and leave nothing behind.
+        # Two edges tell them apart: the survivor is the assertion.
+        doomed = await link_thoughts_impl(
+            store, "thought-alpha", "thought-beta", EdgeType.ASSOCIATED
+        )
+        spared = await link_thoughts_impl(
+            store, "thought-alpha", "thought-beta", EdgeType.DEPENDS_ON
+        )
+        doomed_id = doomed["edge"]["edge_id"]
+        spared_id = spared["edge"]["edge_id"]
+        assert doomed_id != spared_id
+
+        assert await delete_edge_impl(store, doomed_id) == {"deleted": True}
+
+        remaining = await list_edges_impl(store)
+        assert [edge["edge_id"] for edge in remaining["edges"]] == [spared_id]

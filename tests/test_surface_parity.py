@@ -5,9 +5,9 @@ internal modules.  These tests pin the externally observable surface so the
 package keeps exposing exactly what an MCP client (and the registry listing)
 expects:
 
-* the full **11 tools / 3 resources / 3 prompts** in the default deployment;
+* the full **13 tools / 3 resources / 3 prompts** in the default deployment;
 * write-gating via ``ENGRAVA_MCP_READ_ONLY`` (the five write tools disappear
-  while the read tools, resources, and prompts remain);
+  while the eight read tools, resources, and prompts remain);
 * runnable entry points for both the console script and ``python -m`` running;
 * **no import of an engrava private module** — only the documented public API.
 """
@@ -25,7 +25,7 @@ from engrava_mcp import build_server
 from engrava_mcp.config import CONFIG_ENV_VAR, DB_PATH_ENV_VAR
 from engrava_mcp.server import READ_ONLY_ENV_VAR, main
 
-#: Every tool the default deployment must advertise (6 read + 5 write = 11).
+#: Every tool the default deployment must advertise (8 read + 5 write = 13).
 EXPECTED_READ_TOOLS = frozenset(
     {
         "get_thought",
@@ -34,6 +34,8 @@ EXPECTED_READ_TOOLS = frozenset(
         "list_memory",
         "query_memory",
         "memory_stats",
+        "get_edges",
+        "list_edges",
     }
 )
 EXPECTED_WRITE_TOOLS = frozenset(
@@ -72,8 +74,8 @@ def _bare_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv(READ_ONLY_ENV_VAR, raising=False)
 
 
-async def test_default_surface_is_eleven_tools_three_resources_three_prompts() -> None:
-    """The default deployment exposes exactly 11 tools, 3 resources, 3 prompts."""
+async def test_default_surface_is_thirteen_tools_three_resources_three_prompts() -> None:
+    """The default deployment exposes exactly 13 tools, 3 resources, 3 prompts."""
     server = build_server()
     async with connect_client(server) as client:
         tools = await client.list_tools()
@@ -83,7 +85,7 @@ async def test_default_surface_is_eleven_tools_three_resources_three_prompts() -
 
     tool_names = {tool.name for tool in tools.tools}
     assert tool_names == EXPECTED_TOOLS
-    assert len(tool_names) == 11
+    assert len(tool_names) == 13
 
     static_uris = {str(resource.uri) for resource in resources.resources}
     template_uris = {str(template.uriTemplate) for template in templates.resourceTemplates}
@@ -108,7 +110,10 @@ async def test_read_only_gating_hides_only_write_tools(
         templates = await client.list_resource_templates()
         prompts = await client.list_prompts()
 
-    assert {tool.name for tool in tools.tools} == EXPECTED_READ_TOOLS
+    read_tool_names = {tool.name for tool in tools.tools}
+    assert read_tool_names == EXPECTED_READ_TOOLS
+    # The edge-read tools are reads, so gating never hides them.
+    assert {"get_edges", "list_edges"} <= read_tool_names
     # Resources and prompts are reads by definition, so gating never hides them.
     static_uris = {str(resource.uri) for resource in resources.resources}
     template_uris = {str(template.uriTemplate) for template in templates.resourceTemplates}

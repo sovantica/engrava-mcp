@@ -36,10 +36,11 @@ are independent.
 | engrava-mcp | Works with engrava |
 |---|---|
 | `0.5.x` | `>=0.5,<0.6` |
+| `0.6.x` | `>=0.6,<0.7` |
 
 The dependency range is the source of truth. Normal installs resolve a compatible
 `engrava` automatically; if you pin `engrava` yourself, keep it within that range. If no
-matching `engrava-mcp` exists yet for a newer `engrava` (e.g. a fresh `engrava 0.6`), that
+matching `engrava-mcp` exists yet for a newer `engrava` (e.g. a fresh `engrava 0.7`), that
 pairing is **not yet verified/supported** — not broken; stay on a supported pair until a
 matching `engrava-mcp` ships.
 
@@ -79,14 +80,40 @@ The server resolves its store from environment variables, in priority order:
 | Variable | Meaning |
 |---|---|
 | `ENGRAVA_MCP_CONFIG` | Path to an `engrava.yaml`. Built with the full configuration — embedding provider, vector backend, journal, TTL. **Recommended.** |
-| `ENGRAVA_DB_PATH` | Path to a bare SQLite database file. Zero-config quick-start; no embedding provider is configured, so semantic (vector) search is inert — full-text search, the graph, MindQL, and the audit trail still work. |
+| `ENGRAVA_DB_PATH` | Path to a bare SQLite database file. Zero-config quick-start; no embedding provider is configured, so semantic (vector) search is inert — full-text search, the graph, MindQL, and the audit trail still work. "Zero-config" means Engrava's default search policy, so `search_memory`'s `recency_now` is honoured on this route too — recency is scored against the timestamp you supply, under Engrava's default search weights. |
 | `ENGRAVA_MCP_READ_ONLY` | When set to `1` / `true` / `yes`, the write tools are not registered, so the server exposes a read-only surface. |
 
 **Recommended:** give the MCP server the same `engrava.yaml` your application
 uses. The `yaml` is the only place to declare an embedding provider (and its
 model / key), which the server needs to embed a *new query* at search time for
-semantic search. With only `ENGRAVA_DB_PATH` set, the server logs a startup
+semantic search. With only `ENGRAVA_DB_PATH` set, the server emits a startup
 warning that semantic search is inert and points you at `ENGRAVA_MCP_CONFIG`.
+
+### Store-hook extensions need the config path
+
+Engrava extensions that hook the store — anything wired through an
+`engrava.yaml`'s `hooks:` section — are attached only on the
+`ENGRAVA_MCP_CONFIG` launch. `ENGRAVA_DB_PATH` opens a bare database and carries
+no configuration, so it runs with Engrava's default hooks and cannot attach a
+store-hook extension. That is deliberate: it is an intentionally minimal
+read/write facade.
+
+Installing such an extension and starting with `ENGRAVA_DB_PATH` therefore
+leaves its store hooks unattached in this server. When an installed package
+advertises any extension, the server emits a startup warning naming it — it
+reports what is advertised, not what each one does, since it never loads them
+itself — so you can tell the difference between "nothing advertised" and
+"advertised but nothing wired it here". If reading the installed-package
+metadata raises an ordinary error, the server attempts to log that instead and
+carries on starting. Both go through Python's `logging`, so whether and where
+they surface is up to your logging configuration. To wire a store hook, launch
+with `ENGRAVA_MCP_CONFIG` pointing at an `engrava.yaml` with a `hooks:`
+section:
+
+```yaml
+hooks:
+  class: "my_package.hooks.MyHooks"
+```
 
 ### Example `engrava.yaml`
 
@@ -144,16 +171,24 @@ uvx --from "engrava-mcp[ollama]" engrava-mcp   # Ollama embeddings deps
 
 ## The surface
 
-- **Tools (11):** `get_thought`, `search_memory`, `search_keywords`,
-  `list_memory`, `query_memory`, `memory_stats` (read); `store_thought`,
-  `update_thought`, `link_thoughts`, `delete_thought`, `delete_edge` (write,
-  gated by `ENGRAVA_MCP_READ_ONLY`).
+- **Tools (13):** `get_thought`, `search_memory`, `search_keywords`,
+  `list_memory`, `query_memory`, `memory_stats`, `get_edges`, `list_edges`
+  (read); `store_thought`, `update_thought`, `link_thoughts`, `delete_thought`,
+  `delete_edge` (write, gated by `ENGRAVA_MCP_READ_ONLY`).
 - **Resources (3):** `engrava://thought/{thought_id}`, `engrava://stats`,
   `engrava://recent`.
 - **Prompts (3):** `summarize_recent_memory`, `find_related`, `reflect_on_topic`.
 
 `query_memory` accepts only MindQL `FIND` queries; raw SQL and every other
 command are rejected.
+
+`get_edges` traverses a thought's edges by direction (`IN` / `OUT` / `BOTH`);
+`list_edges` browses edges filtered by type, source, or metadata.
+
+`link_thoughts` accepts optional edge `metadata` (JSON fields that `list_edges`
+can filter on). `search_memory` accepts an optional `recency_now` (ISO-8601
+timestamp) giving the moment to measure age against (transaction time); recency
+takes part in the ranking only when you pass it.
 
 ## Development
 

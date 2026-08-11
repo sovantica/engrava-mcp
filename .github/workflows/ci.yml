@@ -12,14 +12,14 @@ permissions:
 # ---------------------------------------------------------------------------
 # engrava dependency resolution
 # ---------------------------------------------------------------------------
-# engrava-mcp depends on `engrava>=0.5,<0.6` (and the `engrava[vec]` extra).
-# engrava 0.5.0 is published on PyPI, so every job installs the package normally
-# with `pip install -e ".[dev]"`, which resolves engrava (and engrava[vec]) from
-# PyPI. CI therefore exercises the exact install path a real user gets.
+# engrava-mcp depends on `engrava>=0.6,<0.7` (and the `engrava[vec]` extra).
+# Every job resolves engrava (and engrava[vec]) as a dependency rather than from
+# a local checkout, so CI installs it the way an installing user's resolver
+# would rather than from a path only this workspace has.
 #
-# HARDENING (H2, follow-up — not implemented yet): add a job that resolves the
+# HARDENING (follow-up — not implemented yet): add a job that resolves the
 # LATEST in-range engrava from PyPI side by side with the pinned resolution, so a
-# stability-guarantee violation in an engrava 0.5.x patch is caught early.
+# stability-guarantee violation in an engrava 0.6.x patch is caught early.
 # ---------------------------------------------------------------------------
 
 jobs:
@@ -50,6 +50,124 @@ jobs:
         run: pip install -e ".[dev]"
       - name: Mypy
         run: mypy --strict src/
+
+  dependency-audit:
+    name: Dependency CVE audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      # Installed into a virtualenv of this job's own making, non-editable and
+      # without the dev extra. What this job wants is the production dependency
+      # closure — the dependencies this checkout declares — rather than a
+      # development environment; the other jobs install `-e ".[dev]"` because
+      # they need the source tree and the dev tooling, and auditing that set
+      # would report on tooling nobody ships.
+      #
+      # The closure goes into a virtualenv this job creates, so the audit reads
+      # site directories belonging to an environment made here rather than
+      # whatever the runner happened to have. It is not empty of everything else
+      # — pip is in there and is audited too, deliberately. An install
+      # redirected elsewhere would not land here at all; the root check in the
+      # next step is what notices that.
+      #
+      # Every interpreter here is invoked with -I. That drops PYTHONPATH and
+      # the current directory from the search path, which matters twice over: a
+      # dependency reachable through PYTHONPATH would count as satisfied for pip
+      # and appear in the metadata this job reads while sitting outside the
+      # directory the audit reads, and a module in the checkout sharing a name
+      # with one of the tools would be imported in preference to it.
+      - name: Install package
+        run: |
+          python -I -m venv "${RUNNER_TEMP}/target-venv"
+          # pip lives in that site directory too, so it is inside the audited
+          # set, and the runner image can ship one with a freshly disclosed CVE.
+          # Upgrading clears such a finding for real rather than suppressing it.
+          "${RUNNER_TEMP}/target-venv/bin/python" -I -m pip install --upgrade pip
+          "${RUNNER_TEMP}/target-venv/bin/python" -I -m pip install .
+          # A dependency gate is only worth running if the dependencies arrived.
+          # An install that skipped them would leave the root and pip alone in
+          # here, and that audits clean for want of anything to audit — so ask
+          # pip whether every requirement it resolved is actually satisfied.
+          "${RUNNER_TEMP}/target-venv/bin/python" -I -m pip check
+      # Installing the package is how the dependency closure gets resolved; the
+      # package itself is not part of what this job checks. It is ours, built
+      # from this very checkout, and an advisory against it is not something a
+      # dependency gate is the right place to hear about first. So it is removed
+      # again before the audit, leaving behind what it dragged in. That is what
+      # the job is named after.
+      #
+      # The removal is checked in both directions rather than assumed. If the
+      # distribution name ever stopped matching, a silent no-op would put the
+      # root back in the audited set; and if any other distribution name left
+      # the environment alongside it, the audit would be passing on a thinned
+      # set, which is the failure mode that would make this gate ornamental.
+      # The name comparison is exactly that — names — so it does not speak to
+      # a dependency's files being disturbed while its metadata remains.
+      - name: Drop the package from the audited set
+        run: |
+          # Both sides go through the same canonical form (PEP 503: runs of
+          # -, _ and . collapse to one hyphen, lowercased), so two legal
+          # spellings of one name cannot compare unequal.
+          root="$(python -I -c 'import pathlib, re, tomllib; name = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["name"]; print(re.sub(r"[-_.]+", "-", name).lower())')"
+          names='import importlib.metadata as m, re; print("\n".join(sorted({re.sub(r"[-_.]+", "-", d.name).lower() for d in m.distributions()})))'
+          "${RUNNER_TEMP}/target-venv/bin/python" -I -c "$names" > "${RUNNER_TEMP}/before.txt"
+          if ! "${RUNNER_TEMP}/target-venv/bin/python" -I -m pip show "$root" > /dev/null 2>&1; then
+            echo "::error::'$root' is not installed; the audited set was never what this job assumes"
+            exit 1
+          fi
+          "${RUNNER_TEMP}/target-venv/bin/python" -I -m pip uninstall -y "$root"
+          if "${RUNNER_TEMP}/target-venv/bin/python" -I -m pip show "$root" > /dev/null 2>&1; then
+            echo "::error::'$root' is still installed after uninstall"
+            exit 1
+          fi
+          "${RUNNER_TEMP}/target-venv/bin/python" -I -c "$names" > "${RUNNER_TEMP}/after.txt"
+          removed="$(comm -23 "${RUNNER_TEMP}/before.txt" "${RUNNER_TEMP}/after.txt")"
+          added="$(comm -13 "${RUNNER_TEMP}/before.txt" "${RUNNER_TEMP}/after.txt")"
+          if [ "$removed" != "$root" ] || [ -n "$added" ]; then
+            echo "::error::expected only '$root' to leave the environment; removed=[$removed] added=[$added]"
+            exit 1
+          fi
+      # The auditor runs from its OWN environment and is pointed at the target
+      # with --path. Installing it alongside the package would let its own
+      # dependency resolution upgrade a vulnerable distribution out of the
+      # environment before anything looked at it: pip-audit depends on requests,
+      # which floors certifi, so a package pinning an old certifi gets silently
+      # repaired and the audit then reports a clean tree it should have failed.
+      - name: Run pip-audit
+        run: |
+          python -I -m venv "${RUNNER_TEMP}/pip-audit-venv"
+          "${RUNNER_TEMP}/pip-audit-venv/bin/python" -I -m pip install pip-audit
+          # The site directory is asked of the interpreter that owns it, and
+          # assigned rather than substituted inline so a failure to answer stops
+          # the step: pip-audit does not descend into subdirectories, so a wrong
+          # or empty path audits nothing and reports it clean.
+          # Both site paths, deduplicated. They land on one directory in an
+          # ordinary virtualenv, but that is a property of the layout rather
+          # than of virtualenvs: the scheme templates differ — purelib hangs off
+          # base, platlib off platbase and platlibdir — so where they resolve
+          # apart, compiled distributions would sit outside a single-path audit.
+          sites="$("${RUNNER_TEMP}/target-venv/bin/python" -I -c 'import sysconfig; p = sysconfig.get_paths(); print("\n".join(dict.fromkeys((p["purelib"], p["platlib"]))))')"
+          # pip-audit does not descend into subdirectories, so a path one level
+          # out audits nothing and reports it clean. Each path is therefore only
+          # worth passing if distributions are actually visible at it.
+          audit_args=()
+          while IFS= read -r site; do
+            if compgen -G "${site}/*.dist-info" > /dev/null; then
+              audit_args+=(--path "$site")
+            fi
+          done <<< "$sites"
+          if [ "${#audit_args[@]}" -eq 0 ]; then
+            echo "::error::no installed distributions under any site path of the target environment"
+            exit 1
+          fi
+          # --strict also fails on a dependency that could NOT be audited, not
+          # only on one with a known CVE, so a silently skipped distribution
+          # cannot pass for a clean one.
+          "${RUNNER_TEMP}/pip-audit-venv/bin/python" -I -m pip_audit --strict "${audit_args[@]}"
 
   test:
     runs-on: ubuntu-latest

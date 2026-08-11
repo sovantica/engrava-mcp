@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import aiosqlite
 import pytest
 from engrava import (
     EdgeType,
@@ -17,7 +16,7 @@ from engrava import (
     ThoughtNotFoundError,
     ThoughtType,
 )
-from engrava.domain.exceptions import ReferentialIntegrityError
+from engrava.domain.exceptions import DuplicateEdgeError, ReferentialIntegrityError
 
 from engrava_mcp.server import (
     get_thought_impl,
@@ -180,6 +179,35 @@ class TestLinkThoughts:
         )
         assert result["edge"]["weight"] == 1.0
 
+    async def test_metadata_round_trips_into_stored_edge(self, store: SqliteEngravaCore) -> None:
+        result = await link_thoughts_impl(
+            store,
+            "thought-alpha",
+            "thought-beta",
+            EdgeType.ASSOCIATED,
+            metadata={"topic": "drinks", "batch": 7},
+        )
+        # The metadata is echoed in the response ...
+        assert result["edge"]["metadata"] == {"topic": "drinks", "batch": 7}
+
+        # ... and persisted on the stored edge, where list_edges can read it.
+        edges = await store.get_edges("thought-alpha", direction="OUT")
+        stored = next(e for e in edges if e.edge_type is EdgeType.ASSOCIATED)
+        assert stored.metadata == {"topic": "drinks", "batch": 7}
+
+    async def test_metadata_defaults_to_empty_when_omitted(self, store: SqliteEngravaCore) -> None:
+        result = await link_thoughts_impl(
+            store,
+            "thought-alpha",
+            "thought-beta",
+            EdgeType.DEPENDS_ON,
+        )
+        assert result["edge"]["metadata"] == {}
+
+        edges = await store.get_edges("thought-alpha", direction="OUT")
+        stored = next(e for e in edges if e.edge_type is EdgeType.DEPENDS_ON)
+        assert stored.metadata == {}
+
     async def test_missing_endpoint_raises(self, store: SqliteEngravaCore) -> None:
         with pytest.raises(ReferentialIntegrityError):
             await link_thoughts_impl(
@@ -201,7 +229,7 @@ class TestLinkThoughts:
             "thought-beta",
             EdgeType.ASSOCIATED,
         )
-        with pytest.raises(aiosqlite.IntegrityError):
+        with pytest.raises(DuplicateEdgeError):
             await link_thoughts_impl(
                 store,
                 "thought-alpha",

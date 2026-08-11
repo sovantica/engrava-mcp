@@ -35,14 +35,18 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
 import pytest
+from engrava import EdgeType
+from engrava.domain.exceptions import DuplicateEdgeError
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session as connect_client
 
 from engrava_mcp.server import (
+    DUPLICATE_EDGE_MESSAGE,
     SERVER_NAME,
     StoreProvider,
     _tool_errors,
+    link_thoughts_impl,
     register_tools,
 )
 
@@ -152,6 +156,24 @@ def _error_text(content: object) -> str:
     text = content[0].text  # type: ignore[union-attr]
     assert isinstance(text, str)
     return text
+
+
+def _assert_no_raw_duplicate_phrasing(text: str) -> None:
+    """Assert the store's own duplicate-edge wording never reaches the client.
+
+    The typed ``DuplicateEdgeError`` reads "edge relationship already exists:
+    '<id>' -[TYPE]-> '<id>'". That phrasing belongs to the store and may change
+    at any time, so forwarding it would put an upstream string on our wire
+    contract.
+
+    Args:
+        text: The client-facing error message to inspect.
+
+    """
+    lowered = text.lower()
+    assert "edge relationship" not in lowered, f"leaked the store's phrasing: {text!r}"
+    assert "already exists:" not in lowered, f"leaked the store's phrasing: {text!r}"
+    assert "-[" not in text, f"leaked the store's edge notation: {text!r}"
 
 
 def _assert_no_leak(text: str) -> None:
@@ -398,8 +420,49 @@ class TestDuplicateEdge:
         text = _error_text(duplicate.content)
         # Actionable: it explains the uniqueness rule in user terms ...
         assert "already" in text.lower()
+        # ... it is OUR curated wording, not the store's own phrasing ...
+        assert DUPLICATE_EDGE_MESSAGE in text
+        _assert_no_raw_duplicate_phrasing(text)
         # ... and leaks no table/column names, raw constraint text, or symbol.
         _assert_no_leak(text)
+
+    async def test_typed_duplicate_error_maps_to_the_curated_message(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        # The store signals a duplicate edge with a typed DuplicateEdgeError
+        # whose own message spells out the endpoints in the store's phrasing.
+        # That wording is the store's to change at will, so it must never reach
+        # the client: the guard maps it to our curated message instead. This is
+        # the regression guard for that mapping going stale.
+        await link_thoughts_impl(store, "thought-alpha", "thought-beta", EdgeType.ASSOCIATED)
+
+        with pytest.raises(ToolError) as excinfo:
+            async with _tool_errors():
+                await link_thoughts_impl(
+                    store, "thought-alpha", "thought-beta", EdgeType.ASSOCIATED
+                )
+
+        text = str(excinfo.value)
+        assert text == DUPLICATE_EDGE_MESSAGE
+        _assert_no_raw_duplicate_phrasing(text)
+        _assert_no_leak(text)
+
+    async def test_both_duplicate_paths_are_indistinguishable(self) -> None:
+        # A duplicate may surface as the typed error or as a raw UNIQUE
+        # violation depending on the path taken; a client must not be able to
+        # tell which happened.
+        typed = DuplicateEdgeError("a", "b", "ASSOCIATED")
+        raw = sqlite3.IntegrityError("UNIQUE constraint failed: edge.from_thought_id")
+
+        messages: list[str] = []
+        for failure in (typed, raw):
+            with pytest.raises(ToolError) as excinfo:
+                async with _tool_errors():
+                    raise failure
+            messages.append(str(excinfo.value))
+
+        assert messages[0] == messages[1] == DUPLICATE_EDGE_MESSAGE
 
 
 class TestInvalidFieldValue:

@@ -61,7 +61,7 @@ dev = [
     # Exact pin, not a floor: `[tool.ruff.lint] select = ["ALL"]` opts into
     # every rule a new ruff release adds, so a range lets CI and a developer
     # lint identical source with different rule sets and disagree.
-    "ruff==0.15.20",
+    "ruff==0.16.3",
 ]
 
 [project.scripts]

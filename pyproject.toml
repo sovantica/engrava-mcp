@@ -114,3 +114,22 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# A test's level is what it touches, not how long it takes. Unmarked = unit: in-process,
+# any I/O confined to tmp_path. No test carries a level marker today (the only marks in the
+# suite are pytest's own `parametrize`), which is the point: the three names are registered
+# so the first test that needs one does not invent a fourth, and strict checking turns a
+# typo into an error instead of a silently unselected test.
+addopts = "--strict-markers -m 'not external'"
+# `-m 'not external'` is what makes "never runs in the default selection" true rather than
+# aspirational: registering a marker does not deselect it. A CLI `-m` overrides this one, so
+# `pytest -m external` still runs them on purpose.
+# Set alongside the addopts flag, not instead of it. Measured 2026-09-01 in isolated venvs
+# on one unregistered marker: pytest 8.4.2 honours the flag and ignores this key, 9.0.3
+# does the reverse, 9.1.1 honours both. This project's floor is pytest>=8.0.0, so neither
+# setting alone enforces across the range it admits.
+strict_markers = true
+markers = [
+    "integration: touches real local resources (an on-disk database, a subprocess of this project's own CLI)",
+    "external: touches the network, a third-party API or a package index; never in the default selection",
+    "slow: over 5 seconds of wall clock; orthogonal to level",
+]

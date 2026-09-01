@@ -111,6 +111,15 @@ python_version = "3.11"
 module = "httpx.*"
 ignore_missing_imports = true
 
+[tool.coverage.run]
+# Measure the package only. Without this, a bare `--cov` - which is exactly how CI and
+# `CONTRIBUTING` invoke the gate - instruments every module imported during the run,
+# including any sibling project installed in editable mode. In a checkout that sits beside
+# an editable `engrava`, the same command reads 60.98% against the 90% floor while this
+# package itself is at 100%: a red gate that says nothing about this repo. Scoping the
+# source here makes the local and CI invocations measure the same thing.
+source = ["src/engrava_mcp"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

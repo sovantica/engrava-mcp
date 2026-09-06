@@ -33,6 +33,7 @@ from engrava_mcp.server import (
     query_memory_impl,
     search_keywords_impl,
     search_memory_impl,
+    update_thought_impl,
 )
 
 if TYPE_CHECKING:
@@ -298,6 +299,76 @@ class TestSearchMemoryFilters:
         assert kept_order == [tid for tid in ranked_order if tid in set(kept_order)]
         for entry in filtered["results"]:
             assert entry["score"] == scores[entry["thought_id"]]
+
+
+class TestSearchMemoryArchivedFilter:
+    """Tests that ``lifecycle_status=ARCHIVED`` is a reachable filter value.
+
+    ``search_hybrid`` excludes archived thoughts from the ranked window by
+    default, *before* the wrapper's post-rank filter ever runs. Without
+    admitting archived thoughts into that window for this one filter value,
+    a caller asking for ``ARCHIVED`` results could never get any back.
+    """
+
+    async def test_archived_filter_finds_an_archived_thought(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        await update_thought_impl(
+            store,
+            "thought-alpha",
+            lifecycle_status=LifecycleStatus.ARCHIVED,
+        )
+
+        result = await search_memory_impl(
+            store, "coffee", lifecycle_status=LifecycleStatus.ARCHIVED
+        )
+
+        assert [entry["thought_id"] for entry in result["results"]] == ["thought-alpha"]
+        assert result["filtered"]["matched"] == 1
+
+    async def test_unfiltered_search_still_excludes_archived(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # Unchanged default behaviour: with no filter at all, an archived
+        # thought must not be ranked.
+        await update_thought_impl(
+            store,
+            "thought-alpha",
+            lifecycle_status=LifecycleStatus.ARCHIVED,
+        )
+
+        unfiltered = await search_memory_impl(store, "coffee")
+        assert unfiltered["results"] == []
+        assert "filtered" not in unfiltered
+
+    @pytest.mark.parametrize(
+        "status",
+        [LifecycleStatus.CREATED, LifecycleStatus.ACTIVE, LifecycleStatus.DONE],
+    )
+    async def test_non_archived_filters_never_rank_an_archived_thought(
+        self, store: SqliteEngravaCore, status: LifecycleStatus
+    ) -> None:
+        # A non-ARCHIVED filter must exclude the archived thought from the
+        # ranked window itself, not merely drop it after ranking: both would
+        # leave ``results`` empty, but only the former also reports
+        # scanned == matched == dropped == 0. A ``dropped`` count above zero
+        # here would mean the ranked window was wrongly widened for a filter
+        # value that never asked for archived thoughts.
+        await update_thought_impl(
+            store,
+            "thought-alpha",
+            lifecycle_status=LifecycleStatus.ARCHIVED,
+        )
+
+        result = await search_memory_impl(store, "coffee", lifecycle_status=status)
+
+        assert result["results"] == []
+        assert result["filtered"] == {
+            "criteria": {"lifecycle_status": status.value},
+            "scanned": 0,
+            "matched": 0,
+            "dropped": 0,
+        }
 
 
 @pytest.fixture

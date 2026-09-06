@@ -668,6 +668,14 @@ async def search_memory_impl(
     ``filtered`` block below) so the caller is never misled into reading
     an empty or short list as "nothing was found".
 
+    By default the ranker never ranks archived thoughts at all, so a
+    post-rank ``lifecycle_status=ARCHIVED`` filter could never keep
+    anything — it would always report a confident, misleading empty
+    result.  To keep that value reachable, archived thoughts are
+    admitted into the ranked window only when ``lifecycle_status`` is
+    ``ARCHIVED``; every other value, including no filter at all, ranks
+    with the default archived-excluded behaviour.
+
     Args:
         store: The store to query.
         query_text: Natural-language query text.
@@ -678,6 +686,9 @@ async def search_memory_impl(
             appear in the results.
         thought_type: When set, keep only hits of this type.
         lifecycle_status: When set, keep only hits in this lifecycle state.
+            Setting this to ``ARCHIVED`` also admits archived thoughts
+            into the ranked window (see above); every other value ranks
+            with archived thoughts excluded, as if no filter were set.
         priority: When set, keep only hits at this priority level.
         recency_now: Optional ISO-8601 timestamp used as "now" for the
             recency signal, letting a stateless consumer score recency by
@@ -710,6 +721,7 @@ async def search_memory_impl(
         top_k=top_k,
         include_reflections=include_reflections,
         recency_now=recency_now,
+        include_archived=lifecycle_status is LifecycleStatus.ARCHIVED,
     )
     backends_used = sorted(result.backends_used)
 
@@ -1671,7 +1683,9 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
             "ranked hits by thought type, lifecycle status, or priority; "
             "these filters are applied after ranking, so a filtered call may "
             "return fewer than top_k results and reports how many ranked hits "
-            "were dropped. For an exhaustive, unranked, paginated listing by "
+            "were dropped. Archived thoughts are excluded from ranking by "
+            "default; set lifecycle_status=ARCHIVED to search them instead. "
+            "For an exhaustive, unranked, paginated listing by "
             "those same fields, use list_memory instead. Recency takes part in "
             "the ranking only when you pass recency_now: an ISO-8601 timestamp "
             "giving the moment to measure age against (transaction time)."
@@ -1741,7 +1755,8 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         name="search_keywords",
         description=(
             "Full-text BM25 keyword search over stored memory. Returns ranked "
-            "thought identifiers with scores."
+            "thought identifiers with scores. Archived thoughts are never "
+            "returned; this tool has no filter to widen that."
         ),
         annotations=_READ_ONLY,
     )

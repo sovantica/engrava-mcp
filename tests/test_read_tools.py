@@ -21,6 +21,7 @@ from engrava.domain.exceptions import InvalidRecencyArgumentError
 from engrava.mindql.parser import MindQLParseError
 from mcp.server.fastmcp.exceptions import ToolError
 
+from engrava_mcp.read_only import ReadOnlyStore
 from engrava_mcp.server import (
     DEFAULT_TOP_K,
     StoreNotReadyError,
@@ -186,17 +187,34 @@ class TestStoreProvider:
         with pytest.raises(StoreNotReadyError):
             provider.require()
 
+    def test_require_read_without_store_raises(self) -> None:
+        provider = StoreProvider()
+        with pytest.raises(StoreNotReadyError):
+            provider.require_read()
+
     def test_set_then_require(self, store: SqliteEngravaCore) -> None:
         provider = StoreProvider()
-        provider.set(store)
+        provider.set(store, read_store=store)
         assert provider.require() is store
+
+    def test_set_then_require_read_can_differ_from_require(self, store: SqliteEngravaCore) -> None:
+        # The read slot and the write slot are recorded independently, which is
+        # what lets read-only mode install a different object (a read-only view)
+        # for reads while ``require()`` keeps returning the full store.
+        read_store = ReadOnlyStore(store)
+        provider = StoreProvider()
+        provider.set(store, read_store=read_store)
+        assert provider.require() is store
+        assert provider.require_read() is read_store
 
     def test_clear_resets(self, store: SqliteEngravaCore) -> None:
         provider = StoreProvider()
-        provider.set(store)
+        provider.set(store, read_store=store)
         provider.clear()
         with pytest.raises(StoreNotReadyError):
             provider.require()
+        with pytest.raises(StoreNotReadyError):
+            provider.require_read()
 
 
 class TestSearchMemoryFilters:

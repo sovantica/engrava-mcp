@@ -436,6 +436,124 @@ class TestFilterAndListOverTransport:
         assert result.structuredContent["count"] == 3
 
 
+class TestReadOnlyModeAccessTracking:
+    """A read-only session over a tracking-enabled store makes no writes.
+
+    An operator who turns Engrava's dreaming extension on gets
+    ``access_tracking_enabled=True`` by default, and read-only mode must not let a
+    read against that store stage a deferred access-count write. This drives the
+    real ``ENGRAVA_MCP_CONFIG`` route end to end (build the server, call a read tool
+    over the transport, let the lifespan tear down) and then reads ``access_count``
+    back from a fresh connection — after the server's own connection has closed and
+    flushed — so nothing about the assertion depends on any store method's own read.
+    """
+
+    async def test_reads_over_the_transport_leave_access_count_untouched(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "tracked.sqlite"
+        await _seed_database(db_path)
+
+        config_path = tmp_path / "engrava.yaml"
+        config_path.write_text(
+            f"database:\n  path: {db_path}\nextensions:\n  dreaming:\n    enabled: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.delenv(DB_PATH_ENV_VAR, raising=False)
+        monkeypatch.setenv(CONFIG_ENV_VAR, str(config_path))
+        monkeypatch.setenv(READ_ONLY_ENV_VAR, "1")
+
+        server = build_server()
+        async with connect_client(server) as client:
+            for _ in range(3):
+                result = await client.call_tool("get_thought", {"thought_id": "seeded-1"})
+                assert result.isError is False
+            for _ in range(3):
+                # search_hybrid also buffers an access for a hit it returns — the
+                # path a prior round's validation found completely unguarded — so
+                # this transport-level check must exercise it too, not only
+                # get_thought.
+                searched = await client.call_tool("search_memory", {"query_text": "persisted"})
+                assert searched.isError is False
+                assert searched.structuredContent is not None
+                assert searched.structuredContent["results"], (
+                    "the search must actually hit the seeded thought"
+                )
+
+        connection = await aiosqlite.connect(str(db_path))
+        try:
+            cursor = await connection.execute(
+                "SELECT access_count FROM thought WHERE thought_id = ?",
+                ("seeded-1",),
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row[0] == 0
+        finally:
+            await connection.close()
+
+
+class TestReadOnlyDecisionIsCapturedOnce:
+    """Registration and store-wrapping cannot disagree, even if the environment changes.
+
+    ``build_server()`` reads ``ENGRAVA_MCP_READ_ONLY`` once and reuses that value both to
+    decide which tools register (synchronously, inside ``build_server()``) and to decide
+    whether the store the lifespan hands out is wrapped (later, when the lifespan actually
+    runs). Reading the flag independently at each site would let an environment change in
+    between produce a deployment that advertises itself as read-only while serving reads
+    against the raw, unwrapped store — or the reverse. This flips the flag after
+    ``build_server()`` has already decided, and asserts both facets still agree with the
+    value captured at build time.
+    """
+
+    async def test_env_change_after_build_does_not_unwrap_or_re_register(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "frozen.sqlite"
+        await _seed_database(db_path)
+
+        config_path = tmp_path / "engrava.yaml"
+        config_path.write_text(
+            f"database:\n  path: {db_path}\nextensions:\n  dreaming:\n    enabled: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.delenv(DB_PATH_ENV_VAR, raising=False)
+        monkeypatch.setenv(CONFIG_ENV_VAR, str(config_path))
+        monkeypatch.setenv(READ_ONLY_ENV_VAR, "1")
+
+        server = build_server()
+
+        # The environment changes after build_server() has already decided. A
+        # second, independent read of the flag at serve time would now see
+        # "not read-only" and hand read tools the raw store.
+        monkeypatch.delenv(READ_ONLY_ENV_VAR, raising=False)
+
+        async with connect_client(server) as client:
+            listed = await client.list_tools()
+            names = {tool.name for tool in listed.tools}
+            assert names == READ_TOOL_NAMES, "registration must stay frozen at build time"
+
+            for _ in range(3):
+                result = await client.call_tool("get_thought", {"thought_id": "seeded-1"})
+                assert result.isError is False
+
+        connection = await aiosqlite.connect(str(db_path))
+        try:
+            cursor = await connection.execute(
+                "SELECT access_count FROM thought WHERE thought_id = ?",
+                ("seeded-1",),
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row[0] == 0, "store-wrapping must stay frozen at build time too"
+        finally:
+            await connection.close()
+
+
 class TestStoreResolution:
     """Tests for environment-driven store resolution."""
 

@@ -140,8 +140,8 @@ async def _client_on_the_resolved_store() -> AsyncIterator[ClientSession]:
         await seed_recency_corpus(resolved.store)
         server: FastMCP = FastMCP(SERVER_NAME)
         provider = StoreProvider()
-        provider.set(resolved.store)
-        register_tools(server, provider)
+        provider.set(resolved.store, read_store=resolved.store)
+        register_tools(server, provider, read_only=False)
         async with connect_client(server) as client:
             yield client
     finally:

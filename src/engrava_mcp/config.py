@@ -375,4 +375,17 @@ async def _resolve_from_db_path(db_path: str) -> ResolvedStore:
         with contextlib.suppress(Exception):
             await connection.close()
         raise
-    return ResolvedStore(store=store, _closer=connection.close)
+
+    async def _closer() -> None:
+        """Flush the store, then release the connection it does not own.
+
+        ``store.close()`` flushes any access-buffer writes the store may have
+        buffered, but is a no-op on the connection itself: the manual
+        constructor above never marks a store as owning its connection, so
+        closing it here remains this closer's job. Store first, so a pending
+        flush still has an open connection to write through.
+        """
+        await store.close()
+        await connection.close()
+
+    return ResolvedStore(store=store, _closer=_closer)

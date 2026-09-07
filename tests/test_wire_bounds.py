@@ -100,8 +100,8 @@ async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[ClientSession]:
     """
     server: FastMCP = FastMCP(SERVER_NAME)
     provider = StoreProvider()
-    provider.set(store)
-    register_tools(server, provider)
+    provider.set(store, read_store=store)
+    register_tools(server, provider, read_only=False)
     register_prompts(server, provider)
     async with connect_client(server) as client:
         yield client
@@ -364,7 +364,7 @@ class TestBoundErrorsAreCleanAtTheBoundary:
         # Unguarded, this surfaces a raw OutOfRangeBoundError to the client.
         server: FastMCP = FastMCP(SERVER_NAME)
         provider = StoreProvider()
-        provider.set(store)
+        provider.set(store, read_store=store)
         register_prompts(server, provider)
 
         registered = {prompt.name: prompt for prompt in server._prompt_manager.list_prompts()}
@@ -386,7 +386,7 @@ class TestBoundErrorsAreCleanAtTheBoundary:
         # The guard is presentation-only on the happy path.
         server: FastMCP = FastMCP(SERVER_NAME)
         provider = StoreProvider()
-        provider.set(store)
+        provider.set(store, read_store=store)
         register_prompts(server, provider)
 
         registered = {prompt.name: prompt for prompt in server._prompt_manager.list_prompts()}

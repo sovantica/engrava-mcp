@@ -55,7 +55,11 @@ Five write tools complete the surface:
 The write tools are gated by the :data:`READ_ONLY_ENV_VAR` environment
 variable.  When it is set to a truthy value the write tools are not
 registered at all, so a read-only deployment never advertises them to
-clients.  The read tools are always available.
+clients.  The read tools are always available, and in read-only mode they run
+against a read-only view (see :mod:`engrava_mcp.read_only`) rather than the
+raw store, so a read never stages a write of its own either — including a
+deferred access-count update a store with access tracking on would otherwise
+buffer and flush on close.
 
 Three read-only *resources* round out the surface.  Where tools are
 *invoked*, resources are addressable ``engrava://`` URIs that clients
@@ -150,11 +154,14 @@ from pydantic import Field, ValidationError
 
 from engrava_mcp._compat import warn_if_engrava_out_of_range
 from engrava_mcp.config import ResolvedStore, resolve_store
+from engrava_mcp.read_only import ReadOnlyStore
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
     from engrava import SqliteEngravaCore
+
+    from engrava_mcp.read_only import ReadOnlyMcpStore
 
 #: Direction of edge traversal for ``get_edges``.  ``OUT`` follows edges whose
 #: source is the given thought, ``IN`` follows edges whose target is it, and
@@ -529,28 +536,38 @@ class StoreProvider:
     """Holds the active store for the lifetime of a running server.
 
     The server lifespan calls :meth:`set` on startup and :meth:`clear`
-    on shutdown.  Registered tools call :meth:`require` to obtain the
-    store, which raises if the server is not currently serving.
+    on shutdown.  Write tools call :meth:`require` to obtain the full,
+    mutable store; read tools and resources call :meth:`require_read`
+    instead, which returns the read-only view the lifespan installed when
+    the server is running in read-only mode (see
+    :data:`~engrava_mcp.read_only.ReadOnlyMcpStore`) — so a read can never
+    stage a write regardless of which surface it came through.
     """
 
     def __init__(self) -> None:
         self._store: SqliteEngravaCore | None = None
+        self._read_store: ReadOnlyMcpStore | None = None
 
-    def set(self, store: SqliteEngravaCore) -> None:
+    def set(self, store: SqliteEngravaCore, *, read_store: ReadOnlyMcpStore) -> None:
         """Record the active store.
 
         Args:
-            store: The store that tools should query.
+            store: The full, mutable store that write tools should use.
+            read_store: The store read tools and resources should use —
+                either ``store`` itself or a read-only view over it,
+                decided by the caller.
 
         """
         self._store = store
+        self._read_store = read_store
 
     def clear(self) -> None:
         """Forget the active store after shutdown."""
         self._store = None
+        self._read_store = None
 
     def require(self) -> SqliteEngravaCore:
-        """Return the active store.
+        """Return the active store, for a write tool.
 
         Returns:
             The store recorded by the lifespan.
@@ -564,8 +581,24 @@ class StoreProvider:
             raise StoreNotReadyError(msg)
         return self._store
 
+    def require_read(self) -> ReadOnlyMcpStore:
+        """Return the active read surface, for a read tool or resource.
 
-async def get_thought_impl(store: SqliteEngravaCore, thought_id: str) -> dict[str, Any]:
+        Returns:
+            The read surface recorded by the lifespan — a read-only view in
+            read-only mode, the full store otherwise.
+
+        Raises:
+            StoreNotReadyError: If no store is currently active.
+
+        """
+        if self._read_store is None:
+            msg = "No active engrava store; the server lifespan is not running."
+            raise StoreNotReadyError(msg)
+        return self._read_store
+
+
+async def get_thought_impl(store: ReadOnlyMcpStore, thought_id: str) -> dict[str, Any]:
     """Fetch a single thought by identifier.
 
     Args:
@@ -647,7 +680,7 @@ def _thought_matches(
 
 
 async def search_memory_impl(
-    store: SqliteEngravaCore,
+    store: ReadOnlyMcpStore,
     query_text: str,
     *,
     top_k: int = DEFAULT_TOP_K,
@@ -764,7 +797,7 @@ async def search_memory_impl(
 
 
 async def search_keywords_impl(
-    store: SqliteEngravaCore,
+    store: ReadOnlyMcpStore,
     query: str,
     *,
     top_k: int = DEFAULT_TOP_K,
@@ -793,7 +826,7 @@ async def search_keywords_impl(
 
 
 async def query_memory_impl(
-    store: SqliteEngravaCore,
+    store: ReadOnlyMcpStore,
     query: str,
     *,
     limit: int | None = None,
@@ -840,7 +873,7 @@ async def query_memory_impl(
     return {"columns": result.columns, "rows": result.rows}
 
 
-async def memory_stats_impl(store: SqliteEngravaCore) -> dict[str, Any]:
+async def memory_stats_impl(store: ReadOnlyMcpStore) -> dict[str, Any]:
     """Return aggregate counts and store-health metrics.
 
     Args:
@@ -871,7 +904,7 @@ async def memory_stats_impl(store: SqliteEngravaCore) -> dict[str, Any]:
 
 
 async def recent_thoughts_impl(
-    store: SqliteEngravaCore,
+    store: ReadOnlyMcpStore,
     *,
     limit: int = DEFAULT_RECENT_LIMIT,
 ) -> dict[str, Any]:
@@ -902,7 +935,7 @@ async def recent_thoughts_impl(
 
 
 async def list_memory_impl(
-    store: SqliteEngravaCore,
+    store: ReadOnlyMcpStore,
     *,
     thought_type: ThoughtType | None = None,
     lifecycle_status: LifecycleStatus | None = None,
@@ -969,7 +1002,7 @@ async def list_memory_impl(
 
 
 async def get_edges_impl(
-    store: SqliteEngravaCore,
+    store: ReadOnlyMcpStore,
     thought_id: str,
     *,
     direction: EdgeDirection = "BOTH",
@@ -1066,7 +1099,7 @@ def _metadata_path(key: str) -> str:
 
 
 async def list_edges_impl(
-    store: SqliteEngravaCore,
+    store: ReadOnlyMcpStore,
     *,
     edge_type: EdgeType | None = None,
     source: KnowledgeSource | None = None,
@@ -1476,11 +1509,24 @@ def build_server() -> FastMCP:
 
     """
     provider = StoreProvider()
+    # Read once and reuse: this decides both which store a read gets (below) and
+    # which tools register (in register_tools). Calling _read_only_enabled() twice
+    # and independently would let the two disagree if the environment changed
+    # between build_server() and serving — read-only registration paired with an
+    # unwrapped store, or the reverse.
+    read_only = _read_only_enabled()
 
     @asynccontextmanager
     async def lifespan(_server: FastMCP) -> AsyncIterator[None]:
         resolved: ResolvedStore = await resolve_store()
-        provider.set(resolved.store)
+        # In read-only mode, reads go through a view that never stages a write —
+        # not even the deferred access-count update a plain read would buffer on
+        # a store with access tracking on — so readOnlyHint=True is true on every
+        # configuration, not only on the one where tracking happens to be off.
+        read_store: ReadOnlyMcpStore = (
+            ReadOnlyStore(resolved.store) if read_only else resolved.store
+        )
+        provider.set(resolved.store, read_store=read_store)
         try:
             yield
         finally:
@@ -1518,7 +1564,7 @@ def build_server() -> FastMCP:
     )
     register_resources(server, provider)
     register_prompts(server, provider)
-    register_tools(server, provider)
+    register_tools(server, provider, read_only=read_only)
     return server
 
 
@@ -1555,7 +1601,7 @@ def register_resources(server: FastMCP, provider: StoreProvider) -> None:
         mime_type=RESOURCE_MIME_TYPE,
     )
     async def thought_resource(thought_id: str) -> str:
-        payload = await get_thought_impl(provider.require(), thought_id)
+        payload = await get_thought_impl(provider.require_read(), thought_id)
         return json.dumps(payload)
 
     @server.resource(
@@ -1566,7 +1612,7 @@ def register_resources(server: FastMCP, provider: StoreProvider) -> None:
         mime_type=RESOURCE_MIME_TYPE,
     )
     async def stats_resource() -> str:
-        payload = await memory_stats_impl(provider.require())
+        payload = await memory_stats_impl(provider.require_read())
         return json.dumps(payload)
 
     @server.resource(
@@ -1577,7 +1623,7 @@ def register_resources(server: FastMCP, provider: StoreProvider) -> None:
         mime_type=RESOURCE_MIME_TYPE,
     )
     async def recent_resource() -> str:
-        payload = await recent_thoughts_impl(provider.require())
+        payload = await recent_thoughts_impl(provider.require_read())
         return json.dumps(payload)
 
 
@@ -1623,7 +1669,7 @@ def register_prompts(server: FastMCP, provider: StoreProvider) -> None:
         # The protocol layer normally rejects it first, but the domain guard
         # exists precisely for the paths where that layer does not apply.
         async with _tool_errors():
-            recent = await recent_thoughts_impl(provider.require(), limit=limit)
+            recent = await recent_thoughts_impl(provider.require_read(), limit=limit)
             return _summarize_recent_prompt(limit, recent)
 
     @server.prompt(
@@ -1648,20 +1694,24 @@ def register_prompts(server: FastMCP, provider: StoreProvider) -> None:
 # — this function has a single branch, the read-only guard. Splitting the flat
 # registration list would hurt readability, so the complexity cap is waived here
 # deliberately.
-def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C901
+def register_tools(server: FastMCP, provider: StoreProvider, *, read_only: bool) -> None:  # noqa: C901
     """Register the MCP tools on a server.
 
     The eight read tools (``get_thought``, ``search_memory``,
     ``search_keywords``, ``list_memory``, ``query_memory``,
     ``memory_stats``, ``get_edges``, ``list_edges``) are always
-    registered.  The five write tools are
-    registered only when the server is not in read-only mode (see
-    :func:`_read_only_enabled`); in read-only mode they are never
-    advertised to clients.
+    registered.  The five write tools are registered only when ``read_only``
+    is ``False``; in read-only mode they are never advertised to clients.
 
     Args:
         server: The server to register tools on.
         provider: Supplies the active store to each tool at call time.
+        read_only: Whether this deployment is read-only. Callers should pass
+            the same value used to decide the store ``provider`` was given
+            (see :func:`build_server`), rather than re-reading
+            :func:`_read_only_enabled` independently — reading it twice
+            lets registration and store-wrapping disagree if the
+            environment changes in between.
 
     """
 
@@ -1672,7 +1722,7 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
     )
     async def get_thought(thought_id: str) -> dict[str, Any]:
         async with _tool_errors():
-            return await get_thought_impl(provider.require(), thought_id)
+            return await get_thought_impl(provider.require_read(), thought_id)
 
     @server.tool(
         name="search_memory",
@@ -1704,7 +1754,7 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
     ) -> dict[str, Any]:
         async with _tool_errors():
             return await search_memory_impl(
-                provider.require(),
+                provider.require_read(),
                 query_text,
                 top_k=top_k,
                 include_reflections=include_reflections,
@@ -1740,7 +1790,7 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
     ) -> dict[str, Any]:
         async with _tool_errors():
             return await list_memory_impl(
-                provider.require(),
+                provider.require_read(),
                 thought_type=thought_type,
                 lifecycle_status=lifecycle_status,
                 priority=priority,
@@ -1762,7 +1812,7 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
     )
     async def search_keywords(query: str, top_k: TopK = DEFAULT_TOP_K) -> dict[str, Any]:
         async with _tool_errors():
-            return await search_keywords_impl(provider.require(), query, top_k=top_k)
+            return await search_keywords_impl(provider.require_read(), query, top_k=top_k)
 
     @server.tool(
         name="query_memory",
@@ -1775,7 +1825,7 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
     )
     async def query_memory(query: str, limit: PageLimit | None = None) -> dict[str, Any]:
         async with _tool_errors():
-            return await query_memory_impl(provider.require(), query, limit=limit)
+            return await query_memory_impl(provider.require_read(), query, limit=limit)
 
     @server.tool(
         name="memory_stats",
@@ -1787,7 +1837,7 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
     )
     async def memory_stats() -> dict[str, Any]:
         async with _tool_errors():
-            return await memory_stats_impl(provider.require())
+            return await memory_stats_impl(provider.require_read())
 
     @server.tool(
         name="get_edges",
@@ -1805,7 +1855,7 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         direction: EdgeDirection = "BOTH",
     ) -> dict[str, Any]:
         async with _tool_errors():
-            return await get_edges_impl(provider.require(), thought_id, direction=direction)
+            return await get_edges_impl(provider.require_read(), thought_id, direction=direction)
 
     @server.tool(
         name="list_edges",
@@ -1829,7 +1879,7 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
     ) -> dict[str, Any]:
         async with _tool_errors():
             return await list_edges_impl(
-                provider.require(),
+                provider.require_read(),
                 edge_type=edge_type,
                 source=source,
                 metadata_equals=metadata_equals,
@@ -1837,7 +1887,7 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
                 limit=limit,
             )
 
-    if _read_only_enabled():
+    if read_only:
         return
 
     @server.tool(

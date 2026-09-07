@@ -209,6 +209,62 @@ class TestOutOfRangeBoundsAreRejectedAndPagingStaysExact:
             await list_memory_impl(bulk_store, limit=10**18)
 
 
+class TestQueryMemoryOwnLimitIsBounded:
+    """``query_memory`` bounds the query text's own ``LIMIT``, not just the argument.
+
+    Before this guard, the ``limit`` *argument* was checked against
+    :data:`MAX_PAGE_LIMIT`, but a ``LIMIT`` written into the query text itself
+    was executed as-is -- including no ``LIMIT`` at all, which ran unbounded.
+    Each test here pairs a deletion-sensitive rejection or injection with an
+    exact row count against ``bulk_store`` (more rows than any capped page
+    size used below), so the cap's reality is observable rather than assumed.
+    """
+
+    async def test_no_limit_in_query_is_capped_not_unbounded(
+        self, bulk_store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # bulk_store holds more CREATED rows than this lowered cap, so an
+        # injected LIMIT is observable without building a 5000+ row store.
+        monkeypatch.setattr(server_module, "MAX_PAGE_LIMIT", 5)
+
+        # FIND_ALL carries no LIMIT clause and no `limit` argument is passed:
+        # without injection this returns every CREATED row (CREATED_ROWS),
+        # not the cap.
+        result = await query_memory_impl(bulk_store, FIND_ALL)
+        assert len(result["rows"]) == 5
+
+    async def test_over_cap_in_query_limit_is_refused(self, bulk_store: SqliteEngravaCore) -> None:
+        # The real MAX_PAGE_LIMIT is used here (no monkeypatch needed): the
+        # rejection happens before the store is ever touched, so the store's
+        # actual size is irrelevant to this assertion.
+        with pytest.raises(OutOfRangeBoundError) as exc_info:
+            await query_memory_impl(bulk_store, f"{FIND_ALL} LIMIT {MAX_PAGE_LIMIT + 1}")
+        # Same bound message shape every other tool uses, naming the cap.
+        assert str(MAX_PAGE_LIMIT) in str(exc_info.value)
+
+        with pytest.raises(OutOfRangeBoundError):
+            await query_memory_impl(bulk_store, f"{FIND_ALL} LIMIT 100000")
+
+    async def test_in_range_in_query_limit_is_honoured_when_no_argument(
+        self, bulk_store: SqliteEngravaCore
+    ) -> None:
+        # An in-query LIMIT within range, with no `limit` argument, still
+        # works -- the new cap-checking path is not itself a regression.
+        result = await query_memory_impl(bulk_store, f"{FIND_ALL} LIMIT 5")
+        assert len(result["rows"]) == 5
+
+    async def test_limit_argument_overrides_in_query_limit(
+        self, bulk_store: SqliteEngravaCore
+    ) -> None:
+        # Precedence: the `limit` argument always wins over a LIMIT already
+        # in the query text -- it replaces it rather than being compared
+        # against it. The in-query LIMIT (5) would produce a different count
+        # than the argument (3), so this is deletion-sensitive to a precedence
+        # flip in either direction.
+        overridden = await query_memory_impl(bulk_store, f"{FIND_ALL} LIMIT 5", limit=3)
+        assert len(overridden["rows"]) == 3
+
+
 class TestImplLevelBounds:
     """Every wire-supplied bound is domain-validated in its implementation."""
 
@@ -259,8 +315,9 @@ class TestImplLevelBounds:
         )
 
     async def test_query_memory_without_limit_still_works(self, store: SqliteEngravaCore) -> None:
-        # An omitted limit is not a bound to validate; the store's own default
-        # applies and the call must not be rejected.
+        # An omitted limit is not itself a bound to validate; MAX_PAGE_LIMIT is
+        # injected instead of reaching the store unbounded (see
+        # TestQueryMemoryOwnLimitIsBounded), and the call must not be rejected.
         result = await query_memory_impl(store, FIND_ALL)
         assert isinstance(result["rows"], list)
 

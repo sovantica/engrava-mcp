@@ -28,7 +28,9 @@ Eight read-only tools are exposed:
     Structured ``FIND`` queries in the MindQL query language.  Only the
     ``FIND`` command is accepted; raw-SQL passthrough and every other
     command are rejected.  Accepts an optional ``limit`` (the MindQL
-    grammar has no ``OFFSET``, so this tool paginates by ``limit`` only).
+    grammar has no ``OFFSET``, so this tool paginates by ``limit`` only),
+    which always overrides any ``LIMIT`` the query text carries; a query
+    with no ``LIMIT`` at all is capped rather than run unbounded.
 ``memory_stats``
     Aggregate counts and store-health metrics.
 ``get_edges``
@@ -324,6 +326,51 @@ class UnsupportedQueryError(ValueError):
         )
 
 
+class UnexecutableQueryError(ValueError):
+    """Raised when a query that parsed as ``FIND`` fails during execution.
+
+    By the time ``store.execute_mindql`` runs, the query has already passed
+    the ``FIND``-only guard — so whatever it rejects the query for (an
+    unknown column, a disallowed comparison) is necessarily about the
+    query's own content, never about the command set. That makes the raw
+    diagnosis safe to surface verbatim, unlike a failure raised by ``parse()``
+    itself: the discriminator is *where* the failure was raised, not what it
+    says, because the MindQL executor's exceptions carry no structure to
+    pattern-match on beyond that.
+
+    Args:
+        message: The executor's own diagnosis, forwarded unchanged.
+
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+class MalformedFindError(ValueError):
+    """Raised when a query classified as ``FIND`` fails to parse.
+
+    ``query_memory_impl`` determines the command verb itself, before ever
+    calling ``parse()`` (see :func:`_query_declares_find`): when the first
+    token, after stripping an optional ``EXPLAIN`` prefix, is ``FIND``
+    case-insensitively, any ``MindQLParseError`` that ``parse()`` then raises
+    is necessarily about that FIND's own content (an unknown table, a bad
+    condition) — the unrecognised-verb message that names the full command
+    set only fires for a verb ``parse()`` itself does not recognise as
+    ``FIND``, ``COUNT``, ``SELECT``, or a registered extension, which by
+    construction cannot be this case. The discriminator is the *input*,
+    classified before parsing, not the exception's *text* — this module
+    controls the former and never the latter.
+
+    Args:
+        message: The parser's own diagnosis, forwarded unchanged.
+
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
 class OutOfRangeBoundError(ValueError):
     """Raised when a wire-supplied numeric bound falls outside its domain.
 
@@ -452,6 +499,20 @@ async def _tool_errors() -> AsyncIterator[None]:  # noqa: C901, PLR0912
             f"be parsed as one. Use the FIND command, for example: {FIND_QUERY_EXAMPLE}"
         )
         raise ToolError(msg) from exc
+    except MalformedFindError as exc:
+        # See MalformedFindError's docstring: query_memory_impl classifies
+        # the command verb itself, before calling parse(), so a
+        # MindQLParseError wrapped in this type is guaranteed to be about a
+        # FIND's own content and never the unrecognised-verb message.
+        raise ToolError(str(exc)) from exc
+    except UnexecutableQueryError as exc:
+        # Raised by query_memory_impl only after the query already parsed as
+        # FIND, so by construction it cannot name another MindQL command.
+        # Its message names only the query's own content (a column, a table,
+        # a value) and is safe to echo verbatim — unlike the MindQLParseError
+        # branch above, which stays generic because it also covers the
+        # unrecognised-verb case.
+        raise ToolError(str(exc)) from exc
     except ThoughtNotFoundError as exc:
         msg = (
             f"No thought exists with id {exc.thought_id!r}. Check the "
@@ -825,6 +886,54 @@ async def search_keywords_impl(
     }
 
 
+#: Matches an optional leading ``EXPLAIN`` keyword the same way ``parse()``
+#: does (case-insensitively, followed by whitespace or end-of-string), so
+#: :func:`_query_declares_find` classifies the verb using exactly the same
+#: rule ``parse()`` itself will apply, rather than a rule that could drift
+#: from it.
+_EXPLAIN_PREFIX_RE = re.compile(r"EXPLAIN(\s+|$)", re.IGNORECASE)
+
+
+def _query_declares_find(query: str) -> bool:
+    """Classify whether ``query``'s own command verb is ``FIND``.
+
+    Used only to decide which of two messages a ``MindQLParseError`` gets —
+    never to interpret the query, which remains ``parse()``'s job entirely.
+    Mirrors ``parse()``'s own ``EXPLAIN``-stripping and whitespace-splitting
+    tokenization far enough to read the first token, so this can never
+    disagree with what ``parse()`` itself would call the verb.
+
+    Fails toward ``False`` on anything not confidently recognised — an empty
+    query, a bare ``EXPLAIN`` with nothing after it, leading/trailing
+    whitespace that leaves no token at all. A false positive here would
+    disclose ``parse()``'s command set for a query that is not actually a
+    FIND; a false negative only costs a caller the specific diagnosis and
+    falls back to the pre-existing generic message, which is the safe
+    direction to fail in.
+
+    Args:
+        query: The raw MindQL query string, exactly as the caller wrote it.
+
+    Returns:
+        ``True`` when the first command token, after stripping an optional
+        ``EXPLAIN`` prefix, is ``FIND`` case-insensitively; ``False`` for
+        every other input, including ones this function does not recognise.
+
+    """
+    stripped = query.strip()
+    if not stripped:
+        return False
+
+    explain_match = _EXPLAIN_PREFIX_RE.match(stripped)
+    if explain_match:
+        stripped = stripped[explain_match.end() :].strip()
+        if not stripped:
+            return False
+
+    verb = stripped.split(maxsplit=1)[0]
+    return verb.upper() == "FIND"
+
+
 async def query_memory_impl(
     store: ReadOnlyMcpStore,
     query: str,
@@ -836,22 +945,50 @@ async def query_memory_impl(
     Only the ``FIND`` command is accepted.  The grammar is
     ``FIND <table> WHERE <field> <op> '<value>' [LIMIT n]``.
 
+    Every call is capped at :data:`MAX_PAGE_LIMIT` rows regardless of what
+    ``query`` asks for: a query with no ``LIMIT`` clause of its own gets the
+    cap injected, and one whose own ``LIMIT`` already exceeds the cap is
+    refused rather than silently truncated to it. **Precedence:** the
+    ``limit`` argument, when supplied, always replaces any ``LIMIT`` already
+    present in ``query`` outright — the two are never combined or compared,
+    so a caller that wants the query's own ``LIMIT`` honoured must omit the
+    argument.
+
     Args:
         store: The store to query.
         query: A MindQL ``FIND`` query string.
-        limit: Optional row cap.  When provided, it overrides any
-            ``LIMIT`` clause present in ``query``.
+        limit: Optional row cap.  When provided, it overrides any ``LIMIT``
+            clause present in ``query`` and is validated against the same
+            ``[1, MAX_PAGE_LIMIT]`` range. When omitted, the query's own
+            ``LIMIT`` is used if present and in range, or ``MAX_PAGE_LIMIT``
+            is injected if the query carries none.
 
     Returns:
         A dict with the result ``columns`` and matching ``rows``.
 
     Raises:
         UnsupportedQueryError: If the query is not a ``FIND`` command.
-        OutOfRangeBoundError: If ``limit`` is outside its accepted range.
-        MindQLParseError: If the query is malformed.
+        OutOfRangeBoundError: If ``limit``, or an in-query ``LIMIT`` used in
+            its place, is outside its accepted range.
+        MindQLParseError: If the query is malformed and its own verb is not
+            classified as ``FIND`` (see :func:`_query_declares_find`).
+        MalformedFindError: If the query's own verb classifies as ``FIND``
+            but it fails to parse (e.g. an unknown table or condition).
+        UnexecutableQueryError: If the query parses as ``FIND`` but fails
+            during execution (e.g. an unknown column).
 
     """
-    parsed = parse(query)
+    # The verb is classified from the input itself, before parse() ever
+    # runs, so that a MindQLParseError it then raises can be routed by where
+    # the query committed to FIND rather than by the message's text (see
+    # _query_declares_find and MalformedFindError).
+    declares_find = _query_declares_find(query)
+    try:
+        parsed = parse(query)
+    except MindQLParseError as exc:
+        if declares_find:
+            raise MalformedFindError(str(exc)) from exc
+        raise
     if parsed.command is not MindQLCommand.FIND:
         raise UnsupportedQueryError(parsed.command.value)
 
@@ -859,17 +996,37 @@ async def query_memory_impl(
     # bound is validated *before* it is built into a MindQLQuery, because the
     # executor interpolates the limit into the SQL string rather than binding
     # it. Never rely on the protocol layer's coercion to have done this.
+    #
+    # Precedence (see the docstring): the `limit` argument always wins over a
+    # LIMIT already present in the query text, replacing it outright. Only
+    # when the argument is absent does the query's own LIMIT get a say — and
+    # even then it is capped exactly like the argument would be, and a query
+    # with no LIMIT at all gets MAX_PAGE_LIMIT injected rather than reaching
+    # the store unbounded.
     if limit is not None:
         _check_bound("limit", limit, minimum=1, maximum=MAX_PAGE_LIMIT)
-
-    effective = parsed if limit is None else _with_limit(parsed, limit)
+        effective = _with_limit(parsed, limit)
+    elif parsed.limit is None:
+        effective = _with_limit(parsed, MAX_PAGE_LIMIT)
+    else:
+        _check_bound("the query's LIMIT clause", parsed.limit, minimum=1, maximum=MAX_PAGE_LIMIT)
+        effective = parsed
 
     # Execute via the public store-level entry point. The store owns the
     # connection; this consumer must not reach into it. The FIND-only guard
     # above is intentionally kept here (a consumer exposure policy), and no
     # ``extensions`` map is passed — both keep the over-the-wire surface
     # restricted to FIND.
-    result = await store.execute_mindql(effective)
+    #
+    # A MindQLParseError raised here is discriminated from one raised by
+    # parse() above by WHERE it was raised, never by what it says: the query
+    # has already parsed as FIND at this point, so whatever the executor
+    # rejects it for cannot name another MindQL command. Wrap it in a
+    # distinct type so `_tool_errors` can map the two differently.
+    try:
+        result = await store.execute_mindql(effective)
+    except MindQLParseError as exc:
+        raise UnexecutableQueryError(str(exc)) from exc
     return {"columns": result.columns, "rows": result.rows}
 
 
@@ -1819,7 +1976,11 @@ def register_tools(server: FastMCP, provider: StoreProvider, *, read_only: bool)
         description=(
             "Run a structured MindQL FIND query over stored memory, e.g. "
             "\"FIND thoughts WHERE lifecycle_status = 'ACTIVE' LIMIT 10\". "
-            "Only the FIND command is supported."
+            "Only the FIND command is supported. Results are capped at "
+            f"{MAX_PAGE_LIMIT} rows: a query with no LIMIT clause gets this "
+            "cap injected, and a LIMIT above it is refused rather than "
+            "truncated. The limit argument, if given, always replaces any "
+            "LIMIT already in the query text — the two are never combined."
         ),
         annotations=_READ_ONLY,
     )

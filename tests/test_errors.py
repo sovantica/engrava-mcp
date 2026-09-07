@@ -11,7 +11,16 @@ The conditions covered are:
 
 * the store is not yet available (a misconfigured deployment),
 * ``query_memory`` receives a non-``FIND`` command (``SELECT`` / ``COUNT``),
-* ``query_memory`` receives a malformed ``FIND``,
+* ``query_memory`` receives a query whose own verb is not classified as
+  ``FIND`` and fails to parse — the message stays generic, since the parser's
+  raw text for an unrecognised verb would name the full command set,
+* ``query_memory`` receives a query whose own verb *is* classified as
+  ``FIND`` but fails to parse (an unknown table, a bad condition) — this
+  gets the parser's specific diagnosis, because that verb classification
+  guarantees the failure is about the FIND's own content,
+* ``query_memory`` receives a syntactically valid ``FIND`` that fails during
+  execution (e.g. an unknown column) — the same specific-diagnosis treatment,
+  for the same reason, at a different stage,
 * ``update_thought`` names a thought that does not exist,
 * ``link_thoughts`` names an endpoint that does not exist.
 
@@ -45,6 +54,7 @@ from engrava_mcp.server import (
     DUPLICATE_EDGE_MESSAGE,
     SERVER_NAME,
     StoreProvider,
+    _query_declares_find,
     _tool_errors,
     link_thoughts_impl,
     register_tools,
@@ -63,6 +73,8 @@ _LEAK_MARKERS = (
     'File "',
     "StoreNotReadyError",
     "UnsupportedQueryError",
+    "UnexecutableQueryError",
+    "MalformedFindError",
     "MindQLParseError",
     "ThoughtNotFoundError",
     "ReferentialIntegrityError",
@@ -294,18 +306,96 @@ class TestGuardPreservation:
         assert "SELECT" not in text
         assert "extension" not in lowered
 
+    async def test_lowercase_whitespace_padded_unknown_verb_is_also_rejected(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        # The verb classifier that routes a MindQLParseError to the specific
+        # or the generic message must not itself be fooled by case or
+        # padding: a lowercase, whitespace-padded unknown verb is still "not
+        # FIND", so it keeps the generic message and the command set stays
+        # hidden. This is the guard the classifier exists to protect, not a
+        # by-product of it.
+        async with _client_for(store) as client:
+            result = await client.call_tool("query_memory", {"query": "  drop   thoughts  "})
 
-class TestMalformedFind:
-    """A malformed query is rejected with a FIND-only message + example.
+        assert result.isError is True
+        text = _error_text(result.content)
+        lowered = text.lower()
+        assert "only find" in lowered
+        _assert_no_leak(text)
+        assert "COUNT" not in text
+        assert "SELECT" not in text
+        assert "extension" not in lowered
 
-    The message is deliberately generic (FIND-only + a valid example) and
-    does NOT echo the parser's raw text, because the parser names the full
-    MindQL command set for an unrecognised verb — which the MCP surface must
-    not advertise. The trade-off (a malformed FIND loses the precise parse
-    detail) is accepted to keep the over-the-wire surface FIND-only.
+
+class TestQueryDeclaresFind:
+    """``_query_declares_find`` classifies the verb, and fails safe.
+
+    This is the discriminator ``query_memory_impl`` uses to decide which
+    message a ``MindQLParseError`` gets. It never interprets the query — it
+    only reads the first token, after stripping an optional ``EXPLAIN``
+    prefix the same way ``parse()`` does — and it returns ``False`` on
+    anything ambiguous rather than risk a false positive that would route an
+    unrecognised-verb failure to the specific-message branch.
     """
 
-    async def test_incomplete_find_reports_find_only_and_example(
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "FIND thoughts",
+            "FIND",
+            "FIND nosuchtable",
+            "  find thoughts LIMIT 5",
+            "FiNd nosuchtable",
+            "EXPLAIN FIND thoughts",
+            "EXPLAIN   FIND nosuchtable",
+            "explain find thoughts",
+        ],
+    )
+    def test_recognises_find_case_and_whitespace_insensitively(self, query: str) -> None:
+        assert _query_declares_find(query) is True
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "COUNT thoughts",
+            "SELECT * FROM thought",
+            "DROP thoughts",
+            "  drop   thoughts  ",
+            "FINDER thoughts",
+            "",
+            "   ",
+            "EXPLAIN",
+            "EXPLAIN   ",
+            "explain",
+        ],
+    )
+    def test_fails_safe_to_false_on_anything_not_confidently_find(self, query: str) -> None:
+        # Every one of these either is not FIND (COUNT, SELECT, DROP,
+        # "FINDER" is not "FIND") or is too ambiguous to call at all (empty,
+        # a bare EXPLAIN with nothing after it) -- both fail the same way, to
+        # the side that keeps the generic message.
+        assert _query_declares_find(query) is False
+
+
+class TestMalformedFind:
+    """A query whose own verb is FIND reports the parser's specific diagnosis.
+
+    ``query_memory_impl`` classifies the verb itself, before ``parse()`` ever
+    runs (see ``_query_declares_find`` in ``server.py``): when the query's
+    first token, after an optional ``EXPLAIN`` prefix, is ``FIND``
+    case-insensitively, whatever ``parse()`` then rejects the query for
+    cannot be the unrecognised-verb message — it is necessarily about that
+    FIND's own content (a bad table, a bad condition, a missing table name)
+    — so the raw diagnosis is surfaced verbatim instead of the generic
+    FIND-only message. A query whose verb is *not* FIND (an unrecognised verb,
+    or anything the classifier does not confidently recognise) keeps the
+    pre-existing generic message; that side is covered by
+    :class:`TestGuardPreservation`.
+    """
+
+    async def test_find_alone_reports_its_own_diagnosis(
         self,
         store: SqliteEngravaCore,
     ) -> None:
@@ -314,27 +404,120 @@ class TestMalformedFind:
 
         assert result.isError is True
         text = _error_text(result.content)
-        # FIND-only contract is stated, with a valid FIND example to copy ...
-        assert "only find" in text.lower()
-        assert "FIND thoughts WHERE" in text
-        # ... and the parser's command set is never leaked.
-        assert "COUNT" not in text
-        assert "extension" not in text.lower()
+        # The parser's own diagnosis reaches the client verbatim ...
+        assert "FIND requires a table name" in text
+        # ... rather than the generic FIND-only message.
+        assert "could not be parsed" not in text
         _assert_no_leak(text)
 
-    async def test_unknown_table_reports_problem(
+    async def test_unknown_table_names_the_table(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        async with _client_for(store) as client:
+            result = await client.call_tool("query_memory", {"query": "FIND nosuchtable"})
+
+        assert result.isError is True
+        text = _error_text(result.content)
+        assert "nosuchtable" in text
+        assert "could not be parsed" not in text
+        _assert_no_leak(text)
+
+    async def test_invalid_condition_names_the_condition(
         self,
         store: SqliteEngravaCore,
     ) -> None:
         async with _client_for(store) as client:
             result = await client.call_tool(
                 "query_memory",
-                {"query": "FIND widgets WHERE x = '1'"},
+                {"query": "FIND thoughts WHERE priority ~~ 'P1'"},
             )
 
         assert result.isError is True
         text = _error_text(result.content)
-        assert "FIND thoughts WHERE" in text
+        # The rejected condition text reaches the client ...
+        assert "priority ~~ 'P1'" in text
+        # ... rather than the generic FIND-only message.
+        assert "could not be parsed" not in text
+        _assert_no_leak(text)
+
+    async def test_explain_prefix_gets_the_same_specific_diagnosis(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        # EXPLAIN is stripped before the verb is read, both by parse() and by
+        # the classifier that decides which message to give — so a malformed
+        # FIND behind EXPLAIN is diagnosed the same as one without it.
+        async with _client_for(store) as client:
+            result = await client.call_tool(
+                "query_memory",
+                {"query": "EXPLAIN FIND nosuchtable"},
+            )
+
+        assert result.isError is True
+        text = _error_text(result.content)
+        assert "nosuchtable" in text
+        assert "could not be parsed" not in text
+        _assert_no_leak(text)
+
+    async def test_mixed_case_find_still_gets_the_specific_diagnosis(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        # The verb classifier folds case exactly like parse() does, so a
+        # mixed-case verb is still recognised as FIND.
+        async with _client_for(store) as client:
+            result = await client.call_tool("query_memory", {"query": "FiNd nosuchtable"})
+
+        assert result.isError is True
+        text = _error_text(result.content)
+        assert "nosuchtable" in text
+        assert "could not be parsed" not in text
+        _assert_no_leak(text)
+
+    async def test_lowercase_whitespace_padded_find_still_executes(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        # A lowercase, whitespace-padded FIND that is otherwise valid is not
+        # touched by the classifier at all: it parses and executes normally.
+        # This guards against a classifier bug that would reject or mishandle
+        # a perfectly good query just because of case or padding.
+        async with _client_for(store) as client:
+            result = await client.call_tool("query_memory", {"query": "  find thoughts LIMIT 5"})
+
+        assert result.isError is not True
+
+
+class TestUnexecutableFind:
+    """A FIND that parses fine but fails at execution reports the diagnosis.
+
+    ``FIND thoughts WHERE nosuchfield = 'x'`` is a syntactically valid FIND —
+    it parses — and only fails once the executor checks the column against
+    the table's allowlist. Like the parse()-stage failures in
+    :class:`TestMalformedFind`, this diagnosis is safe to surface verbatim:
+    the query has committed to FIND (whether by parsing all the way through,
+    here, or merely by its own leading verb, there) before failing, so the
+    message cannot name another MindQL command the way the parser's
+    unrecognised-verb message would.
+    """
+
+    async def test_unknown_column_names_the_column(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        async with _client_for(store) as client:
+            result = await client.call_tool(
+                "query_memory",
+                {"query": "FIND thoughts WHERE nosuchfield = 'x'"},
+            )
+
+        assert result.isError is True
+        text = _error_text(result.content)
+        # The specific diagnosis reaches the client, naming the bad column ...
+        assert "nosuchfield" in text
+        # ... rather than being swallowed by the generic FIND-only message.
+        assert "could not be parsed" not in text
         _assert_no_leak(text)
 
 

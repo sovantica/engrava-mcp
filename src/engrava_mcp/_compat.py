@@ -20,16 +20,16 @@ import importlib.metadata
 import warnings
 
 #: Lowest engrava version (inclusive) this server is tested against.
-#: Keep in sync with the ``engrava>=0.6,<0.7`` requirement in ``pyproject.toml``.
-ENGRAVA_MIN_VERSION = (0, 6)
+#: Keep in sync with the ``engrava>=0.7,<0.8`` requirement in ``pyproject.toml``.
+ENGRAVA_MIN_VERSION = (0, 7)
 
 #: Lowest engrava version (exclusive) that is out of range — the next minor.
-#: Keep in sync with the ``engrava>=0.6,<0.7`` requirement in ``pyproject.toml``.
-ENGRAVA_MAX_VERSION_EXCLUSIVE = (0, 7)
+#: Keep in sync with the ``engrava>=0.7,<0.8`` requirement in ``pyproject.toml``.
+ENGRAVA_MAX_VERSION_EXCLUSIVE = (0, 8)
 
 #: Human-readable supported range, used in user-facing messages. Keep in sync
-#: with the ``engrava>=0.6,<0.7`` requirement in ``pyproject.toml``.
-ENGRAVA_SUPPORTED_RANGE = ">=0.6,<0.7"
+#: with the ``engrava>=0.7,<0.8`` requirement in ``pyproject.toml``.
+ENGRAVA_SUPPORTED_RANGE = ">=0.7,<0.8"
 
 
 class EngravaVersionWarning(UserWarning):

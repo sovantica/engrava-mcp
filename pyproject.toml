@@ -31,7 +31,7 @@ dependencies = [
     # change within an X.Y.x patch range). 0.6.0 is the first release carrying
     # the public API this server's 0.6 surface consumes (edge reads, edge
     # metadata, transaction-time recency).
-    "engrava>=0.6,<0.7",
+    "engrava>=0.7,<0.8",
     # Cap the MCP SDK major so a future incompatible release can't silently
     # break `uvx engrava-mcp`; widen only after testing a new major. mcp>=1.27
     # transitively constrains pydantic>=2.11,<3 (the floor engrava also targets).
@@ -41,7 +41,7 @@ dependencies = [
     # so semantic search and OpenAI/Ollama embeddings work out of the box once
     # an embedding provider is declared in engrava.yaml. Heavy local providers
     # (torch / sentence-transformers, HuggingFace Hub) stay opt-in extras.
-    "engrava[vec]>=0.6,<0.7",
+    "engrava[vec]>=0.7,<0.8",
     "httpx>=0.27.0",
 ]
 
@@ -49,10 +49,10 @@ dependencies = [
 # Mirror engrava's embedding-provider extras so users can install the matching
 # provider dependencies alongside the server, e.g.
 # `uvx --from "engrava-mcp[local]" engrava-mcp`.
-openai = ["engrava[embeddings-openai]>=0.6,<0.7"]
-ollama = ["engrava[embeddings-ollama]>=0.6,<0.7"]
-hf = ["engrava[embeddings-hf]>=0.6,<0.7"]
-local = ["engrava[embeddings-local]>=0.6,<0.7"]
+openai = ["engrava[embeddings-openai]>=0.7,<0.8"]
+ollama = ["engrava[embeddings-ollama]>=0.7,<0.8"]
+hf = ["engrava[embeddings-hf]>=0.7,<0.8"]
+local = ["engrava[embeddings-local]>=0.7,<0.8"]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",

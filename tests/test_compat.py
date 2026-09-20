@@ -24,7 +24,7 @@ class TestIncompatibleEngravaMessage:
 
         assert "engrava" in message
         assert ENGRAVA_SUPPORTED_RANGE in message
-        assert ">=0.6,<0.7" in message
+        assert ">=0.7,<0.8" in message
         assert str(original) in message
 
     def test_recovery_instruction_is_present(self) -> None:
@@ -37,7 +37,7 @@ class TestIncompatibleEngravaMessage:
 class TestWarnIfEngravaOutOfRange:
     """The startup version check is a soft warning, never a hard failure."""
 
-    @pytest.mark.parametrize("version", ["0.4.0", "0.5.0", "0.7.0", "1.0.0"])
+    @pytest.mark.parametrize("version", ["0.5.0", "0.6.0", "0.8.0", "1.0.0"])
     def test_out_of_range_version_warns(
         self, monkeypatch: pytest.MonkeyPatch, version: str
     ) -> None:
@@ -46,7 +46,7 @@ class TestWarnIfEngravaOutOfRange:
         with pytest.warns(EngravaVersionWarning, match=version):
             warn_if_engrava_out_of_range()
 
-    @pytest.mark.parametrize("version", ["0.6.0", "0.6.2", "0.6.99"])
+    @pytest.mark.parametrize("version", ["0.7.0", "0.7.2", "0.7.99"])
     def test_in_range_version_does_not_warn(
         self, monkeypatch: pytest.MonkeyPatch, version: str
     ) -> None:
@@ -85,8 +85,8 @@ class TestWarnIfEngravaOutOfRange:
             warn_if_engrava_out_of_range()
 
     def test_pre_release_minor_suffix_is_handled(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # A "0.7.0rc1" pre-release is still out of range (minor 7 >= 7).
-        monkeypatch.setattr(importlib.metadata, "version", lambda _name: "0.7rc1")
+        # A "0.8.0rc1" pre-release is still out of range (minor 8 >= 8).
+        monkeypatch.setattr(importlib.metadata, "version", lambda _name: "0.8rc1")
 
         with pytest.warns(EngravaVersionWarning):
             warn_if_engrava_out_of_range()

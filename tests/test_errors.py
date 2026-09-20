@@ -38,26 +38,37 @@ tests already use.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import re
 import sqlite3
+import textwrap
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
 import pytest
-from engrava import EdgeType
-from engrava.domain.exceptions import DuplicateEdgeError
+from engrava import EdgeType, StaleDataError
+from engrava.domain import exceptions as engrava_exceptions
+from engrava.domain.exceptions import DuplicateEdgeError, EngravaError
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session as connect_client
 
+import engrava_mcp.server as server_module
 from engrava_mcp.server import (
     DUPLICATE_EDGE_MESSAGE,
+    EDGE_ID_COLLISION_MESSAGE,
     SERVER_NAME,
+    SQLITE_MAX_BOUND_INT,
+    EmbeddingQueryNotSupportedError,
     StoreProvider,
     _query_declares_find,
     _tool_errors,
     link_thoughts_impl,
+    query_memory_impl,
     register_tools,
+    store_thought_impl,
+    update_thought_impl,
 )
 
 if TYPE_CHECKING:
@@ -87,6 +98,7 @@ _LEAK_MARKERS = (
     "edge.from_thought_id",
     "edge.to_thought_id",
     "edge.edge_type",
+    "edge.edge_id",
     # Domain-model-validation internals: Pydantic's raw message names the model
     # class and links its docs site.
     "ValidationError",
@@ -97,6 +109,17 @@ _LEAK_MARKERS = (
     # names the internal status type.
     "InvalidTransitionError",
     "Invalid LifecycleStatus transition",
+    # StaleDataError's raw message names the internal entity-type symbol.
+    "StaleDataError",
+    "Stale data:",
+    # A bare ValueError's raw phrasing (duplicate thought_id, oversized edge
+    # metadata) must be replaced, not forwarded.
+    "Thought already exists:",
+    "metadata serialized size",
+    # The embeddings-refusal and overflow guards must not name their own type.
+    "EmbeddingQueryNotSupportedError",
+    "OverflowError",
+    "convert to SQLite INTEGER",
 )
 
 #: Phrases that would wrongly suggest raw SQL is runnable over the wire.
@@ -794,3 +817,670 @@ class TestUnrecognisedIntegrityError:
         with pytest.raises(ToolError):
             async with _tool_errors():
                 raise unique_violation
+
+
+class TestDuplicateThoughtId:
+    """A caller-supplied thought_id that collides with an existing thought.
+
+    engrava reports this as a bare ``ValueError`` ("Thought already exists:
+    <id>"), not a dedicated type -- the store's contract is the message text,
+    not a catchable class -- so the client must not see it raw.
+    """
+
+    async def test_duplicate_id_reports_clean_message_with_alternatives(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        async with _client_for(store) as client:
+            first = await client.call_tool(
+                "store_thought",
+                {"essence": "first", "content": "first body", "thought_id": "dup-thought"},
+            )
+            assert first.isError is False
+
+            duplicate = await client.call_tool(
+                "store_thought",
+                {"essence": "second", "content": "second body", "thought_id": "dup-thought"},
+            )
+
+        assert duplicate.isError is True
+        text = _error_text(duplicate.content)
+        # Names the offending id ...
+        assert "dup-thought" in text
+        assert "already exists" in text.lower()
+        # ... and offers both actionable alternatives.
+        assert "thought_id" in text
+        assert "deduplicate" in text
+        _assert_no_leak(text)
+
+    async def test_duplicate_id_does_not_overwrite_the_existing_thought(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        await store_thought_impl(
+            store, essence="original", content="original body", thought_id="dup-thought-2"
+        )
+
+        with pytest.raises(ToolError):
+            async with _tool_errors():
+                await store_thought_impl(
+                    store,
+                    essence="replacement",
+                    content="replacement body",
+                    thought_id="dup-thought-2",
+                )
+
+        read_back = await store.get_thought("dup-thought-2")
+        assert read_back is not None
+        assert read_back.essence == "original"
+
+    async def test_deduplicate_true_is_unaffected(self, store: SqliteEngravaCore) -> None:
+        # deduplicate=True resolves by content hash, a different path that
+        # never reaches the id-collision ValueError -- the fix above must not
+        # have coupled the two.
+        content = "shared body for dedup-true regression"
+        first = await store_thought_impl(store, essence="a", content=content, deduplicate=True)
+        second = await store_thought_impl(store, essence="b", content=content, deduplicate=True)
+        assert first["thought"]["thought_id"] == second["thought"]["thought_id"]
+
+
+class TestConcurrentThoughtUpdate:
+    """A concurrent write that loses the optimistic-concurrency guard.
+
+    ``update_thought`` reads the thought's ``updated_cycle`` and guards its
+    write on that value unconditionally -- not opt-in, and not exposed as a
+    wire argument. Simulated here by advancing the stored row underneath the
+    read ``update_thought`` already took, the same window a second real
+    writer on a second store instance would race into (see
+    ``StaleDataError``'s own docstring: a second store on the same database
+    file is outside what the in-process write lock can reach).
+    """
+
+    @staticmethod
+    def _install_racing_read(monkeypatch: pytest.MonkeyPatch, store: SqliteEngravaCore) -> None:
+        """Make the next ``_get_thought_row`` also advance the real row.
+
+        The snapshot ``update_thought`` reads is returned unchanged, so its
+        own ``expected_cycle`` is now stale relative to the row it is about
+        to guard its write against -- reproducing what a second writer
+        landing in that exact window would do.
+        """
+        real_get_thought_row = type(store)._get_thought_row
+
+        async def _racing_get_thought_row(self: SqliteEngravaCore, thought_id: str) -> object:
+            row = await real_get_thought_row(self, thought_id)
+            await self._db.execute(
+                "UPDATE thought SET updated_cycle = updated_cycle + 1 WHERE thought_id = ?",
+                (thought_id,),
+            )
+            return row
+
+        monkeypatch.setattr(type(store), "_get_thought_row", _racing_get_thought_row)
+
+    async def test_reports_actionable_retry_message_over_the_wire(
+        self, store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._install_racing_read(monkeypatch, store)
+
+        async with _client_for(store) as client:
+            result = await client.call_tool(
+                "update_thought",
+                {"thought_id": "thought-alpha", "essence": "raced update"},
+            )
+
+        assert result.isError is True
+        text = _error_text(result.content)
+        assert "thought-alpha" in text
+        assert "changed" in text.lower() or "modified" in text.lower()
+        # Actionable: names the retry path.
+        assert "get_thought" in text
+        _assert_no_leak(text)
+
+    async def test_raced_update_writes_nothing(
+        self, store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._install_racing_read(monkeypatch, store)
+
+        with pytest.raises(ToolError):
+            async with _tool_errors():
+                await update_thought_impl(store, "thought-alpha", essence="raced update")
+
+        read_back = await store.get_thought("thought-alpha")
+        assert read_back is not None
+        assert read_back.essence != "raced update"
+
+    async def test_direct_stale_data_error_maps_to_the_same_message_shape(self) -> None:
+        # Regression guard for the message contract itself, independent of
+        # how the race is reproduced.
+        err = StaleDataError(
+            entity_type="ThoughtRecord", entity_id="thought-alpha", expected_version=3
+        )
+        with pytest.raises(ToolError) as excinfo:
+            async with _tool_errors():
+                raise err
+        text = str(excinfo.value)
+        assert "thought-alpha" in text
+        assert "get_thought" in text
+        _assert_no_leak(text)
+
+
+class TestOversizedEdgeMetadata:
+    """Edge metadata above engrava's serialized-size limit.
+
+    Reported as a bare ``ValueError`` shared with the thought-metadata path
+    inside engrava, but ``store_thought`` / ``update_thought`` do not expose
+    ``metadata`` on this wire surface at all -- ``link_thoughts`` is the only
+    reachable caller, so the curated message stays edge-specific rather than
+    echoing the store's thought-oriented "store it in content instead" advice.
+    """
+
+    async def test_oversized_metadata_reports_clean_edge_specific_message(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        oversized = {"blob": "x" * 70_000}
+        async with _client_for(store) as client:
+            result = await client.call_tool(
+                "link_thoughts",
+                {
+                    "from_thought_id": "thought-alpha",
+                    "to_thought_id": "thought-beta",
+                    "edge_type": "ASSOCIATED",
+                    "metadata": oversized,
+                },
+            )
+
+        assert result.isError is True
+        text = _error_text(result.content)
+        assert "metadata" in text.lower()
+        assert "too large" in text.lower()
+        # The two byte counts the store computed are surfaced ...
+        assert "65536" in text
+        # ... but the store's own "content" field advice is thought-specific
+        # and must not appear on this edge-only path.
+        assert "`content`" not in text
+        _assert_no_leak(text)
+
+    async def test_oversized_metadata_creates_no_edge(self, store: SqliteEngravaCore) -> None:
+        oversized = {"blob": "x" * 70_000}
+        with pytest.raises(ToolError):
+            async with _tool_errors():
+                await link_thoughts_impl(
+                    store,
+                    "thought-alpha",
+                    "thought-beta",
+                    EdgeType.ASSOCIATED,
+                    metadata=oversized,
+                )
+
+        edges = await store.get_edges("thought-alpha", direction="OUT")
+        assert edges == []
+
+    async def test_in_range_metadata_is_unaffected(self, store: SqliteEngravaCore) -> None:
+        result = await link_thoughts_impl(
+            store,
+            "thought-alpha",
+            "thought-beta",
+            EdgeType.ASSOCIATED,
+            metadata={"topic": "regression check"},
+        )
+        assert result["edge"]["metadata"] == {"topic": "regression check"}
+
+    async def test_message_shape_change_falls_back_to_a_generic_message(self) -> None:
+        # Defense in depth for the regex extracting the two byte counts: if
+        # engrava's message ever carries the "metadata serialized size" prefix
+        # without the exact "N bytes exceeds maximum M bytes" shape the regex
+        # expects, the branch still raises a clean, if less specific, message
+        # rather than crashing on a failed match or falling through unmapped.
+        reshaped = ValueError("metadata serialized size is too large now")
+        with pytest.raises(ToolError) as excinfo:
+            async with _tool_errors():
+                raise reshaped
+        text = str(excinfo.value)
+        assert "too large" in text.lower()
+        _assert_no_leak(text)
+
+
+class TestUnrelatedValueErrorIsNeverSwallowed:
+    """A ``ValueError`` matching neither curated prefix propagates unchanged.
+
+    The regression this guards: the plain ``ValueError`` branch added for (a)
+    and (c) must re-raise anything that is not one of those two specific
+    shapes, so a future, unrelated ``ValueError`` is never silently
+    misdescribed or swallowed.
+    """
+
+    async def test_unrelated_value_error_propagates_unchanged(self) -> None:
+        original = ValueError("some other failure entirely")
+        with pytest.raises(ValueError, match="some other failure entirely") as excinfo:
+            async with _tool_errors():
+                raise original
+        assert excinfo.value is original
+
+
+class TestEdgeIdCollision:
+    """A caller-supplied ``edge_id`` colliding with an existing edge's PK.
+
+    Distinct from the (from, to, type) UNIQUE violation :class:`TestDuplicateEdge`
+    covers: SQLite raises the same ``sqlite3.IntegrityError`` with "UNIQUE" in
+    the text either way (a PRIMARY KEY is a UNIQUE index internally), but the
+    two are different constraints with different causes -- attributing this
+    one to the other tells the caller to change the edge type, which does
+    nothing for an id collision.
+    """
+
+    async def test_colliding_edge_id_reports_the_real_cause(self, store: SqliteEngravaCore) -> None:
+        await link_thoughts_impl(
+            store,
+            "thought-alpha",
+            "thought-beta",
+            EdgeType.ASSOCIATED,
+            edge_id="edge-fixed-id",
+        )
+
+        with pytest.raises(ToolError) as excinfo:
+            async with _tool_errors():
+                # A different (from, to, type) -- would succeed on its own --
+                # but the same edge_id, so only the PRIMARY KEY collides.
+                await link_thoughts_impl(
+                    store,
+                    "thought-beta",
+                    "thought-alpha",
+                    EdgeType.DEPENDS_ON,
+                    edge_id="edge-fixed-id",
+                )
+
+        text = str(excinfo.value)
+        assert text == EDGE_ID_COLLISION_MESSAGE
+        # It must NOT be attributed to the (from, to, type) duplicate cause,
+        # nor suggest changing the edge type as the repair.
+        assert text != DUPLICATE_EDGE_MESSAGE
+        assert "already links those two thoughts" not in text
+        assert "changing the edge type will not resolve" in text.lower()
+        _assert_no_leak(text)
+
+    async def test_colliding_edge_id_over_the_wire(self, store: SqliteEngravaCore) -> None:
+        async with _client_for(store) as client:
+            first = await client.call_tool(
+                "link_thoughts",
+                {
+                    "from_thought_id": "thought-alpha",
+                    "to_thought_id": "thought-beta",
+                    "edge_type": "ASSOCIATED",
+                    "edge_id": "edge-wire-fixed",
+                },
+            )
+            assert first.isError is False
+
+            collision = await client.call_tool(
+                "link_thoughts",
+                {
+                    "from_thought_id": "thought-beta",
+                    "to_thought_id": "thought-alpha",
+                    "edge_type": "DEPENDS_ON",
+                    "edge_id": "edge-wire-fixed",
+                },
+            )
+
+        assert collision.isError is True
+        text = _error_text(collision.content)
+        assert EDGE_ID_COLLISION_MESSAGE in text
+        _assert_no_leak(text)
+
+    async def test_the_from_to_type_duplicate_is_still_correctly_attributed(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # Regression guard: distinguishing the PK collision must not break
+        # the pre-existing, correct (from, to, type) mapping it sits beside.
+        await link_thoughts_impl(store, "thought-alpha", "thought-beta", EdgeType.ASSOCIATED)
+        with pytest.raises(ToolError) as excinfo:
+            async with _tool_errors():
+                await link_thoughts_impl(
+                    store, "thought-alpha", "thought-beta", EdgeType.ASSOCIATED
+                )
+        assert str(excinfo.value) == DUPLICATE_EDGE_MESSAGE
+
+
+class TestOverflowingNumericBound:
+    """A wire-supplied integer that would overflow SQLite's own bind range.
+
+    The primary fix is the type: ``offset`` / ``min_cycle`` / ``max_cycle``
+    are now bound to ``[..., SQLITE_MAX_BOUND_INT]`` (see ``test_wire_bounds.py``
+    for the wire-level rejection), so the values here should no longer reach
+    a bind call at all. This class covers the ``_tool_errors`` translation
+    directly, as defense in depth for any such parameter the type fix has not
+    caught, or a future one that forgets it.
+    """
+
+    async def test_direct_overflow_error_maps_to_a_clean_message(self) -> None:
+        raw = OverflowError("Python int too large to convert to SQLite INTEGER")
+        with pytest.raises(ToolError) as excinfo:
+            async with _tool_errors():
+                raise raw
+        text = str(excinfo.value)
+        assert str(SQLITE_MAX_BOUND_INT) in text
+        _assert_no_leak(text)
+
+    async def test_offset_at_the_old_overflow_value_is_now_rejected_at_the_impl_layer(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # 2**63 is exactly the value the deep scan probed: it used to reach
+        # sqlite3's bind call inside list_memory_impl and raise a raw
+        # OverflowError. It is now rejected by _check_bound before the store
+        # is ever touched, with the same clean message this class's first
+        # test pins.
+        with pytest.raises(ToolError) as excinfo:
+            async with _tool_errors():
+                await server_module.list_memory_impl(store, offset=2**63)
+        text = str(excinfo.value)
+        assert "offset" in text
+        assert str(SQLITE_MAX_BOUND_INT) in text
+        _assert_no_leak(text)
+
+    async def test_offset_at_the_old_overflow_value_is_rejected_over_the_wire(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # Over the real MCP boundary this value is rejected by the advertised
+        # schema before list_memory_impl ever runs -- a different layer from
+        # the previous test, so only the rejection itself is asserted here.
+        # NOTE: FastMCP's own argument-schema rejection message leaks
+        # "pydantic" and a docs URL (confirmed pre-existing on every bound
+        # argument already annotated before this WS, e.g. limit=10**18, not
+        # something this change introduced) -- out of this WS's scope, which
+        # is the _tool_errors translation table, not FastMCP's own protocol-
+        # layer error formatting. Reported, not fixed here.
+        async with _client_for(store) as client:
+            result = await client.call_tool("list_memory", {"offset": 2**63})
+        assert result.isError is True
+
+
+class TestEmbeddingQueryRefusal:
+    """``FIND embeddings`` is refused outright rather than crashing on the blob.
+
+    The crash this replaces happens *after* ``query_memory_impl`` returns --
+    inside FastMCP's own response serialisation, once the returned dict's
+    ``rows`` carry the embedding's raw ``bytes`` -- which is outside
+    ``_tool_errors``'s ``try``/``except`` by the time it happens. Refusing the
+    table at the query boundary, before any row is ever fetched, is the only
+    place in this call this failure can be reached.
+    """
+
+    async def test_find_embeddings_is_refused_over_the_wire(self, store: SqliteEngravaCore) -> None:
+        async with _client_for(store) as client:
+            result = await client.call_tool("query_memory", {"query": "FIND embeddings"})
+
+        assert result.isError is True
+        text = _error_text(result.content)
+        assert "embed" in text.lower()
+        assert "thoughts" in text.lower()
+        _assert_no_leak(text)
+
+    async def test_find_embeddings_is_refused_even_with_a_stored_vector(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # The exact scenario the deep scan probed: a real stored vector
+        # present, so an unguarded query would fetch its raw bytes and crash
+        # unmapped during serialisation instead of returning cleanly.
+        await store.store_embedding("thought-alpha", [0.1, 0.2, 0.3])
+
+        async with _client_for(store) as client:
+            result = await client.call_tool("query_memory", {"query": "FIND embeddings"})
+
+        assert result.isError is True
+        _assert_no_leak(_error_text(result.content))
+
+    async def test_impl_raises_typed_error_for_the_embeddings_target(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        await store.store_embedding("thought-alpha", [0.1, 0.2, 0.3])
+        with pytest.raises(EmbeddingQueryNotSupportedError):
+            await query_memory_impl(store, "FIND embeddings")
+
+    async def test_other_tables_are_unaffected(self, store: SqliteEngravaCore) -> None:
+        result = await query_memory_impl(store, "FIND thoughts")
+        assert isinstance(result["rows"], list)
+
+
+# ---------------------------------------------------------------------------
+# Deliverable 5: the exception-surface sweep.
+# ---------------------------------------------------------------------------
+
+#: Every public exception type ``engrava.domain.exceptions`` defines that
+#: ``_tool_errors`` deliberately does not map, with the reason. An entry
+#: disappears from here only when a ``_tool_errors`` branch maps it -- never
+#: by silent deletion. Scoped to ``engrava.domain.exceptions`` specifically
+#: (not the MindQL parser's own exceptions, a materially smaller and already
+#: separately-tested surface) because that module is what "engrava's public
+#: exception types" means in the WS this sweep exists to serve: it is where
+#: the count of defined types was taken from, and where it must be re-taken.
+_OUT_OF_SCOPE: dict[str, str] = {
+    "EngravaError": ("abstract base; engrava raises a concrete subclass, never this type itself"),
+    "ActionNotFoundError": "no MCP tool touches the Action domain",
+    "ReadOnlyViolationError": (
+        "read-only mode is enforced by not registering write tools and by "
+        "engrava_mcp's own ReadOnlyStore, never by engrava's ReadOnlyEngrava -- "
+        "this type cannot be raised through this server"
+    ),
+    "EmbeddingProviderContractError": (
+        "raised only at embedding-provider construction, before the server "
+        "lifespan starts serving any tool call"
+    ),
+    "EmbeddingModelMismatchError": (
+        "raised only when a store opens against a mismatched embedding model, "
+        "during the lifespan's store resolution -- before any tool call runs"
+    ),
+    "VectorDimensionMismatchError": (
+        "raised only by search_similar against a caller-supplied query vector; "
+        "no tool on this surface accepts one"
+    ),
+    "EmbeddingQueryPrefixMismatchError": (
+        "a configured-provider-versus-corpus mismatch; no tool argument can construct it"
+    ),
+    "EmbeddingGenerationError": (
+        "only raised when require_embedding=True is configured; this server never sets it"
+    ),
+    "JournalIntegrityError": (
+        "raised only by from_config's on-open journal verification, before the "
+        "lifespan starts serving any tool call"
+    ),
+    "ExtensionMigrationError": "requires an installed extension; this server registers none",
+    "CoreMigrationError": (
+        "raised only during schema migration at store open, before any tool call runs"
+    ),
+    "SchemaVersionError": "raised only during store open, before any tool call runs",
+    "DerivedRecordError": "requires the derived-records extension seam; no tool calls it",
+    "SourceThoughtNotFoundError": (
+        "requires the derived-records backfill entry point; no tool calls it"
+    ),
+    "CycleProviderError": "requires a configured cycle provider; this server configures none",
+    "RecencyModeConflictError": (
+        "requires an explicit current_cycle together with recency_now; "
+        "current_cycle is never wire-exposed, so no call can construct the conflict"
+    ),
+    "ConnectionQuarantinedError": (
+        "requires a prior cancellation-induced rollback failure on this connection; "
+        "not one of the cases this WS closes -- tracked as follow-up"
+    ),
+    "WriteContentionError": (
+        "requires exhausting the dedup-window's bounded BEGIN IMMEDIATE retries "
+        "under contention; not one of the cases this WS closes -- tracked as follow-up"
+    ),
+    "WriteLockTimeoutError": (
+        "requires a task spawned and awaited from inside another task's own "
+        "suspend_auto_commit() window; no tool handler does this"
+    ),
+    "DedupLockReentryError": (
+        "requires a same-task re-entry into the dedup lock, which on this surface "
+        "would need an extension hook this server does not ship -- a boundary, not "
+        "a live defect (see engrava's docs/extension-hooks.md)"
+    ),
+}
+
+
+def _except_clause_type_names(func: object) -> set[str]:
+    """Every exception-type identifier a function's own ``except`` clauses name.
+
+    Reads the identifier text an ``except`` clause spells, not what it
+    resolves to -- resolution against the real class objects happens
+    separately, in :func:`_handled_public_exception_names`, so a same-named
+    but unrelated symbol cannot masquerade as "handled".
+
+    Args:
+        func: The function to inspect (its live source is read via
+            :func:`inspect.getsource`, so edits to it are picked up without
+            this test file changing).
+
+    Returns:
+        The set of identifiers named in ``except X`` / ``except (X, Y)`` /
+        ``except X as e`` clauses anywhere in the function body.
+
+    """
+    source = textwrap.dedent(inspect.getsource(func))  # type: ignore[arg-type]
+    tree = ast.parse(source)
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ExceptHandler) and node.type is not None:
+            candidates = node.type.elts if isinstance(node.type, ast.Tuple) else [node.type]
+            for candidate in candidates:
+                if isinstance(candidate, ast.Name):
+                    names.add(candidate.id)
+                elif isinstance(candidate, ast.Attribute):
+                    names.add(candidate.attr)
+    return names
+
+
+def _engrava_public_exception_types() -> dict[str, type[EngravaError]]:
+    """Every public exception type ``engrava.domain.exceptions`` defines.
+
+    Returns:
+        A mapping of class name to class object, for every class the module
+        itself defines (``__module__`` matches -- an imported re-export from
+        elsewhere would not count).
+
+    """
+    return {
+        name: obj
+        for name, obj in inspect.getmembers(engrava_exceptions, inspect.isclass)
+        if obj.__module__ == engrava_exceptions.__name__
+    }
+
+
+def _handled_public_exception_names(public_types: dict[str, type[EngravaError]]) -> set[str]:
+    """Names from ``public_types`` that ``_tool_errors`` actually maps.
+
+    A name is "handled" only when it is both named in one of
+    ``_tool_errors``'s own ``except`` clauses AND bound, in
+    :mod:`engrava_mcp.server`'s own module namespace, to the exact class
+    object ``public_types`` gives it -- not merely text-matched -- so an
+    unrelated same-named symbol cannot pass as coverage.
+
+    Args:
+        public_types: The mapping from :func:`_engrava_public_exception_types`.
+
+    Returns:
+        The subset of ``public_types`` keys ``_tool_errors`` maps.
+
+    """
+    named = _except_clause_type_names(server_module._tool_errors)
+    return {
+        name
+        for name in named
+        if name in public_types and getattr(server_module, name, None) is public_types[name]
+    }
+
+
+def _unaccounted_exception_types(
+    public_types: dict[str, object],
+    handled: set[str],
+    out_of_scope: dict[str, str],
+) -> list[str]:
+    """Public type names that are neither mapped nor excused.
+
+    The pure check both the real sweep and its own failability demonstration
+    call, so the demonstration exercises the actual logic rather than a copy
+    of it.
+
+    Args:
+        public_types: Name -> class for every type under sweep.
+        handled: Names a ``_tool_errors`` branch maps.
+        out_of_scope: Names excused, with a reason.
+
+    Returns:
+        Sorted names present in ``public_types`` but absent from both
+        ``handled`` and ``out_of_scope``.
+
+    """
+    return sorted(name for name in public_types if name not in handled and name not in out_of_scope)
+
+
+class TestExceptionSurfaceSweep:
+    """``_tool_errors`` must map or explicitly excuse every public engrava
+    exception type.
+
+    engrava's exception surface grows behind this server's back: a type added
+    upstream that this table does not recognise crosses the wire as
+    ``Error executing tool <name>: <internal message>`` unless and until
+    someone happens to probe it by hand -- exactly how the six cases this WS
+    closes were found. This test makes that discovery automatic instead of
+    incidental: every class ``engrava.domain.exceptions`` defines must either
+    be named in a ``_tool_errors`` except clause, or be listed in
+    ``_OUT_OF_SCOPE`` with a reason. Silence is not a valid third state.
+    """
+
+    def test_every_public_exception_is_mapped_or_excused(self) -> None:
+        public_types = _engrava_public_exception_types()
+        handled = _handled_public_exception_names(public_types)
+        unaccounted = _unaccounted_exception_types(public_types, handled, _OUT_OF_SCOPE)
+        assert not unaccounted, (
+            "engrava added exception type(s) this server neither maps nor "
+            f"excuses: {unaccounted}. Add a _tool_errors branch mapping it, or "
+            "add a reasoned entry to _OUT_OF_SCOPE."
+        )
+
+    def test_out_of_scope_entries_are_not_stale(self) -> None:
+        # An _OUT_OF_SCOPE entry must name a type engrava still defines, and
+        # one _tool_errors still does not map -- otherwise it is either a
+        # leftover for a type that no longer exists, or dead weight hiding a
+        # mapping that already exists.
+        public_types = _engrava_public_exception_types()
+        handled = _handled_public_exception_names(public_types)
+        stale = sorted(
+            name for name in _OUT_OF_SCOPE if name not in public_types or name in handled
+        )
+        assert not stale, f"stale _OUT_OF_SCOPE entries, no longer accurate: {stale}"
+
+    def test_out_of_scope_entries_carry_a_real_reason(self) -> None:
+        empty = [name for name, reason in _OUT_OF_SCOPE.items() if not reason.strip()]
+        assert not empty, f"_OUT_OF_SCOPE entries with no reason: {empty}"
+
+    def test_sweep_fails_on_a_deliberately_unmapped_type(self) -> None:
+        # Proves the sweep guards something, on synthetic input that exercises
+        # the same pure check the real sweep above calls: a type present in
+        # neither `handled` nor `out_of_scope` is flagged.
+        public_types = {"ThoughtNotFoundError": object(), "StaleDataError": object()}
+        handled = {"ThoughtNotFoundError"}
+        out_of_scope: dict[str, str] = {}
+
+        unaccounted = _unaccounted_exception_types(public_types, handled, out_of_scope)
+
+        assert unaccounted == ["StaleDataError"]
+
+    def test_sweep_passes_when_the_gap_is_closed_either_way(self) -> None:
+        # Foil to the previous test: mapping OR excusing the same gap clears
+        # it, confirming the check treats both routes as equally valid.
+        public_types = {"ThoughtNotFoundError": object(), "StaleDataError": object()}
+        handled = {"ThoughtNotFoundError", "StaleDataError"}
+        assert _unaccounted_exception_types(public_types, handled, {}) == []
+
+        handled_narrow = {"ThoughtNotFoundError"}
+        excused = {"StaleDataError": "covered by a reason, not a branch"}
+        assert _unaccounted_exception_types(public_types, handled_narrow, excused) == []
+
+    def test_every_currently_mapped_type_is_reachable_through_the_import(self) -> None:
+        # The identity check in _handled_public_exception_names depends on
+        # engrava_mcp.server importing each mapped type by its real name; this
+        # pins that precondition so a future refactor (e.g. importing under an
+        # alias) fails here with a clear reason rather than silently reopening
+        # every type it renamed as "unmapped".
+        public_types = _engrava_public_exception_types()
+        handled = _handled_public_exception_names(public_types)
+        assert "ThoughtNotFoundError" in handled
+        assert "DuplicateEdgeError" in handled
+        assert "StaleDataError" in handled

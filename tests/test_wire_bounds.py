@@ -36,6 +36,8 @@ from engrava_mcp.server import (
     MAX_PAGE_LIMIT,
     MAX_TOP_K,
     SERVER_NAME,
+    SQLITE_MAX_BOUND_INT,
+    SQLITE_MIN_BOUND_INT,
     OutOfRangeBoundError,
     StoreProvider,
     _tool_errors,
@@ -84,6 +86,23 @@ OUT_OF_RANGE_LIMITS = [-1, 0, MAX_PAGE_LIMIT + 1, 10**18]
 
 #: The same, for the ranked-window bound.
 OUT_OF_RANGE_TOP_K = [-1, 0, MAX_TOP_K + 1, 10**18]
+
+#: Values that must be rejected for ``offset``: negatives (unchanged), and now
+#: also anything above SQLite's own signed-64-bit bind ceiling -- 2**63 is the
+#: exact value the deep scan probed, which used to reach sqlite3's bind call
+#: and raise a raw, unmapped ``OverflowError``.
+OUT_OF_RANGE_OFFSETS = [-1, SQLITE_MAX_BOUND_INT + 1, 2**63, 2**64]
+
+#: Values that must be rejected for ``min_cycle`` / ``max_cycle``: unlike
+#: ``offset`` these accept a negative value (see ``CycleFilterBound``'s
+#: docstring), so only values outside SQLite's own bind range are rejected,
+#: in either direction.
+OUT_OF_RANGE_CYCLE_BOUNDS = [
+    SQLITE_MAX_BOUND_INT + 1,
+    SQLITE_MIN_BOUND_INT - 1,
+    2**63,
+    -(2**63) - 1,
+]
 
 
 @asynccontextmanager
@@ -292,6 +311,60 @@ class TestImplLevelBounds:
         result = await list_memory_impl(store, offset=0)
         assert result["offset"] == 0
 
+    @pytest.mark.parametrize("offset", OUT_OF_RANGE_OFFSETS)
+    async def test_list_memory_offset_above_sqlite_bind_ceiling(
+        self, store: SqliteEngravaCore, offset: int
+    ) -> None:
+        # offset used to have no upper bound at all: 2**63 reached sqlite3's
+        # own bind call and raised a raw OverflowError there instead of a
+        # domain error here.
+        with pytest.raises(OutOfRangeBoundError):
+            await list_memory_impl(store, offset=offset)
+
+    async def test_list_memory_offset_at_the_sqlite_ceiling_is_valid(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # The ceiling itself is inside the domain (an inclusive bound).
+        result = await list_memory_impl(store, offset=SQLITE_MAX_BOUND_INT)
+        assert result["offset"] == SQLITE_MAX_BOUND_INT
+
+    @pytest.mark.parametrize("cycle_bound", OUT_OF_RANGE_CYCLE_BOUNDS)
+    async def test_list_memory_min_cycle_outside_sqlite_bind_range(
+        self, store: SqliteEngravaCore, cycle_bound: int
+    ) -> None:
+        # min_cycle / max_cycle had no bound at all before this fix -- neither
+        # a floor nor a ceiling -- so either extreme reached sqlite3's bind
+        # call unguarded.
+        with pytest.raises(OutOfRangeBoundError):
+            await list_memory_impl(store, min_cycle=cycle_bound)
+
+    @pytest.mark.parametrize("cycle_bound", OUT_OF_RANGE_CYCLE_BOUNDS)
+    async def test_list_memory_max_cycle_outside_sqlite_bind_range(
+        self, store: SqliteEngravaCore, cycle_bound: int
+    ) -> None:
+        with pytest.raises(OutOfRangeBoundError):
+            await list_memory_impl(store, max_cycle=cycle_bound)
+
+    async def test_list_memory_negative_min_cycle_is_valid_and_excludes_nothing(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # Unlike offset, a negative min_cycle is in-domain rather than
+        # rejected: as a lower bound it is trivially satisfied by any
+        # updated_cycle (always >= 0), so it behaves the same as omitting the
+        # filter entirely -- both seeded thoughts still come back.
+        with_bound = await list_memory_impl(store, min_cycle=-5)
+        without_bound = await list_memory_impl(store)
+        assert with_bound["count"] == without_bound["count"] == 2
+
+    async def test_list_memory_negative_max_cycle_is_valid_and_excludes_everything(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # A negative max_cycle is also in-domain, but as an upper bound it is
+        # never satisfied (updated_cycle is always >= 0) -- a legitimate,
+        # non-error way to get an empty page, not a bound violation.
+        result = await list_memory_impl(store, max_cycle=-1)
+        assert result["count"] == 0
+
     @pytest.mark.parametrize("limit", OUT_OF_RANGE_LIMITS)
     async def test_list_edges_limit(self, store: SqliteEngravaCore, limit: int) -> None:
         with pytest.raises(OutOfRangeBoundError):
@@ -349,6 +422,10 @@ class TestBoundErrorsAreCleanAtTheBoundary:
             ("query_memory", {"query": FIND_ALL, "limit": -1}),
             ("list_memory", {"limit": 10**18}),
             ("search_keywords", {"query": "coffee", "top_k": MAX_TOP_K + 1}),
+            ("list_memory", {"offset": SQLITE_MAX_BOUND_INT + 1}),
+            ("list_memory", {"offset": 2**63}),
+            ("list_memory", {"min_cycle": SQLITE_MAX_BOUND_INT + 1}),
+            ("list_memory", {"max_cycle": SQLITE_MIN_BOUND_INT - 1}),
         ],
     )
     async def test_out_of_range_bound_is_rejected_over_the_wire(
@@ -465,6 +542,7 @@ class TestBoundsAdvertisedInToolSchema:
         assert list_memory_schema["limit"]["minimum"] == 1
         assert list_memory_schema["limit"]["maximum"] == MAX_PAGE_LIMIT
         assert list_memory_schema["offset"]["minimum"] == 0
+        assert list_memory_schema["offset"]["maximum"] == SQLITE_MAX_BOUND_INT
 
         keywords_schema = tools["search_keywords"].inputSchema["properties"]
         assert keywords_schema["top_k"]["minimum"] == 1
@@ -495,6 +573,25 @@ class TestBoundsAdvertisedInToolSchema:
         assert bounded, f"no bounded branch in the advertised schema: {limit_schema!r}"
         assert bounded[0]["minimum"] == 1
         assert bounded[0]["maximum"] == MAX_PAGE_LIMIT
+
+    async def test_schema_publishes_bounds_on_the_nullable_cycle_filters(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # min_cycle / max_cycle are optional, like query_memory's limit, so
+        # their bounds may sit inside a nullable union rather than on the
+        # property itself. Assert both ends of SQLite's own bind range are
+        # advertised for each.
+        async with _client_for(store) as client:
+            tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+
+        properties = tools["list_memory"].inputSchema["properties"]
+        for name in ("min_cycle", "max_cycle"):
+            field_schema = properties[name]
+            branches = field_schema.get("anyOf", [field_schema])
+            bounded = [branch for branch in branches if "maximum" in branch]
+            assert bounded, f"no bounded branch advertised for {name}: {field_schema!r}"
+            assert bounded[0]["minimum"] == SQLITE_MIN_BOUND_INT
+            assert bounded[0]["maximum"] == SQLITE_MAX_BOUND_INT
 
     async def test_prompt_argument_is_advertised(self, store: SqliteEngravaCore) -> None:
         # The prompt's limit crosses the wire, so a client can supply it and it

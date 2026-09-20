@@ -113,6 +113,7 @@ mutation logic unit-testable without a running server.
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import os
 import re
@@ -188,6 +189,38 @@ JsonScalar = str | int | float | bool | None
 
 #: Server name advertised to MCP clients.
 SERVER_NAME = "engrava"
+
+#: Distribution whose installed version is advertised to MCP clients as this
+#: server's own ``serverInfo.version`` — never the ``mcp`` SDK's.  Keep in
+#: sync with ``project.name`` in ``pyproject.toml``.
+_DISTRIBUTION_NAME = "engrava-mcp"
+
+#: Advertised when the installed distribution carries no version metadata to
+#: read (a normal PEP 660 editable install does; a vendored or otherwise
+#: unusual checkout might not).  Chosen over crashing at startup, and over
+#: silently falling back to the ``mcp`` SDK's own version — the defect
+#: :func:`_server_version` exists to fix.
+_UNKNOWN_VERSION = "unknown"
+
+
+def _server_version() -> str:
+    """Resolve the version to advertise to MCP clients as this server's own.
+
+    Reads the installed :data:`_DISTRIBUTION_NAME` distribution's version via
+    :func:`importlib.metadata.version` — the same number already set by hand
+    in ``pyproject.toml`` and in both ``server.json`` fields at release time —
+    rather than a fourth hand-maintained literal that could drift from those.
+
+    Returns:
+        The installed ``engrava-mcp`` version, or :data:`_UNKNOWN_VERSION` if
+        no distribution metadata can be found.
+
+    """
+    try:
+        return importlib.metadata.version(_DISTRIBUTION_NAME)
+    except importlib.metadata.PackageNotFoundError:
+        return _UNKNOWN_VERSION
+
 
 #: Default number of results returned by search tools.
 DEFAULT_TOP_K = 10
@@ -364,7 +397,6 @@ _READ_ONLY = ToolAnnotations(read_only_hint=True)
 #: observable effects even though the visible fields converge on the same
 #: values) — none of these is safe for a client to blindly retry.
 _WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False)
-
 
 #: Annotation for a destructive but idempotent write (deleting a thought or
 #: edge).  It is marked idempotent because deleting an already-absent
@@ -2033,6 +2065,7 @@ def build_server() -> MCPServer:
 
     server: MCPServer = MCPServer(
         SERVER_NAME,
+        version=_server_version(),
         instructions=(
             "Access to an engrava agent-memory store: fetch thoughts, run "
             "hybrid and keyword search, list thoughts with structured filters "

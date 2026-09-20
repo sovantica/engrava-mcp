@@ -499,7 +499,11 @@ class TestListMemory:
 
 
 class TestQueryMemoryLimit:
-    """Tests that ``query_memory`` paginates by ``limit`` (MindQL has no OFFSET)."""
+    """Tests that ``query_memory`` paginates by ``limit``.
+
+    The MindQL grammar itself has an ``OFFSET`` clause; this tool simply
+    exposes no separate ``offset`` argument for it.
+    """
 
     async def test_limit_argument_caps_rows(self, store: SqliteEngravaCore) -> None:
         # Both seeded thoughts are ACTIVE; an explicit limit caps the rows.

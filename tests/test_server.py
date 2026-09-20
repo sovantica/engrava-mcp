@@ -115,11 +115,12 @@ class TestServerEndToEnd:
 
         # Idempotency hints must match the real store semantics a client
         # would rely on for safe retries:
-        #   - update_thought converges on the same end state  -> idempotent
+        #   - update_thought refreshes updated_at (and appends a journal
+        #     entry on a journal-enabled store) on every call -> NOT idempotent
         #   - store_thought creates a fresh node each call    -> NOT idempotent
         #   - link_thoughts rejects a duplicate (from,to,type) -> NOT idempotent
         #   - delete_* of an absent id is a no-op, same end state -> idempotent
-        assert idempotent_by_name["update_thought"] is True
+        assert idempotent_by_name["update_thought"] is False
         assert idempotent_by_name["store_thought"] is False
         assert idempotent_by_name["link_thoughts"] is False
         assert idempotent_by_name["delete_thought"] is True

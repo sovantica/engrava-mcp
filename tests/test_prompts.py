@@ -47,9 +47,9 @@ EXPECTED_PROMPT_NAMES = frozenset({"summarize_recent_memory", "find_related", "r
 async def _seed_two_thoughts(path: Path) -> None:
     """Create a database file with two thoughts updated in a known order.
 
-    The second thought carries the larger ``updated_cycle`` so it is the
-    most recent, which lets the ``summarize_recent_memory`` prompt embed a
-    deterministic newest-first snapshot.
+    The second thought carries the larger ``updated_cycle``, which lets the
+    ``summarize_recent_memory`` prompt embed a deterministic snapshot
+    ordered by highest cognitive cycle first.
 
     Args:
         path: Filesystem path for the new database.
@@ -204,7 +204,7 @@ class TestPromptRendering:
 
         text = _single_text(result)
         # With no limit supplied the prompt falls back to the default.
-        assert f"{DEFAULT_SUMMARY_LIMIT} most recently stored" in text
+        assert f"{DEFAULT_SUMMARY_LIMIT} highest-cognitive-cycle" in text
         assert "engrava://recent" in text
         # The embedded snapshot is read-only data drawn from the store.
         assert "newer-thought" in text
@@ -226,7 +226,7 @@ class TestPromptRendering:
             result = await client.get_prompt("summarize_recent_memory", {"limit": "2"})
 
         text = _single_text(result)
-        assert "2 most recently stored" in text
+        assert "2 highest-cognitive-cycle" in text
         # limit=2 covers both seeded thoughts, so both appear in the snapshot.
         assert "newer-thought" in text
         assert "older-thought" in text
@@ -283,13 +283,13 @@ class TestPromptTextBuilders:
 
     def test_summarize_recent_handles_empty_store(self) -> None:
         text = _summarize_recent_prompt(7, {"thoughts": [], "limit": 7})
-        assert "7 most recently stored" in text
+        assert "7 highest-cognitive-cycle" in text
         assert "no thoughts to summarise" in text
 
     def test_summarize_recent_embeds_thoughts(self) -> None:
         recent = {"thoughts": [{"thought_id": "abc", "essence": "Note"}], "limit": 1}
         text = _summarize_recent_prompt(1, recent)
-        assert "1 most recent thoughts" in text
+        assert "1 thoughts (ordered by highest cognitive cycle first" in text
         assert "abc" in text
 
     def test_find_related_builder_includes_topic_and_tool(self) -> None:

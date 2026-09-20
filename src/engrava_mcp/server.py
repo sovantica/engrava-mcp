@@ -19,18 +19,23 @@ Eight read-only tools are exposed:
 ``search_keywords``
     Pure full-text BM25 keyword search.
 ``list_memory``
-    Deterministic, unranked browse over stored thoughts with the full
+    Unranked browse over stored thoughts with the full
     filter matrix (``thought_type``, ``lifecycle_status``, ``priority``,
     updated-cycle range) and ``limit`` / ``offset`` pagination.  Returns
-    thoughts newest-first with no score — the clean home for "list memory
-    by structured field", complementing the ranked ``search_memory``.
+    thoughts ordered by highest cognitive cycle first with no score — the
+    clean home for "list memory by structured field", complementing the
+    ranked ``search_memory``.  Thoughts written through this server all
+    carry cycle 0, so their relative order is unspecified
+    (:data:`_CYCLE_ORDERING_NOTE`).
 ``query_memory``
     Structured ``FIND`` queries in the MindQL query language.  Only the
     ``FIND`` command is accepted; raw-SQL passthrough and every other
-    command are rejected.  Accepts an optional ``limit`` (the MindQL
-    grammar has no ``OFFSET``, so this tool paginates by ``limit`` only),
-    which always overrides any ``LIMIT`` the query text carries; a query
-    with no ``LIMIT`` at all is capped rather than run unbounded.
+    command are rejected.  The grammar itself has an ``OFFSET`` clause, but
+    this tool exposes no separate ``offset`` argument, so it paginates by
+    ``limit`` only (a caller wanting an offset writes it directly in the
+    query text).  An optional ``limit`` always overrides any ``LIMIT`` the
+    query text carries; a query with no ``LIMIT`` at all is capped rather
+    than run unbounded.
 ``memory_stats``
     Aggregate counts and store-health metrics.
 ``get_edges``
@@ -74,7 +79,8 @@ surface as attachable context:
     Store-health counts and size, identical to the ``memory_stats`` tool
     (both share :func:`memory_stats_impl`).
 ``engrava://recent``
-    The most-recently-updated thoughts as a JSON document.
+    The stored thoughts, ordered by highest cognitive cycle first
+    (:data:`_CYCLE_ORDERING_NOTE`), as a JSON document.
 
 Resources are reads by definition, so — unlike the write tools — they are
 *not* gated by :data:`READ_ONLY_ENV_VAR`; they are advertised in both the
@@ -87,8 +93,9 @@ the read tools and resources above.  They are templates only — they open no
 write path and call no store method:
 
 ``summarize_recent_memory``
-    Summarise the most recently stored thoughts.  Takes an optional
-    ``limit`` (how many recent thoughts to consider).
+    Summarise the thoughts with the highest cognitive cycle
+    (:data:`_CYCLE_ORDERING_NOTE`).  Takes an optional ``limit`` (how many
+    to consider).
 ``find_related``
     Find and synthesise thoughts related to a required ``topic``.
 ``reflect_on_topic``
@@ -186,6 +193,26 @@ DEFAULT_TOP_K = 10
 #: Default number of thoughts returned by the ``engrava://recent`` resource.
 DEFAULT_RECENT_LIMIT = 10
 
+#: The ordering clause shared by every description of cycle-ordered output
+#: (the ``list_memory`` tool, the ``engrava://recent`` resource, and the
+#: ``summarize_recent_memory`` prompt).  Cognitive cycles are a signal the
+#: consuming application supplies (see engrava's
+#: :meth:`~engrava.SqliteEngravaCore.list_thoughts`); an MCP client has none,
+#: so every thought this server writes stamps ``created_cycle =
+#: updated_cycle = 0`` and no update advances it.  Ordering by descending
+#: ``updated_cycle`` is real, but the underlying query has no tiebreaker, so
+#: SQLite guarantees nothing at all about how the tied rows come back
+#: relative to each other — a fixed rule is exactly the kind of guarantee
+#: this constant must not assert, no matter how it is phrased.  Say only
+#: what is true: the order among ties is unspecified and carries no
+#: recency meaning.  Stated once so the tool description and the resource
+#: description cannot drift apart.
+_CYCLE_ORDERING_NOTE = (
+    "ordered by highest cognitive cycle first; thoughts written through "
+    "this server all carry cycle 0, so their relative order is "
+    "unspecified and does not represent recency"
+)
+
 #: Default page size for the ``list_memory`` browse tool.  Matches the
 #: store's own ``list_thoughts`` default so an unpaged listing behaves the
 #: same whether driven through MCP or the core API directly.
@@ -231,9 +258,9 @@ PageOffset = Annotated[int, Field(ge=0)]
 #: it is rejected at the boundary before any path is constructed.
 METADATA_FIELD_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 
-#: Default number of recent thoughts the ``summarize_recent_memory`` prompt
-#: asks the assistant to consider when the caller omits ``limit``.  Kept
-#: small so the summary stays focused on the latest activity.
+#: Default number of thoughts the ``summarize_recent_memory`` prompt asks
+#: the assistant to consider when the caller omits ``limit``.  Kept small
+#: so the summary stays focused rather than embedding the whole store.
 DEFAULT_SUMMARY_LIMIT = 5
 
 #: MIME type advertised for every ``engrava://`` resource.  Resource
@@ -278,16 +305,15 @@ READ_ONLY_TRUTHY_VALUES = frozenset({"1", "true", "yes"})
 
 _READ_ONLY = ToolAnnotations(readOnlyHint=True)
 
-#: Annotation for a non-idempotent, non-destructive write.  Covers both
-#: creating a new thought node (repeating the call creates another node)
-#: and creating a typed edge (an edge is unique per source/target/type, so
-#: repeating an identical link is rejected rather than converging) — neither
-#: is safe for a client to blindly retry.
+#: Annotation for a non-idempotent, non-destructive write.  Covers creating
+#: a new thought node (repeating the call creates another node), creating a
+#: typed edge (an edge is unique per source/target/type, so repeating an
+#: identical link is rejected rather than converging), and updating a
+#: thought (every call refreshes ``updated_at`` and, on a journal-enabled
+#: store, appends a journal entry, so a retried identical call has
+#: observable effects even though the visible fields converge on the same
+#: values) — none of these is safe for a client to blindly retry.
 _WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False)
-
-#: Annotation for an idempotent, non-destructive write (updating a thought —
-#: repeating with the same arguments converges on the same end state).
-_WRITE_IDEMPOTENT = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True)
 
 #: Annotation for a destructive but idempotent write (deleting a thought or
 #: edge).  It is marked idempotent because deleting an already-absent
@@ -1065,19 +1091,25 @@ async def recent_thoughts_impl(
     *,
     limit: int = DEFAULT_RECENT_LIMIT,
 ) -> dict[str, Any]:
-    """Return the most-recently-updated thoughts.
+    """Return the thoughts with the highest cognitive cycle.
 
     Wraps the public :meth:`~engrava.SqliteEngravaCore.list_thoughts`,
-    which orders by descending ``updated_cycle`` — so the first entry is
-    the thought touched most recently.
+    which orders by descending ``updated_cycle``.  Cognitive cycles are a
+    signal the consuming application supplies; every thought this server
+    writes stamps ``created_cycle = updated_cycle = 0`` and no update
+    advances it, so for thoughts written through this server the first
+    entry is not "the one touched most recently" — the query carries no
+    tiebreaker, so SQLite guarantees nothing about which tied row comes
+    first, and this call's result order among them is unspecified.
 
     Args:
         store: The store to query.
-        limit: Maximum number of thoughts to return, newest first.
+        limit: Maximum number of thoughts to return, highest cognitive
+            cycle first (:data:`_CYCLE_ORDERING_NOTE`).
 
     Returns:
         A dict with a ``thoughts`` list of JSON-serialisable thoughts
-        (newest first) and the ``limit`` that was applied.
+        (highest cognitive cycle first) and the ``limit`` that was applied.
 
     Raises:
         OutOfRangeBoundError: If ``limit`` is outside its accepted range.
@@ -1103,12 +1135,13 @@ async def list_memory_impl(
     limit: int = DEFAULT_LIST_LIMIT,
     offset: int = 0,
 ) -> dict[str, Any]:
-    """List thoughts deterministically with filters and pagination.
+    """List thoughts with filters and pagination.
 
     A direct pass-through to the public
     :meth:`~engrava.SqliteEngravaCore.list_thoughts`, which orders by
-    descending ``updated_cycle`` (newest first) and applies every filter
-    server-side.  Unlike :func:`search_memory_impl` this is a plain
+    descending ``updated_cycle`` (highest cognitive cycle first;
+    :data:`_CYCLE_ORDERING_NOTE`) and applies every filter server-side.
+    Unlike :func:`search_memory_impl` this is a plain
     browse: there is no relevance ranking and therefore no score.  It is
     the right tool when a caller wants an exhaustive, paginated slice of
     memory narrowed by structured fields rather than the best matches for
@@ -1128,9 +1161,9 @@ async def list_memory_impl(
 
     Returns:
         A dict with a ``thoughts`` list of JSON-serialisable thoughts
-        (newest first), the ``count`` of thoughts on this page, and the
-        ``limit`` / ``offset`` that were applied so the caller can drive
-        pagination.
+        (highest cognitive cycle first), the ``count`` of thoughts on this
+        page, and the ``limit`` / ``offset`` that were applied so the
+        caller can drive pagination.
 
     Raises:
         OutOfRangeBoundError: If ``limit`` or ``offset`` is outside its
@@ -1264,7 +1297,7 @@ async def list_edges_impl(
     metadata_in: dict[str, list[JsonScalar]] | None = None,
     limit: int = DEFAULT_EDGE_LIST_LIMIT,
 ) -> dict[str, Any]:
-    """List edges deterministically with optional filters.
+    """List edges with optional filters.
 
     A pass-through to the public
     :meth:`~engrava.SqliteEngravaCore.list_edges` that translates the
@@ -1272,7 +1305,12 @@ async def list_edges_impl(
     engrava's typed :class:`~engrava.MetadataFilter` internally (see
     :func:`_metadata_filter`), so the typed predicate machinery and its
     JSONPath grammar never appear on the wire.  ``edge_type`` and
-    ``source`` are applied server-side by engrava.
+    ``source`` are applied server-side by engrava.  The underlying query
+    orders by descending ``created_cycle`` with no tiebreaker — the same
+    property :data:`_CYCLE_ORDERING_NOTE` documents for thoughts applies
+    here too: every edge created through :func:`link_thoughts_impl` stamps
+    ``created_cycle = 0``, so the relative order among this server's own
+    edges is unspecified.
 
     Args:
         store: The store to query.
@@ -1286,7 +1324,8 @@ async def list_edges_impl(
 
     Returns:
         A dict with an ``edges`` list of JSON-serialisable edge records
-        (each including its ``metadata``) and their ``count``.
+        (each including its ``metadata``, in unspecified relative order
+        among ties) and their ``count``.
 
     Raises:
         OutOfRangeBoundError: If ``limit`` is outside its accepted range.
@@ -1496,8 +1535,10 @@ async def link_thoughts_impl(
 async def delete_thought_impl(store: SqliteEngravaCore, thought_id: str) -> dict[str, Any]:
     """Delete a thought by identifier.
 
-    Deleting an identifier that is not present is a no-op rather than an
-    error: the call simply reports that nothing was removed.
+    This cascades: engrava deletes the thought's edges, embeddings, and
+    action records in the same operation.  Deleting an identifier that is
+    not present is a no-op rather than an error: the call simply reports
+    that nothing was removed.
 
     Args:
         store: The store to write to.
@@ -1566,35 +1607,38 @@ def _with_limit(parsed: MindQLQuery, limit: int) -> MindQLQuery:
 def _summarize_recent_prompt(limit: int, recent: dict[str, Any]) -> str:
     """Build the ``summarize_recent_memory`` prompt text.
 
-    The text embeds the recent thoughts already gathered from the store so
-    the assistant can summarise them directly, while still naming the read
-    tools and resources it can use to widen the picture.  Embedding is
-    read-only: ``recent`` is the output of :func:`recent_thoughts_impl`.
+    The text embeds the highest-cognitive-cycle thoughts already gathered
+    from the store so the assistant can summarise them directly, while
+    still naming the read tools and resources it can use to widen the
+    picture.  Embedding is read-only: ``recent`` is the output of
+    :func:`recent_thoughts_impl`.
 
     Args:
-        limit: Number of recent thoughts the summary should cover.
+        limit: Number of thoughts the summary should cover, highest
+            cognitive cycle first.
         recent: The payload returned by :func:`recent_thoughts_impl`,
-            carrying a ``thoughts`` list newest-first.
+            carrying a ``thoughts`` list ordered the same way
+            (:data:`_CYCLE_ORDERING_NOTE`).
 
     Returns:
         A ready-to-send instruction asking for a concise summary of the
-        most recent stored memory.
+        highest-cognitive-cycle stored memory.
 
     """
     thoughts = recent.get("thoughts", [])
     if thoughts:
         snapshot = json.dumps(thoughts, indent=2)
         data_section = (
-            f"Here are the {len(thoughts)} most recent thoughts "
-            f"(newest first), as JSON:\n\n{snapshot}\n\n"
+            f"Here are the {len(thoughts)} thoughts ({_CYCLE_ORDERING_NOTE}), "
+            f"as JSON:\n\n{snapshot}\n\n"
         )
     else:
         data_section = "The store currently holds no thoughts to summarise.\n\n"
     return (
-        f"Summarise the {limit} most recently stored memories in this "
+        f"Summarise the {limit} highest-cognitive-cycle memories in this "
         "engrava store.\n\n"
         f"{data_section}"
-        "If you need more detail or want to confirm the latest activity, "
+        "If you need more detail, "
         "read the `engrava://recent` resource or call the `memory_stats` "
         "tool; use `get_thought` to expand any single thought by its "
         "identifier. Produce a concise summary that highlights the main "
@@ -1712,8 +1756,8 @@ def build_server() -> FastMCP:
             "thoughts, link thoughts with typed edges, and delete thoughts or "
             "edges. Read-only resources are also available as attachable "
             "context: a single thought (engrava://thought/{thought_id}), store "
-            "statistics (engrava://stats), and the most recent thoughts "
-            "(engrava://recent). Guided prompts scaffold common retrieval "
+            "statistics (engrava://stats), and the highest-cognitive-cycle "
+            "thoughts (engrava://recent). Guided prompts scaffold common retrieval "
             "workflows: summarize_recent_memory, find_related, and "
             "reflect_on_topic."
         ),
@@ -1739,7 +1783,8 @@ def register_resources(server: FastMCP, provider: StoreProvider) -> None:
         Store-health counts and size.  Shares :func:`memory_stats_impl`
         with the ``memory_stats`` tool, so the two agree by construction.
     ``engrava://recent``
-        The most-recently-updated thoughts as a JSON document.
+        The stored thoughts, ordered by highest cognitive cycle first
+        (:data:`_CYCLE_ORDERING_NOTE`), as a JSON document.
 
     Each handler returns a JSON string with the ``application/json`` MIME
     type, so clients receive a stable, machine-parseable payload.
@@ -1776,7 +1821,10 @@ def register_resources(server: FastMCP, provider: StoreProvider) -> None:
         "engrava://recent",
         name="recent",
         title="Recent thoughts",
-        description="The most-recently-updated thoughts, newest first, as a JSON document.",
+        description=(
+            f"Returns the stored thoughts as a JSON document. The thoughts "
+            f"are {_CYCLE_ORDERING_NOTE}."
+        ),
         mime_type=RESOURCE_MIME_TYPE,
     )
     async def recent_resource() -> str:
@@ -1796,9 +1844,10 @@ def register_prompts(server: FastMCP, provider: StoreProvider) -> None:
     advertised in every deployment:
 
     ``summarize_recent_memory``
-        Summarise the most recent thoughts.  Takes an optional ``limit``;
-        this is the one prompt that reads the store, embedding the recent
-        thoughts (read-only) so the assistant can summarise them inline.
+        Summarise the highest-cognitive-cycle thoughts
+        (:data:`_CYCLE_ORDERING_NOTE`).  Takes an optional ``limit``; this
+        is the one prompt that reads the store, embedding those thoughts
+        (read-only) so the assistant can summarise them inline.
     ``find_related``
         Find and synthesise thoughts related to a required ``topic``.
     ``reflect_on_topic``
@@ -1816,8 +1865,7 @@ def register_prompts(server: FastMCP, provider: StoreProvider) -> None:
         name="summarize_recent_memory",
         title="Summarise recent memory",
         description=(
-            "Summarise the most recently stored thoughts. Optionally set "
-            "how many recent thoughts to consider."
+            f"Summarise the thoughts {_CYCLE_ORDERING_NOTE}. Optionally set how many to consider."
         ),
     )
     async def summarize_recent_memory(limit: PageLimit = DEFAULT_SUMMARY_LIMIT) -> str:
@@ -1924,13 +1972,14 @@ def register_tools(server: FastMCP, provider: StoreProvider, *, read_only: bool)
     @server.tool(
         name="list_memory",
         description=(
-            "List stored thoughts deterministically with optional filters and "
+            "List stored thoughts with optional filters and "
             "pagination. Unlike search_memory this does no relevance ranking "
-            "and returns no scores: it is a plain browse over memory, ordered "
-            "newest first. Filter by thought type, lifecycle status, priority, "
-            "and an updated-cycle range; page through results with limit and "
-            "offset. Use this to enumerate memory by structured fields; use "
-            "search_memory when you want the best matches for a query."
+            f"and returns no scores: it is a plain browse over memory, "
+            f"{_CYCLE_ORDERING_NOTE}. Filter by thought type, lifecycle status, "
+            "priority, and an updated-cycle range; page through results with "
+            "limit and offset. Use this to enumerate memory by structured "
+            "fields; use search_memory when you want the best matches for a "
+            "query."
         ),
         annotations=_READ_ONLY,
     )
@@ -2092,7 +2141,7 @@ def register_tools(server: FastMCP, provider: StoreProvider, *, read_only: bool)
             "fields you supply change; omit the rest. Can change essence, "
             "content, priority, lifecycle status, and confidence."
         ),
-        annotations=_WRITE_IDEMPOTENT,
+        annotations=_WRITE,
     )
     async def update_thought(
         thought_id: str,
@@ -2151,9 +2200,11 @@ def register_tools(server: FastMCP, provider: StoreProvider, *, read_only: bool)
         name="delete_thought",
         description=(
             "Delete a thought by its identifier. Use this to remove a memory "
-            "that is wrong or no longer wanted. Returns whether a thought was "
-            "removed; deleting an identifier that does not exist is not an "
-            "error and simply reports that nothing was removed."
+            "that is wrong or no longer wanted. This cascades: the thought's "
+            "edges, embeddings, and action records are deleted with it. "
+            "Returns whether a thought was removed; deleting an identifier "
+            "that does not exist is not an error and simply reports that "
+            "nothing was removed."
         ),
         annotations=_WRITE_DESTRUCTIVE,
     )

@@ -63,13 +63,16 @@ BUSY_TIMEOUT_MS = 5000
 
 #: Message logged at startup when no embedding provider is resolved, so the
 #: operator understands that semantic (vector) search is inert and how to
-#: enable it.  Lexical FTS, the graph, MindQL, and the audit trail are
-#: unaffected.
+#: enable it.  Lexical FTS, the graph, and MindQL are unaffected.  The audit
+#: trail is a separate knob (``journal: enabled: true`` in an
+#: ``engrava.yaml``) this message deliberately does not claim either way:
+#: it fires on the bare :data:`DB_PATH_ENV_VAR` route too, and that route
+#: never has a journal at all.
 _NO_PROVIDER_WARNING = (
     "No embedding provider configured: semantic (vector) search is inert; "
     "queries fall back to lexical full-text search. Full-text search, the "
-    "graph, MindQL, and the audit trail are unaffected. To enable semantic "
-    "search, declare an embedding provider in an engrava.yaml and point "
+    "graph, and MindQL are unaffected. To enable semantic search, declare "
+    "an embedding provider in an engrava.yaml and point "
     f"{CONFIG_ENV_VAR} at it."
 )
 

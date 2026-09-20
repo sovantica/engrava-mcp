@@ -26,10 +26,9 @@ from typing import TYPE_CHECKING
 
 import pytest
 from engrava import EdgeType
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
-from mcp.shared.exceptions import McpError
-from mcp.shared.memory import create_connected_server_and_client_session as connect_client
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.shared.exceptions import MCPError
 
 import engrava_mcp.server as server_module
 from engrava_mcp.server import (
@@ -52,12 +51,13 @@ from engrava_mcp.server import (
     search_memory_impl,
     store_thought_impl,
 )
+from tests.inprocess_client import connect_client
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
     from engrava import SqliteEngravaCore
-    from mcp import ClientSession
+    from mcp import Client
 
 #: A FIND query matching every thought the ``bulk_store`` fixture seeds.
 FIND_ALL = "FIND thoughts WHERE lifecycle_status = 'CREATED'"
@@ -106,7 +106,7 @@ OUT_OF_RANGE_CYCLE_BOUNDS = [
 
 
 @asynccontextmanager
-async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[ClientSession]:
+async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[Client]:
     """Open a connected client whose tools and prompts query the given store.
 
     Args:
@@ -117,7 +117,7 @@ async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[ClientSession]:
         boundary, so pydantic's schema validation and ``_tool_errors`` both run.
 
     """
-    server: FastMCP = FastMCP(SERVER_NAME)
+    server: MCPServer = MCPServer(SERVER_NAME)
     provider = StoreProvider()
     provider.set(store, read_store=store)
     register_tools(server, provider, read_only=False)
@@ -439,15 +439,15 @@ class TestBoundErrorsAreCleanAtTheBoundary:
         # than an unbounded result.
         async with _client_for(store) as client:
             result = await client.call_tool(tool, arguments)
-        assert result.isError is True
+        assert result.is_error is True
 
     async def test_valid_bounds_still_succeed_over_the_wire(self, store: SqliteEngravaCore) -> None:
         # The guard is presentation-only for in-domain values.
         async with _client_for(store) as client:
             result = await client.call_tool("list_memory", {"limit": 2, "offset": 0})
-        assert result.isError is False
-        assert result.structuredContent is not None
-        assert result.structuredContent["limit"] == 2
+        assert result.is_error is False
+        assert result.structured_content is not None
+        assert result.structured_content["limit"] == 2
 
     async def test_negative_prompt_limit_is_rejected_before_the_body_runs(
         self,
@@ -458,7 +458,7 @@ class TestBoundErrorsAreCleanAtTheBoundary:
         # by the advertised annotation, and by the domain guard inside the body
         # for the paths where the protocol layer does not apply. The claim here
         # is the first of those — and the error alone cannot carry it, because
-        # the in-body guard also surfaces as an McpError mentioning "limit".
+        # the in-body guard also surfaces as an MCPError mentioning "limit".
         #
         # What tells them apart is whether the body ran at all. The store call
         # the body makes is recorded, so with the bound dropped from the
@@ -475,7 +475,7 @@ class TestBoundErrorsAreCleanAtTheBoundary:
         monkeypatch.setattr(server_module, "recent_thoughts_impl", _recording_recent_thoughts)
 
         async with _client_for(store) as client:
-            with pytest.raises(McpError) as excinfo:
+            with pytest.raises(MCPError) as excinfo:
                 await client.get_prompt("summarize_recent_memory", {"limit": "-1"})
             # Control: an in-range limit does reach the body through the same
             # recorder, so the emptiness asserted below is the rejection and not
@@ -496,7 +496,7 @@ class TestBoundErrorsAreCleanAtTheBoundary:
         # handler's unwrapped function bypasses pydantic's argument validation,
         # exactly as a caller reaching the body without that layer would.
         # Unguarded, this surfaces a raw OutOfRangeBoundError to the client.
-        server: FastMCP = FastMCP(SERVER_NAME)
+        server: MCPServer = MCPServer(SERVER_NAME)
         provider = StoreProvider()
         provider.set(store, read_store=store)
         register_prompts(server, provider)
@@ -518,7 +518,7 @@ class TestBoundErrorsAreCleanAtTheBoundary:
         self, store: SqliteEngravaCore
     ) -> None:
         # The guard is presentation-only on the happy path.
-        server: FastMCP = FastMCP(SERVER_NAME)
+        server: MCPServer = MCPServer(SERVER_NAME)
         provider = StoreProvider()
         provider.set(store, read_store=store)
         register_prompts(server, provider)
@@ -538,23 +538,23 @@ class TestBoundsAdvertisedInToolSchema:
         async with _client_for(store) as client:
             tools = {tool.name: tool for tool in (await client.list_tools()).tools}
 
-        list_memory_schema = tools["list_memory"].inputSchema["properties"]
+        list_memory_schema = tools["list_memory"].input_schema["properties"]
         assert list_memory_schema["limit"]["minimum"] == 1
         assert list_memory_schema["limit"]["maximum"] == MAX_PAGE_LIMIT
         assert list_memory_schema["offset"]["minimum"] == 0
         assert list_memory_schema["offset"]["maximum"] == SQLITE_MAX_BOUND_INT
 
-        keywords_schema = tools["search_keywords"].inputSchema["properties"]
+        keywords_schema = tools["search_keywords"].input_schema["properties"]
         assert keywords_schema["top_k"]["minimum"] == 1
         assert keywords_schema["top_k"]["maximum"] == MAX_TOP_K
 
         # search_memory carries the same ranked-window bound as search_keywords.
-        memory_schema = tools["search_memory"].inputSchema["properties"]
+        memory_schema = tools["search_memory"].input_schema["properties"]
         assert memory_schema["top_k"]["minimum"] == 1
         assert memory_schema["top_k"]["maximum"] == MAX_TOP_K
 
         # Both ends of the edge-listing page size, not just the ceiling.
-        edges_schema = tools["list_edges"].inputSchema["properties"]
+        edges_schema = tools["list_edges"].input_schema["properties"]
         assert edges_schema["limit"]["minimum"] == 1
         assert edges_schema["limit"]["maximum"] == MAX_PAGE_LIMIT
 
@@ -567,7 +567,7 @@ class TestBoundsAdvertisedInToolSchema:
         async with _client_for(store) as client:
             tools = {tool.name: tool for tool in (await client.list_tools()).tools}
 
-        limit_schema = tools["query_memory"].inputSchema["properties"]["limit"]
+        limit_schema = tools["query_memory"].input_schema["properties"]["limit"]
         branches = limit_schema.get("anyOf", [limit_schema])
         bounded = [branch for branch in branches if "maximum" in branch]
         assert bounded, f"no bounded branch in the advertised schema: {limit_schema!r}"
@@ -584,7 +584,7 @@ class TestBoundsAdvertisedInToolSchema:
         async with _client_for(store) as client:
             tools = {tool.name: tool for tool in (await client.list_tools()).tools}
 
-        properties = tools["list_memory"].inputSchema["properties"]
+        properties = tools["list_memory"].input_schema["properties"]
         for name in ("min_cycle", "max_cycle"):
             field_schema = properties[name]
             branches = field_schema.get("anyOf", [field_schema])

@@ -222,7 +222,7 @@ class TestLinkThoughts:
     ) -> None:
         # An edge is unique per (from, to, type). Linking the same pair with
         # the same type twice must be rejected rather than silently ignored or
-        # converged — this is why link_thoughts is annotated idempotentHint=False.
+        # converged — this is why link_thoughts is annotated idempotent_hint=False.
         await link_thoughts_impl(
             store,
             "thought-alpha",

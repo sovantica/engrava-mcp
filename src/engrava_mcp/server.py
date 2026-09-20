@@ -1,4 +1,4 @@
-"""FastMCP server exposing engrava's read API as agent tools.
+"""MCPServer server exposing engrava's read API as agent tools.
 
 This module builds a Model Context Protocol server that wraps the public
 async read API of :class:`~engrava.SqliteEngravaCore`.  It is an *API
@@ -157,9 +157,10 @@ from engrava.domain.exceptions import (
     InvalidRecencyArgumentError,
     ReferentialIntegrityError,
 )
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.shared.exceptions import MCPError
+from mcp.types import INVALID_PARAMS, ToolAnnotations
 from pydantic import Field, ValidationError
 
 from engrava_mcp._compat import warn_if_engrava_out_of_range
@@ -352,7 +353,7 @@ READ_ONLY_ENV_VAR = "ENGRAVA_MCP_READ_ONLY"
 #: or empty — leaves the full read and write surface enabled.
 READ_ONLY_TRUTHY_VALUES = frozenset({"1", "true", "yes"})
 
-_READ_ONLY = ToolAnnotations(readOnlyHint=True)
+_READ_ONLY = ToolAnnotations(read_only_hint=True)
 
 #: Annotation for a non-idempotent, non-destructive write.  Covers creating
 #: a new thought node (repeating the call creates another node), creating a
@@ -362,14 +363,17 @@ _READ_ONLY = ToolAnnotations(readOnlyHint=True)
 #: store, appends a journal entry, so a retried identical call has
 #: observable effects even though the visible fields converge on the same
 #: values) — none of these is safe for a client to blindly retry.
-_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False)
+_WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False)
+
 
 #: Annotation for a destructive but idempotent write (deleting a thought or
 #: edge).  It is marked idempotent because deleting an already-absent
 #: identifier is a no-op that returns ``deleted=False`` and leaves the same
 #: end state — the record is gone either way — so a client may safely retry a
 #: delete that appeared to fail.
-_WRITE_DESTRUCTIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True)
+_WRITE_DESTRUCTIVE = ToolAnnotations(
+    read_only_hint=False, destructive_hint=True, idempotent_hint=True
+)
 
 
 class StoreNotReadyError(RuntimeError):
@@ -410,7 +414,7 @@ class EmbeddingQueryNotSupportedError(ValueError):
     JSON — bytes have no JSON representation, so a successful, in-range query
     against this table cannot be returned at all; without this guard it fails
     only after ``query_memory_impl`` has already returned, deep inside
-    FastMCP's own response serialisation, as a raw, unmapped ``TypeError``
+    MCPServer's own response serialisation, as a raw, unmapped ``TypeError``
     that :func:`_tool_errors` never sees (its ``try``/``except`` has already
     exited by the time serialisation runs). Refusing the table outright, at
     the query boundary, converts that unreachable-message crash into an
@@ -520,6 +524,63 @@ def _check_bound(name: str, value: int, *, minimum: int, maximum: int | None = N
         raise OutOfRangeBoundError(name, value, minimum, maximum)
 
 
+class _PromptBoundError(MCPError, ToolError):
+    """A wire-supplied prompt argument bound violation, reported cleanly either way.
+
+    Tools reach an out-of-range bound through :func:`_check_bound` and
+    :func:`_tool_errors`, which turns it into a curated :class:`ToolError` — the
+    channel ``MCPServer.call_tool`` reports to the client without mangling.
+    Prompts have no equivalent: ``Prompt.render`` (the ``mcp`` 2.x prompt-rendering
+    step) re-raises only :class:`~mcp.shared.exceptions.MCPError` unchanged, and
+    wraps *any* other exception it sees — including a plain
+    :class:`OutOfRangeBoundError`, and including :class:`ToolError` itself — into
+    a generic ``ValueError`` that reaches the client only as an opaque "Internal
+    server error". A prompt handler therefore has to raise :class:`MCPError`
+    directly to keep its message.
+
+    Subclassing both lets a single exception serve two call sites without
+    duplicating the bound-violation message: raised through the real MCP
+    connection, it is the :class:`MCPError` ``Prompt.render`` passes through
+    untouched; raised (or caught) by a test driving a prompt's unwrapped
+    function body directly — the path a caller reaching it without the
+    protocol layer would take — it is still the :class:`ToolError` that path
+    expects, exactly as :func:`_tool_errors` would raise for the same
+    violation inside a tool.
+
+    Args:
+        cause: The bound violation this wraps; its message is used verbatim.
+
+    """
+
+    def __init__(self, cause: OutOfRangeBoundError) -> None:
+        MCPError.__init__(self, code=INVALID_PARAMS, message=str(cause))
+
+
+def _check_prompt_bound(name: str, value: int, *, minimum: int, maximum: int | None = None) -> None:
+    """Validate a wire-supplied prompt argument bound, raising a clean protocol error.
+
+    The prompt-side counterpart to :func:`_check_bound`: same domain check, but
+    raising :class:`_PromptBoundError` instead of a bare :class:`OutOfRangeBoundError`
+    so the message survives crossing a prompt's ``Prompt.render`` boundary (see
+    :class:`_PromptBoundError` for why tools and prompts need different exception
+    types here).
+
+    Args:
+        name: The argument's name, used verbatim in the error message.
+        value: The supplied value.
+        minimum: Smallest accepted value.
+        maximum: Largest accepted value, or ``None`` when unbounded above.
+
+    Raises:
+        _PromptBoundError: If ``value`` is outside ``[minimum, maximum]``.
+
+    """
+    try:
+        _check_bound(name, value, minimum=minimum, maximum=maximum)
+    except OutOfRangeBoundError as exc:
+        raise _PromptBoundError(exc) from exc
+
+
 #: ``sqlite3.IntegrityError.sqlite_errorcode`` value for a PRIMARY KEY
 #: violation (``SQLITE_CONSTRAINT_PRIMARYKEY``).  Used in :func:`_tool_errors`
 #: to distinguish an ``edge_id`` collision from the edge table's other UNIQUE
@@ -571,7 +632,7 @@ async def _tool_errors() -> AsyncIterator[None]:  # noqa: C901, PLR0912, PLR0915
     Wraps the body of a tool handler so that the typed exceptions raised by
     the store, the MindQL parser, and this module's own consumer-policy
     guard surface to the client as a :class:`ToolError` carrying a curated,
-    agent-facing message instead of an internal exception.  FastMCP reports
+    agent-facing message instead of an internal exception.  MCPServer reports
     a :class:`ToolError` to the client with ``isError`` set and the message
     as text, so the client receives an actionable hint rather than a raw
     traceback or an internal class name.
@@ -1927,7 +1988,7 @@ def _reflect_on_topic_prompt(topic: str) -> str:
     )
 
 
-def build_server() -> FastMCP:
+def build_server() -> MCPServer:
     """Build the engrava MCP server with its tools registered.
 
     The returned server resolves its store from the environment when its
@@ -1937,7 +1998,7 @@ def build_server() -> FastMCP:
     reports a read-only deployment.
 
     Returns:
-        A configured :class:`FastMCP` server ready to ``run()``.
+        A configured :class:`MCPServer` server ready to ``run()``.
 
     """
     provider = StoreProvider()
@@ -1949,11 +2010,11 @@ def build_server() -> FastMCP:
     read_only = _read_only_enabled()
 
     @asynccontextmanager
-    async def lifespan(_server: FastMCP) -> AsyncIterator[None]:
+    async def lifespan(_server: MCPServer) -> AsyncIterator[None]:
         resolved: ResolvedStore = await resolve_store()
         # In read-only mode, reads go through a view that never stages a write —
         # not even the deferred access-count update a plain read would buffer on
-        # a store with access tracking on — so readOnlyHint=True is true on every
+        # a store with access tracking on — so read_only_hint=True is true on every
         # configuration, not only on the one where tracking happens to be off.
         read_store: ReadOnlyMcpStore = (
             ReadOnlyStore(resolved.store) if read_only else resolved.store
@@ -1970,7 +2031,7 @@ def build_server() -> FastMCP:
             with anyio.CancelScope(shield=True):
                 await resolved.aclose()
 
-    server: FastMCP = FastMCP(
+    server: MCPServer = MCPServer(
         SERVER_NAME,
         instructions=(
             "Access to an engrava agent-memory store: fetch thoughts, run "
@@ -2000,7 +2061,7 @@ def build_server() -> FastMCP:
     return server
 
 
-def register_resources(server: FastMCP, provider: StoreProvider) -> None:
+def register_resources(server: MCPServer, provider: StoreProvider) -> None:
     """Register the read-only MCP resources on a server.
 
     Three resources are registered.  They are reads by definition, so —
@@ -2063,7 +2124,7 @@ def register_resources(server: FastMCP, provider: StoreProvider) -> None:
         return json.dumps(payload)
 
 
-def register_prompts(server: FastMCP, provider: StoreProvider) -> None:
+def register_prompts(server: MCPServer, provider: StoreProvider) -> None:
     """Register the guided retrieval prompts on a server.
 
     Three prompts are registered.  They are parameterised templates that a
@@ -2099,11 +2160,19 @@ def register_prompts(server: FastMCP, provider: StoreProvider) -> None:
             f"Summarise the thoughts {_CYCLE_ORDERING_NOTE}. Optionally set how many to consider."
         ),
     )
-    async def summarize_recent_memory(limit: PageLimit = DEFAULT_SUMMARY_LIMIT) -> str:
-        # Guarded like the tools: ``limit`` is wire-supplied, so an out-of-range
-        # value must surface as a curated message rather than a raw typed error.
-        # The protocol layer normally rejects it first, but the domain guard
-        # exists precisely for the paths where that layer does not apply.
+    async def summarize_recent_memory(limit: int = DEFAULT_SUMMARY_LIMIT) -> str:
+        # ``limit`` is wire-supplied, so an out-of-range value must surface as a
+        # curated message rather than a raw typed error — guarded like the
+        # tools, but not *through* the tools' own ``PageLimit`` annotation: a
+        # pydantic ``Field`` constraint on the parameter would let the SDK
+        # reject the value before this body runs, but on mcp 2.x the argument
+        # ``ValidationError`` that rejection raises is caught by the prompt
+        # SDK's own rendering step and reported to the client only as an
+        # opaque "Internal server error" (see ``_PromptBoundError``). Checking
+        # the bound explicitly here, first, keeps both properties: the store is
+        # still never reached for a rejected value, and the client still gets
+        # an actionable message.
+        _check_prompt_bound("limit", limit, minimum=1, maximum=MAX_PAGE_LIMIT)
         async with _tool_errors():
             recent = await recent_thoughts_impl(provider.require_read(), limit=limit)
             return _summarize_recent_prompt(limit, recent)
@@ -2130,7 +2199,7 @@ def register_prompts(server: FastMCP, provider: StoreProvider) -> None:
 # — this function has a single branch, the read-only guard. Splitting the flat
 # registration list would hurt readability, so the complexity cap is waived here
 # deliberately.
-def register_tools(server: FastMCP, provider: StoreProvider, *, read_only: bool) -> None:  # noqa: C901
+def register_tools(server: MCPServer, provider: StoreProvider, *, read_only: bool) -> None:  # noqa: C901
     """Register the MCP tools on a server.
 
     The eight read tools (``get_thought``, ``search_memory``,
@@ -2464,7 +2533,7 @@ def register_tools(server: FastMCP, provider: StoreProvider, *, read_only: bool)
 def main() -> None:
     """Run the engrava MCP server over stdio.
 
-    Builds the server and serves it on the stdio transport (the FastMCP
+    Builds the server and serves it on the stdio transport (the MCPServer
     default).  This is the console-script, the ``python -m engrava_mcp``,
     and the ``python -m engrava_mcp.server`` entry point.  A soft warning is
     emitted first if the installed engrava version is outside the tested range.

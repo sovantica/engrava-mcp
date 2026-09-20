@@ -22,7 +22,6 @@ from engrava import (
     SqliteEngravaCore,
     ThoughtType,
 )
-from mcp.shared.memory import create_connected_server_and_client_session as connect_client
 from mcp.types import TextContent
 
 from engrava_mcp import build_server
@@ -34,6 +33,7 @@ from engrava_mcp.server import (
     _reflect_on_topic_prompt,
     _summarize_recent_prompt,
 )
+from tests.inprocess_client import connect_client
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -221,7 +221,7 @@ class TestPromptRendering:
 
         server = build_server()
         async with connect_client(server) as client:
-            # Arguments arrive as strings over the wire; FastMCP coerces
+            # Arguments arrive as strings over the wire; MCPServer coerces
             # the declared ``int`` parameter.
             result = await client.get_prompt("summarize_recent_memory", {"limit": "2"})
 

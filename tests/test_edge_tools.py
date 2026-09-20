@@ -25,9 +25,8 @@ from engrava import (
     SqliteEngravaCore,
     ThoughtType,
 )
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
-from mcp.shared.memory import create_connected_server_and_client_session as connect_client
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from engrava_mcp.server import (
     DEFAULT_EDGE_LIST_LIMIT,
@@ -39,15 +38,16 @@ from engrava_mcp.server import (
     list_edges_impl,
     register_tools,
 )
+from tests.inprocess_client import connect_client
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-    from mcp import ClientSession
+    from mcp import Client
 
 
 @asynccontextmanager
-async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[ClientSession]:
+async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[Client]:
     """Open a connected client whose tools query the given store.
 
     Registers the tools against a provider pointed at ``store`` and connects
@@ -60,7 +60,7 @@ async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[ClientSession]:
         A connected client session wired to ``store``.
 
     """
-    server: FastMCP = FastMCP(SERVER_NAME)
+    server: MCPServer = MCPServer(SERVER_NAME)
     provider = StoreProvider()
     provider.set(store, read_store=store)
     register_tools(server, provider, read_only=False)
@@ -338,7 +338,7 @@ class TestListEdges:
                 "list_edges",
                 {"metadata_equals": {"outer.inner": "x"}},
             )
-        assert result.isError is True
+        assert result.is_error is True
         _assert_grammar_free_filter_error(_error_text(result.content))
 
 
@@ -348,9 +348,9 @@ class TestEdgeToolsOverTheWire:
     async def test_get_edges_over_the_wire(self, edge_store: SqliteEngravaCore) -> None:
         async with _client_for(edge_store) as client:
             result = await client.call_tool("get_edges", {"thought_id": "t1", "direction": "OUT"})
-        assert result.isError is False
-        assert result.structuredContent is not None
-        assert {edge["edge_id"] for edge in result.structuredContent["edges"]} == {"e1", "e3"}
+        assert result.is_error is False
+        assert result.structured_content is not None
+        assert {edge["edge_id"] for edge in result.structured_content["edges"]} == {"e1", "e3"}
 
     async def test_list_edges_over_the_wire(self, edge_store: SqliteEngravaCore) -> None:
         async with _client_for(edge_store) as client:
@@ -358,9 +358,9 @@ class TestEdgeToolsOverTheWire:
                 "list_edges",
                 {"metadata_equals": {"topic": "drinks"}},
             )
-        assert result.isError is False
-        assert result.structuredContent is not None
-        assert {edge["edge_id"] for edge in result.structuredContent["edges"]} == {"e1", "e3"}
+        assert result.is_error is False
+        assert result.structured_content is not None
+        assert {edge["edge_id"] for edge in result.structured_content["edges"]} == {"e1", "e3"}
 
 
 class TestEdgeMetadataCrossesTheWire:
@@ -387,16 +387,16 @@ class TestEdgeMetadataCrossesTheWire:
                     "metadata": metadata,
                 },
             )
-            assert created.isError is False
-            assert created.structuredContent is not None
-            assert created.structuredContent["edge"]["metadata"] == metadata
-            edge_id = created.structuredContent["edge"]["edge_id"]
+            assert created.is_error is False
+            assert created.structured_content is not None
+            assert created.structured_content["edge"]["metadata"] == metadata
+            edge_id = created.structured_content["edge"]["edge_id"]
 
             listed = await client.call_tool("list_edges", {"metadata_equals": {"topic": "wire"}})
 
-        assert listed.structuredContent is not None
-        assert [edge["edge_id"] for edge in listed.structuredContent["edges"]] == [edge_id]
-        assert listed.structuredContent["edges"][0]["metadata"] == metadata
+        assert listed.structured_content is not None
+        assert [edge["edge_id"] for edge in listed.structured_content["edges"]] == [edge_id]
+        assert listed.structured_content["edges"][0]["metadata"] == metadata
 
 
 class TestEdgeReadDefaultsAtTheWire:
@@ -410,9 +410,9 @@ class TestEdgeReadDefaultsAtTheWire:
         async with _client_for(edge_store) as client:
             result = await client.call_tool("get_edges", {"thought_id": "t2"})
 
-        assert result.isError is False
-        assert result.structuredContent is not None
-        assert {edge["edge_id"] for edge in result.structuredContent["edges"]} == {"e1", "e2"}
+        assert result.is_error is False
+        assert result.structured_content is not None
+        assert {edge["edge_id"] for edge in result.structured_content["edges"]} == {"e1", "e2"}
 
     async def test_list_edges_without_a_limit_returns_one_default_page(
         self, edge_store: SqliteEngravaCore
@@ -439,9 +439,9 @@ class TestEdgeReadDefaultsAtTheWire:
         async with _client_for(edge_store) as client:
             result = await client.call_tool("list_edges", {})
 
-        assert result.isError is False
-        assert result.structuredContent is not None
-        assert result.structuredContent["count"] == DEFAULT_EDGE_LIST_LIMIT
+        assert result.is_error is False
+        assert result.structured_content is not None
+        assert result.structured_content["count"] == DEFAULT_EDGE_LIST_LIMIT
 
     async def test_an_unknown_direction_is_rejected_at_the_boundary(
         self, edge_store: SqliteEngravaCore
@@ -461,10 +461,10 @@ class TestEdgeReadDefaultsAtTheWire:
             )
             accepted = await client.call_tool("get_edges", {"thought_id": "t2", "direction": "IN"})
 
-        assert rejected.isError is True
-        assert accepted.isError is False
-        assert accepted.structuredContent is not None
-        assert {edge["edge_id"] for edge in accepted.structuredContent["edges"]} == {"e1"}
+        assert rejected.is_error is True
+        assert accepted.is_error is False
+        assert accepted.structured_content is not None
+        assert {edge["edge_id"] for edge in accepted.structured_content["edges"]} == {"e1"}
 
 
 def test_default_edge_list_limit_is_documented() -> None:

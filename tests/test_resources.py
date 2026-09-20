@@ -22,11 +22,11 @@ from engrava import (
     SqliteEngravaCore,
     ThoughtType,
 )
-from mcp.shared.memory import create_connected_server_and_client_session as connect_client
 
 from engrava_mcp import build_server
 from engrava_mcp.config import CONFIG_ENV_VAR, DB_PATH_ENV_VAR
 from engrava_mcp.server import READ_ONLY_ENV_VAR
+from tests.inprocess_client import connect_client
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -97,7 +97,7 @@ def _decode_single(result: object) -> dict[str, object]:
     contents = result.contents  # type: ignore[attr-defined]
     assert len(contents) == 1
     block = contents[0]
-    assert block.mimeType == "application/json"
+    assert block.mime_type == "application/json"
     decoded = json.loads(block.text)
     assert isinstance(decoded, dict)
     return decoded
@@ -134,7 +134,7 @@ class TestResourceListing:
         async with connect_client(server) as client:
             listed = await client.list_resource_templates()
 
-        templates = {template.uriTemplate for template in listed.resourceTemplates}
+        templates = {template.uri_template for template in listed.resource_templates}
         assert THOUGHT_TEMPLATE_URI in templates
 
 
@@ -220,10 +220,10 @@ class TestResourceReads:
             tool_result = await client.call_tool("memory_stats", {})
 
         resource_payload = _decode_single(resource_result)
-        assert tool_result.structuredContent is not None
+        assert tool_result.structured_content is not None
         # The resource and the memory_stats tool share memory_stats_impl,
         # so they must agree field-for-field (no duplicate stats logic).
-        assert resource_payload == tool_result.structuredContent
+        assert resource_payload == tool_result.structured_content
         assert resource_payload["thought_count"] == 2
 
 
@@ -247,7 +247,7 @@ class TestResourcesInReadOnlyMode:
         # Read-only mode hides the write tools but must not hide resources.
         assert {str(resource.uri) for resource in static.resources} == STATIC_RESOURCE_URIS
         assert THOUGHT_TEMPLATE_URI in {
-            template.uriTemplate for template in templates.resourceTemplates
+            template.uri_template for template in templates.resource_templates
         }
 
     async def test_resources_readable_in_read_only_mode(

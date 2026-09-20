@@ -50,11 +50,11 @@ import tomllib
 from pathlib import Path
 
 import pytest
-from mcp.shared.memory import create_connected_server_and_client_session as connect_client
 
 from engrava_mcp import build_server
 from engrava_mcp.config import _NO_PROVIDER_WARNING, CONFIG_ENV_VAR, DB_PATH_ENV_VAR
 from engrava_mcp.server import READ_ONLY_ENV_VAR
+from tests.inprocess_client import connect_client
 
 #: Repository root, located from this test file's path (never hardcoded).
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -227,7 +227,7 @@ class TestDeleteThoughtNamesTheCascade:
 
         update_thought = next(tool for tool in tools.tools if tool.name == "update_thought")
         assert update_thought.annotations is not None
-        assert update_thought.annotations.idempotentHint is False
+        assert update_thought.annotations.idempotent_hint is False
 
 
 class TestReadmeBareRouteCapabilities:

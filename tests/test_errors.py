@@ -4,7 +4,7 @@ When a tool hits a known failure condition, the client must receive a
 clean, typed, actionable error — a message with a helpful hint and
 ``isError`` set — rather than a raw Python traceback or an internal class
 name.  These tests drive the real tool boundary through the in-process MCP
-client transport (so FastMCP's error wrapping runs for real) and assert on
+client transport (so MCPServer's error wrapping runs for real) and assert on
 the message the client actually sees.
 
 The conditions covered are:
@@ -50,9 +50,8 @@ import pytest
 from engrava import EdgeType, StaleDataError
 from engrava.domain import exceptions as engrava_exceptions
 from engrava.domain.exceptions import DuplicateEdgeError, EngravaError
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
-from mcp.shared.memory import create_connected_server_and_client_session as connect_client
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 import engrava_mcp.server as server_module
 from engrava_mcp.server import (
@@ -70,12 +69,13 @@ from engrava_mcp.server import (
     store_thought_impl,
     update_thought_impl,
 )
+from tests.inprocess_client import connect_client
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
     from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
-    from mcp import ClientSession
+    from mcp import Client
 
 #: Substrings that would indicate a leaked traceback or internal symbol.
 #: Error messages shown to a client must contain none of them.
@@ -136,12 +136,12 @@ _SQL_INVITATIONS = (
 
 
 @asynccontextmanager
-async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[ClientSession]:
+async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[Client]:
     """Open a connected client whose tools query the given store.
 
     Builds a server, points a :class:`StoreProvider` at ``store``, registers
     the tools, and connects the in-process client so the real tool boundary
-    (and FastMCP's error wrapping) runs end to end.
+    (and MCPServer's error wrapping) runs end to end.
 
     Args:
         store: The seeded store the tools should query.
@@ -150,7 +150,7 @@ async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[ClientSession]:
         A connected client session wired to ``store``.
 
     """
-    server: FastMCP = FastMCP(SERVER_NAME)
+    server: MCPServer = MCPServer(SERVER_NAME)
     provider = StoreProvider()
     provider.set(store, read_store=store)
     register_tools(server, provider, read_only=False)
@@ -159,7 +159,7 @@ async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[ClientSession]:
 
 
 @asynccontextmanager
-async def _store_less_client() -> AsyncIterator[ClientSession]:
+async def _store_less_client() -> AsyncIterator[Client]:
     """Open a connected client whose provider never received a store.
 
     Registering the tools against an unpopulated :class:`StoreProvider`
@@ -170,7 +170,7 @@ async def _store_less_client() -> AsyncIterator[ClientSession]:
         A connected client session backed by a store-less provider.
 
     """
-    server: FastMCP = FastMCP(SERVER_NAME)
+    server: MCPServer = MCPServer(SERVER_NAME)
     register_tools(server, StoreProvider(), read_only=False)
     async with connect_client(server) as client:
         yield client
@@ -233,7 +233,7 @@ class TestStoreNotReady:
         async with _store_less_client() as client:
             result = await client.call_tool("memory_stats", {})
 
-        assert result.isError is True
+        assert result.is_error is True
         text = _error_text(result.content)
         # Actionable: it names the two documented configuration env vars ...
         assert "ENGRAVA_DB_PATH" in text
@@ -255,7 +255,7 @@ class TestUnsupportedQuery:
                 {"query": "SELECT thought_id FROM thought"},
             )
 
-        assert result.isError is True
+        assert result.is_error is True
         text = _error_text(result.content)
         # The guard still rejects the query and states the FIND-only contract.
         assert "FIND" in text
@@ -269,7 +269,7 @@ class TestUnsupportedQuery:
         async with _client_for(store) as client:
             result = await client.call_tool("query_memory", {"query": "COUNT thoughts"})
 
-        assert result.isError is True
+        assert result.is_error is True
         text = _error_text(result.content)
         assert "FIND" in text
         # A valid FIND example is offered to get the caller back on track.
@@ -291,7 +291,7 @@ class TestGuardPreservation:
             )
 
         # The rejection itself is intact: a SELECT still fails.
-        assert result.isError is True
+        assert result.is_error is True
         text = _error_text(result.content)
         lowered = text.lower()
 
@@ -315,7 +315,7 @@ class TestGuardPreservation:
         async with _client_for(store) as client:
             result = await client.call_tool("query_memory", {"query": "DROP thoughts"})
 
-        assert result.isError is True
+        assert result.is_error is True
         text = _error_text(result.content)
         lowered = text.lower()
         assert "only find" in lowered
@@ -342,7 +342,7 @@ class TestGuardPreservation:
         async with _client_for(store) as client:
             result = await client.call_tool("query_memory", {"query": "  drop   thoughts  "})
 
-        assert result.isError is True
+        assert result.is_error is True
         text = _error_text(result.content)
         lowered = text.lower()
         assert "only find" in lowered
@@ -425,7 +425,7 @@ class TestMalformedFind:
         async with _client_for(store) as client:
             result = await client.call_tool("query_memory", {"query": "FIND"})
 
-        assert result.isError is True
+        assert result.is_error is True
         text = _error_text(result.content)
         # The parser's own diagnosis reaches the client verbatim ...
         assert "FIND requires a table name" in text
@@ -440,7 +440,7 @@ class TestMalformedFind:
         async with _client_for(store) as client:
             result = await client.call_tool("query_memory", {"query": "FIND nosuchtable"})
 
-        assert result.isError is True
+        assert result.is_error is True
         text = _error_text(result.content)
         assert "nosuchtable" in text
         assert "could not be parsed" not in text
@@ -456,7 +456,7 @@ class TestMalformedFind:
                 {"query": "FIND thoughts WHERE priority ~~ 'P1'"},
             )
 
-        assert result.isError is True
+        assert result.is_error is True
         text = _error_text(result.content)
         # The rejected condition text reaches the client ...
         assert "priority ~~ 'P1'" in text
@@ -477,7 +477,7 @@ class TestMalformedFind:
                 {"query": "EXPLAIN FIND nosuchtable"},
             )
 
-        assert result.isError is True
+        assert result.is_error is True
         text = _error_text(result.content)
         assert "nosuchtable" in text
         assert "could not be parsed" not in text
@@ -492,7 +492,7 @@ class TestMalformedFind:
         async with _client_for(store) as client:
             result = await client.call_tool("query_memory", {"query": "FiNd nosuchtable"})
 
-        assert result.isError is True
+        assert result.is_error is True
         text = _error_text(result.content)
         assert "nosuchtable" in text
         assert "could not be parsed" not in text
@@ -509,7 +509,7 @@ class TestMalformedFind:
         async with _client_for(store) as client:
             result = await client.call_tool("query_memory", {"query": "  find thoughts LIMIT 5"})
 
-        assert result.isError is not True
+        assert result.is_error is not True
 
 
 class TestUnexecutableFind:
@@ -535,7 +535,7 @@ class TestUnexecutableFind:
                 {"query": "FIND thoughts WHERE nosuchfield = 'x'"},
             )
 
-        assert result.isError is True
+        assert result.is_error is True
         text = _error_text(result.content)
         # The specific diagnosis reaches the client, naming the bad column ...
         assert "nosuchfield" in text
@@ -557,7 +557,7 @@ class TestUpdateMissingThought:
                 {"thought_id": "ghost-thought", "essence": "x"},
             )
 
-        assert result.isError is True
+        assert result.is_error is True
         text = _error_text(result.content)
         # The offending id is echoed so the caller knows which one is wrong.
         assert "ghost-thought" in text
@@ -583,7 +583,7 @@ class TestLinkMissingEndpoint:
                 },
             )
 
-        assert result.isError is True
+        assert result.is_error is True
         text = _error_text(result.content)
         # The dangling endpoint id is echoed ...
         assert "ghost-endpoint" in text
@@ -611,7 +611,7 @@ class TestDuplicateEdge:
                     "edge_type": "ASSOCIATED",
                 },
             )
-            assert first.isError is False  # the first link succeeds
+            assert first.is_error is False  # the first link succeeds
 
             duplicate = await client.call_tool(
                 "link_thoughts",
@@ -622,7 +622,7 @@ class TestDuplicateEdge:
                 },
             )
 
-        assert duplicate.isError is True
+        assert duplicate.is_error is True
         text = _error_text(duplicate.content)
         # Actionable: it explains the uniqueness rule in user terms ...
         assert "already" in text.lower()
@@ -687,7 +687,7 @@ class TestInvalidFieldValue:
                 {"essence": "", "content": "some content"},
             )
 
-        assert result.isError is True
+        assert result.is_error is True
         text = _error_text(result.content)
         # Actionable: it points at the offending field and says it is invalid ...
         assert "invalid" in text.lower()
@@ -709,7 +709,7 @@ class TestInvalidFieldValue:
                 {"essence": "ok", "content": "c", "confidence": 5.0},
             )
 
-        assert result.isError is True
+        assert result.is_error is True
         text = _error_text(result.content)
         assert "invalid" in text.lower()
         assert "confidence" in text.lower()
@@ -724,7 +724,7 @@ class TestIllegalTransition:
         store: SqliteEngravaCore,
     ) -> None:
         # The seeded thoughts are ACTIVE; ACTIVE -> CREATED is backwards and
-        # illegal. FastMCP coerces the wire status to the LifecycleStatus enum,
+        # illegal. MCPServer coerces the wire status to the LifecycleStatus enum,
         # so the store's transition guard fires. The raw message names the
         # internal status type — the client must get a curated message instead.
         async with _client_for(store) as client:
@@ -733,7 +733,7 @@ class TestIllegalTransition:
                 {"thought_id": "thought-alpha", "lifecycle_status": "CREATED"},
             )
 
-        assert result.isError is True
+        assert result.is_error is True
         text = _error_text(result.content)
         # Actionable: it states the move in plain terms (the public state names
         # are fine; the internal type name is not) ...
@@ -758,9 +758,9 @@ class TestIllegalTransition:
             )
             after = await client.call_tool("get_thought", {"thought_id": "thought-alpha"})
 
-        assert after.isError is False
-        assert after.structuredContent is not None
-        assert after.structuredContent["thought"]["lifecycle_status"] == "ACTIVE"
+        assert after.is_error is False
+        assert after.structured_content is not None
+        assert after.structured_content["thought"]["lifecycle_status"] == "ACTIVE"
 
 
 class TestSuccessPathUnchanged:
@@ -778,10 +778,10 @@ class TestSuccessPathUnchanged:
                 {"query": "FIND thoughts WHERE lifecycle_status = 'ACTIVE'"},
             )
 
-        assert result.isError is False
-        assert result.structuredContent is not None
-        assert "thought_id" in result.structuredContent["columns"]
-        assert len(result.structuredContent["rows"]) == 2
+        assert result.is_error is False
+        assert result.structured_content is not None
+        assert "thought_id" in result.structured_content["columns"]
+        assert len(result.structured_content["rows"]) == 2
 
     async def test_valid_keyword_search_still_succeeds(
         self,
@@ -792,9 +792,9 @@ class TestSuccessPathUnchanged:
         async with _client_for(store) as client:
             result = await client.call_tool("search_keywords", {"query": "coffee"})
 
-        assert result.isError is False
-        assert result.structuredContent is not None
-        assert "results" in result.structuredContent
+        assert result.is_error is False
+        assert result.structured_content is not None
+        assert "results" in result.structured_content
 
 
 class TestUnrecognisedIntegrityError:
@@ -835,14 +835,14 @@ class TestDuplicateThoughtId:
                 "store_thought",
                 {"essence": "first", "content": "first body", "thought_id": "dup-thought"},
             )
-            assert first.isError is False
+            assert first.is_error is False
 
             duplicate = await client.call_tool(
                 "store_thought",
                 {"essence": "second", "content": "second body", "thought_id": "dup-thought"},
             )
 
-        assert duplicate.isError is True
+        assert duplicate.is_error is True
         text = _error_text(duplicate.content)
         # Names the offending id ...
         assert "dup-thought" in text
@@ -926,7 +926,7 @@ class TestConcurrentThoughtUpdate:
                 {"thought_id": "thought-alpha", "essence": "raced update"},
             )
 
-        assert result.isError is True
+        assert result.is_error is True
         text = _error_text(result.content)
         assert "thought-alpha" in text
         assert "changed" in text.lower() or "modified" in text.lower()
@@ -987,7 +987,7 @@ class TestOversizedEdgeMetadata:
                 },
             )
 
-        assert result.isError is True
+        assert result.is_error is True
         text = _error_text(result.content)
         assert "metadata" in text.lower()
         assert "too large" in text.lower()
@@ -1107,7 +1107,7 @@ class TestEdgeIdCollision:
                     "edge_id": "edge-wire-fixed",
                 },
             )
-            assert first.isError is False
+            assert first.is_error is False
 
             collision = await client.call_tool(
                 "link_thoughts",
@@ -1119,7 +1119,7 @@ class TestEdgeIdCollision:
                 },
             )
 
-        assert collision.isError is True
+        assert collision.is_error is True
         text = _error_text(collision.content)
         assert EDGE_ID_COLLISION_MESSAGE in text
         _assert_no_leak(text)
@@ -1180,22 +1180,22 @@ class TestOverflowingNumericBound:
         # Over the real MCP boundary this value is rejected by the advertised
         # schema before list_memory_impl ever runs -- a different layer from
         # the previous test, so only the rejection itself is asserted here.
-        # NOTE: FastMCP's own argument-schema rejection message leaks
+        # NOTE: MCPServer's own argument-schema rejection message leaks
         # "pydantic" and a docs URL (confirmed pre-existing on every bound
         # argument already annotated before this WS, e.g. limit=10**18, not
         # something this change introduced) -- out of this WS's scope, which
-        # is the _tool_errors translation table, not FastMCP's own protocol-
+        # is the _tool_errors translation table, not MCPServer's own protocol-
         # layer error formatting. Reported, not fixed here.
         async with _client_for(store) as client:
             result = await client.call_tool("list_memory", {"offset": 2**63})
-        assert result.isError is True
+        assert result.is_error is True
 
 
 class TestEmbeddingQueryRefusal:
     """``FIND embeddings`` is refused outright rather than crashing on the blob.
 
     The crash this replaces happens *after* ``query_memory_impl`` returns --
-    inside FastMCP's own response serialisation, once the returned dict's
+    inside MCPServer's own response serialisation, once the returned dict's
     ``rows`` carry the embedding's raw ``bytes`` -- which is outside
     ``_tool_errors``'s ``try``/``except`` by the time it happens. Refusing the
     table at the query boundary, before any row is ever fetched, is the only
@@ -1206,7 +1206,7 @@ class TestEmbeddingQueryRefusal:
         async with _client_for(store) as client:
             result = await client.call_tool("query_memory", {"query": "FIND embeddings"})
 
-        assert result.isError is True
+        assert result.is_error is True
         text = _error_text(result.content)
         assert "embed" in text.lower()
         assert "thoughts" in text.lower()
@@ -1223,7 +1223,7 @@ class TestEmbeddingQueryRefusal:
         async with _client_for(store) as client:
             result = await client.call_tool("query_memory", {"query": "FIND embeddings"})
 
-        assert result.isError is True
+        assert result.is_error is True
         _assert_no_leak(_error_text(result.content))
 
     async def test_impl_raises_typed_error_for_the_embeddings_target(

@@ -80,16 +80,16 @@ async def test_stdio_subprocess_serves_tools(tmp_path: Path) -> None:
             ClientSession(read, write) as session,
         ):
             init_result = await session.initialize()
-            assert init_result.serverInfo.name
+            assert init_result.server_info.name
 
             tools = await session.list_tools()
             names = {tool.name for tool in tools.tools}
             assert names == EXPECTED_TOOL_NAMES
 
             result = await session.call_tool("memory_stats", {})
-            assert result.isError is False
-            assert result.structuredContent is not None
+            assert result.is_error is False
+            assert result.structured_content is not None
             # A freshly created store has no thoughts.
-            assert result.structuredContent["thought_count"] == 0
+            assert result.structured_content["thought_count"] == 0
     except (FileNotFoundError, OSError) as exc:  # pragma: no cover - sandbox guard
         pytest.skip(f"stdio subprocess could not be spawned in this environment: {exc}")

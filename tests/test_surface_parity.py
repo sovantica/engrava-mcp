@@ -19,11 +19,11 @@ import importlib.metadata as importlib_metadata
 from pathlib import Path
 
 import pytest
-from mcp.shared.memory import create_connected_server_and_client_session as connect_client
 
 from engrava_mcp import build_server
 from engrava_mcp.config import CONFIG_ENV_VAR, DB_PATH_ENV_VAR
 from engrava_mcp.server import READ_ONLY_ENV_VAR, main
+from tests.inprocess_client import connect_client
 
 #: Every tool the default deployment must advertise (8 read + 5 write = 13).
 EXPECTED_READ_TOOLS = frozenset(
@@ -88,7 +88,7 @@ async def test_default_surface_is_thirteen_tools_three_resources_three_prompts()
     assert len(tool_names) == 13
 
     static_uris = {str(resource.uri) for resource in resources.resources}
-    template_uris = {str(template.uriTemplate) for template in templates.resourceTemplates}
+    template_uris = {str(template.uri_template) for template in templates.resource_templates}
     assert static_uris == EXPECTED_RESOURCE_URIS
     assert template_uris == EXPECTED_RESOURCE_TEMPLATE_URIS
     assert len(static_uris) + len(template_uris) == 3
@@ -116,7 +116,7 @@ async def test_read_only_gating_hides_only_write_tools(
     assert {"get_edges", "list_edges"} <= read_tool_names
     # Resources and prompts are reads by definition, so gating never hides them.
     static_uris = {str(resource.uri) for resource in resources.resources}
-    template_uris = {str(template.uriTemplate) for template in templates.resourceTemplates}
+    template_uris = {str(template.uri_template) for template in templates.resource_templates}
     assert static_uris == EXPECTED_RESOURCE_URIS
     assert template_uris == EXPECTED_RESOURCE_TEMPLATE_URIS
     assert {prompt.name for prompt in prompts.prompts} == EXPECTED_PROMPTS

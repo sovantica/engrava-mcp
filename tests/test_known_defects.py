@@ -33,20 +33,20 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
-from mcp.server.fastmcp import FastMCP
-from mcp.shared.memory import create_connected_server_and_client_session as connect_client
+from mcp.server.mcpserver import MCPServer
 
 from engrava_mcp.server import SERVER_NAME, StoreProvider, register_tools
+from tests.inprocess_client import connect_client
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
     from engrava import SqliteEngravaCore
-    from mcp import ClientSession
+    from mcp import Client
 
 
 @asynccontextmanager
-async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[ClientSession]:
+async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[Client]:
     """Open a connected client whose tools query the given store.
 
     Registers the tools against a provider pointed at ``store`` and connects
@@ -61,7 +61,7 @@ async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[ClientSession]:
         A connected client session wired to ``store``.
 
     """
-    server: FastMCP = FastMCP(SERVER_NAME)
+    server: MCPServer = MCPServer(SERVER_NAME)
     provider = StoreProvider()
     provider.set(store, read_store=store)
     register_tools(server, provider, read_only=False)
@@ -95,7 +95,7 @@ class TestConfidenceClearingKnownDefect:
         # The wire schema accepts `confidence: null`, and engrava itself uses
         # `None` to mean "unknown" — the intuitive reading of the defect is
         # that our code receives that null and then ignores it. It is worse
-        # than that: MCP's own argument-binding layer (FastMCP's
+        # than that: MCP's own argument-binding layer (MCPServer's
         # ArgModelBase.model_dump_one_level, which dumps every field rather
         # than only the ones the caller set) already collapses "confidence
         # omitted" and "confidence: null" to the identical Python value
@@ -131,26 +131,26 @@ class TestConfidenceClearingKnownDefect:
             seed = await client.call_tool(
                 "update_thought", {"thought_id": "thought-alpha", "confidence": 0.5}
             )
-            assert seed.isError is False
+            assert seed.is_error is False
 
             explicit_null = await client.call_tool(
                 "update_thought", {"thought_id": "thought-alpha", "confidence": None}
             )
-            assert explicit_null.isError is False
+            assert explicit_null.is_error is False
             after_explicit_null = await client.call_tool(
                 "get_thought", {"thought_id": "thought-alpha"}
             )
 
             omitted = await client.call_tool("update_thought", {"thought_id": "thought-alpha"})
-            assert omitted.isError is False
+            assert omitted.is_error is False
             after_omitted = await client.call_tool("get_thought", {"thought_id": "thought-alpha"})
 
-        assert after_explicit_null.structuredContent is not None
-        assert after_omitted.structuredContent is not None
-        confidence_after_explicit_null = after_explicit_null.structuredContent["thought"][
+        assert after_explicit_null.structured_content is not None
+        assert after_omitted.structured_content is not None
+        confidence_after_explicit_null = after_explicit_null.structured_content["thought"][
             "confidence"
         ]
-        confidence_after_omitted = after_omitted.structuredContent["thought"]["confidence"]
+        confidence_after_omitted = after_omitted.structured_content["thought"]["confidence"]
 
         # Pinning the defect: an explicit null and an omitted argument
         # produced the exact same outcome — confidence is still 0.5 either
@@ -199,15 +199,15 @@ class TestLinkThoughtsMetadataValidationAsymmetryKnownDefect:
                     "metadata": {"outer.inner": 1},
                 },
             )
-            assert created.isError is False
-            assert created.structuredContent is not None
+            assert created.is_error is False
+            assert created.structured_content is not None
             # Pinning the defect: the write accepted a key list_edges cannot
             # filter on.
-            assert created.structuredContent["edge"]["metadata"] == {"outer.inner": 1}
+            assert created.structured_content["edge"]["metadata"] == {"outer.inner": 1}
 
             filtered = await client.call_tool("list_edges", {"metadata_equals": {"outer.inner": 1}})
 
         # Pinning the defect: the same key, sent to the same server, on the
         # filter side of the same feature, is refused.
-        assert filtered.isError is True
+        assert filtered.is_error is True
         assert "metadata filter is invalid" in _error_text(filtered.content).lower()

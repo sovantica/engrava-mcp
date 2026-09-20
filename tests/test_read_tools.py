@@ -19,7 +19,7 @@ from engrava import (
 )
 from engrava.domain.exceptions import InvalidRecencyArgumentError
 from engrava.mindql.parser import MindQLParseError
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.mcpserver.exceptions import ToolError
 
 from engrava_mcp.read_only import ReadOnlyStore
 from engrava_mcp.server import (

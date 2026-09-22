@@ -90,6 +90,15 @@ model / key), which the server needs to embed a *new query* at search time for
 semantic search. With only `ENGRAVA_DB_PATH` set, the server emits a startup
 warning that semantic search is inert and points you at `ENGRAVA_MCP_CONFIG`.
 
+At search time, the server embeds the query with the provider this `yaml`
+declares. Whether this server's writes embed anything is decided by the same
+`yaml`'s `embeddings.auto_embed`, which Engrava leaves off by default. With it
+off, a thought created through `store_thought` gets no embedding, so
+`search_memory`'s vector ranking cannot match it — its keyword ranking still
+can — and an `update_thought` leaves whatever embedding the thought already had
+as it was, not refreshed. With it on, creating a thought, or changing its
+`essence` or `content`, also calls the provider.
+
 ### Store-hook extensions need the config path
 
 Engrava extensions that hook the store — anything wired through an

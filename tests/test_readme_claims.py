@@ -1,15 +1,22 @@
 """Tests that the README's checkable claims match the release it ships with.
 
-Two claims are checked, and each went stale once because nothing tied it to the code:
+Three claims are checked, and the first two went stale once each because nothing tied
+them to the code:
 
 * The compatibility table's newest row names the same ``engrava`` range as the dependency
   declared in ``pyproject.toml``. The table is maintained by hand; this test is what notices
   when a range move leaves it a release behind.
 * The example ``engrava.yaml`` loads with Engrava's own configuration loader. The example is
   read out of the README rather than copied here, so it is the README that gets tested.
+* The paragraph on which writes get embedded agrees with what loading that same example
+  through Engrava's own config loader actually yields for ``embeddings.auto_embed`` -- the
+  server's own path, not a value read off a dataclass in isolation -- so a change to
+  either the loader's default or the example turns this claim red instead of quietly
+  going stale.
 
-Neither test skips or passes vacuously: a table or an example that cannot be found is a
-failure, because a claim that has gone missing is the same defect as one that is wrong.
+None of the tests skip or pass vacuously: a table, example, or paragraph that cannot be
+found is a failure, because a claim that has gone missing is the same defect as one that
+is wrong.
 """
 
 from __future__ import annotations
@@ -19,6 +26,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+import yaml
 from engrava import ConfigError, load_config
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
@@ -41,6 +49,16 @@ _COMPATIBILITY_ROW = re.compile(
 
 #: Any Markdown heading line, used to bound a section.
 _HEADING = re.compile(r"^#{1,6} ", re.MULTILINE)
+
+#: The heading of the README section that documents store resolution and setup.
+_CONFIGURATION_HEADING = re.compile(r"^## Configuration[ \t]*$", re.MULTILINE)
+
+#: The paragraph that follows the **Recommended:** paragraph, captured up to the blank
+#: line that ends it. Searched only within the bounded Configuration section, so a
+#: **Recommended:** paragraph appearing in some later section could not be matched instead.
+_WRITE_EMBEDDING_PARAGRAPH = re.compile(
+    r"^\*\*Recommended:\*\*.*?\n\n(?P<paragraph>.*?)\n\n", re.MULTILINE | re.DOTALL
+)
 
 #: The heading that introduces the README's example configuration file.
 _EXAMPLE_CONFIG_HEADING = re.compile(r"^### Example `engrava\.yaml`[ \t]*$", re.MULTILINE)
@@ -142,6 +160,47 @@ def _example_config_yaml(readme: str) -> str:
     return body
 
 
+def _configuration_section(readme: str) -> str:
+    """Extract the README's ``## Configuration`` section.
+
+    Args:
+        readme: The full README text.
+
+    Returns:
+        The section's text, from just after the ``## Configuration`` heading up to (not
+        including) the next heading of any level.
+
+    """
+    heading = _CONFIGURATION_HEADING.search(readme)
+    if heading is None:
+        pytest.fail("README has no '## Configuration' section")
+    section = readme[heading.end() :]
+    next_heading = _HEADING.search(section)
+    if next_heading is not None:
+        section = section[: next_heading.start()]
+    return section
+
+
+def _write_embedding_paragraph(readme: str) -> str:
+    """Extract the paragraph that follows the Configuration section's **Recommended:** one.
+
+    Args:
+        readme: The full README text.
+
+    Returns:
+        The paragraph's text, with internal newlines collapsed to single spaces so a
+        rewrap that changes nothing but line breaks does not change what a substring
+        check sees.
+
+    """
+    match = _WRITE_EMBEDDING_PARAGRAPH.search(_configuration_section(readme))
+    if match is None:
+        pytest.fail(
+            "README has no paragraph following '**Recommended:**' in its Configuration section"
+        )
+    return " ".join(match["paragraph"].split())
+
+
 def test_compatibility_table_newest_row_matches_the_dependency_range() -> None:
     """The table's newest row names the range ``pyproject.toml`` requires of ``engrava``.
 
@@ -175,3 +234,63 @@ def test_example_engrava_yaml_loads(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     # The `${OPENAI_API_KEY}` reference resolved, so the embeddings block was really parsed.
     assert config.embeddings is not None
     assert config.embeddings.api_key == _FAKE_API_KEY
+
+
+def test_readme_says_which_writes_get_embedded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The write-embedding paragraph agrees with what the README's own example loads to.
+
+    Two things are pinned. First, that loading the README's example ``engrava.yaml`` through
+    Engrava's own config loader -- the same path the server itself takes, not a value read
+    off a dataclass in isolation -- yields ``auto_embed`` off; the example never sets it, so
+    this is the default a reader following the README actually gets. If Engrava's loader
+    default (or the example) ever makes that ``True``, this goes red instead of leaving the
+    README's claim quietly wrong. Second, that the paragraph explaining what that setting
+    means still makes every point: which provider embeds the query, that `store_thought`
+    gets no embedding while off, that `search_memory`'s vector ranking (not its keyword
+    ranking) is what can't match it, that `update_thought` leaves an existing embedding
+    unrefreshed, and exactly which writes call the provider once it is on.
+    """
+    readme = _readme_text()
+    example_yaml = _example_config_yaml(readme)
+
+    # Without the check below, an example that set `auto_embed` itself would keep this test
+    # green while it stopped testing Engrava's default at all.
+    parsed_example = yaml.safe_load(example_yaml)
+    assert isinstance(parsed_example, dict)
+    embeddings_section = parsed_example.get("embeddings")
+    assert isinstance(embeddings_section, dict)
+    assert "auto_embed" not in embeddings_section, (
+        "README's example engrava.yaml now sets `embeddings.auto_embed` explicitly, so "
+        "the assertion below no longer pins Engrava's default -- it pins the example instead"
+    )
+
+    monkeypatch.setenv("OPENAI_API_KEY", _FAKE_API_KEY)
+    config_path = tmp_path / "engrava.yaml"
+    config_path.write_text(example_yaml, encoding="utf-8")
+
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        pytest.fail(f"README's example engrava.yaml does not load: {exc}", pytrace=False)
+
+    # The example never sets `auto_embed`, so this is the loader's real default, on the
+    # server's own path -- not a dataclass default read in isolation.
+    assert config.embeddings is not None
+    assert config.embeddings.auto_embed is False
+
+    paragraph = _write_embedding_paragraph(readme)
+    assert "the server embeds the query with the provider this `yaml` declares" in paragraph
+    assert "`embeddings.auto_embed`" in paragraph
+    assert "leaves off by default" in paragraph
+    assert "`store_thought` gets no embedding" in paragraph
+    assert "`search_memory`'s vector ranking cannot match it" in paragraph
+    assert "keyword ranking still can" in paragraph
+    assert (
+        "an `update_thought` leaves whatever embedding the thought already had "
+        "as it was, not refreshed"
+    ) in paragraph
+    assert (
+        "creating a thought, or changing its `essence` or `content`, also calls the provider"
+    ) in paragraph

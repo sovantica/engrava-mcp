@@ -115,6 +115,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -184,6 +185,12 @@ EdgeDirection = Literal["IN", "OUT", "BOTH"]
 #: kept to plain JSON scalars over the wire: nested objects and the typed filter
 #: machinery are never exposed to clients.
 JsonScalar = str | int | float | bool | None
+
+#: Module logger.  Shares its name with :data:`engrava_mcp.config.logger`
+#: (``logging.getLogger`` returns the same object for the same name), so a
+#: shutdown-time warning logged from either module reaches the same handlers
+#: and the same ``tests/test_shutdown.py`` capture.
+logger = logging.getLogger("engrava_mcp")
 
 #: Server name advertised to MCP clients.
 SERVER_NAME = "engrava"
@@ -2395,14 +2402,72 @@ def _reflect_on_topic_prompt(topic: str) -> str:
     )
 
 
+#: Exit code passed to ``os._exit`` when the connection close hit its bound
+#: and abandoned a worker thread that never answered (see
+#: :func:`_forced_exit_is_warranted`).  ``1`` (generic failure), absent a more
+#: specific convention: nothing in this server's MCP client compatibility
+#: matrix attaches meaning to a particular non-zero code, so there is no
+#: sharper choice to make here.
+_FORCED_EXIT_CODE = 1
+
+#: Logged immediately before :func:`build_server`'s ``lifespan`` forces the
+#: process to exit.
+_FORCED_EXIT_WARNING = (
+    "The database connection close abandoned a worker thread that never "
+    "answered within its bound. That thread is not a daemon, so this "
+    "process cannot exit on its own while it is still running. Forcing exit "
+    "with code %s so a process supervisor, or the client that launched this "
+    "server, notices immediately -- rather than being left with an orphaned "
+    "process still holding a stale handle to the database file."
+)
+
+
+def _forced_exit_is_warranted(*, connection_close_hit_its_bound: bool) -> bool:
+    """Decide, and log, whether the server process must force its own exit.
+
+    Called from ``lifespan``'s ``finally`` block (see :func:`build_server`)
+    with what :meth:`~engrava_mcp.config.ResolvedStore.aclose` returned. Kept
+    separate from the ``os._exit`` call it gates -- the actual exit is a
+    single line at ``lifespan``'s own outermost point, untested by
+    construction -- so this decision, including the warning it logs, is
+    exercised by a test directly, without the process actually exiting.
+    Nothing else in this module calls ``os._exit``, so a test that calls this
+    function, or that calls :meth:`~engrava_mcp.config.ResolvedStore.aclose`
+    directly the way every existing shutdown test in
+    ``tests/test_shutdown.py`` does, can never trigger it.
+
+    Args:
+        connection_close_hit_its_bound: What
+            :meth:`~engrava_mcp.config.ResolvedStore.aclose` returned: whether
+            the connection close abandoned a worker that never answered
+            within its bound, rather than closing cleanly. ``False`` on a
+            clean close and on the
+            :class:`~engrava.ConnectionQuarantinedError` soft-warning path --
+            that close does not leave a wedged worker behind, so it must
+            never force an exit.
+
+    Returns:
+        ``connection_close_hit_its_bound``, unchanged -- the caller's cue to
+        call ``os._exit``.
+
+    """
+    if connection_close_hit_its_bound:
+        logger.warning(_FORCED_EXIT_WARNING, _FORCED_EXIT_CODE)
+    return connection_close_hit_its_bound
+
+
 def build_server() -> MCPServer:
     """Build the engrava MCP server with its tools registered.
 
     The returned server resolves its store from the environment when its
-    lifespan starts and releases the connection when the lifespan ends.
-    The read tools, the resources, and the prompts are always registered;
-    the write tools are registered unless :func:`_read_only_enabled`
-    reports a read-only deployment.
+    lifespan starts and attempts to close the connection when the lifespan
+    ends -- unless that attempt hits its bound on a genuinely wedged worker
+    thread, in which case the process forces its own exit
+    (:func:`_forced_exit_is_warranted`) instead of returning normally; see
+    :meth:`~engrava_mcp.config.ResolvedStore.aclose` for what that bound is
+    on either launch route. The read tools, the resources, and the prompts
+    are always registered; the write tools are registered unless
+    :func:`_read_only_enabled` reports a read-only deployment.
 
     Returns:
         A configured :class:`MCPServer` server ready to ``run()``.
@@ -2436,7 +2501,26 @@ def build_server() -> MCPServer:
             # on stdio EOF).  Without the shield the database worker thread
             # can outlive the event loop and raise on a late callback.
             with anyio.CancelScope(shield=True):
-                await resolved.aclose()
+                connection_close_hit_its_bound = await resolved.aclose()
+            forced_exit = _forced_exit_is_warranted(
+                connection_close_hit_its_bound=connection_close_hit_its_bound
+            )
+            if forced_exit:
+                # A genuine call terminates the process outright, so this line
+                # is untestable by construction; everything that decides to
+                # reach it -- the fact and the warning -- is proven through
+                # _forced_exit_is_warranted instead (see its docstring and
+                # build_server's for why a wedged worker thread leaves no other
+                # way to end the process).
+                #
+                # tests/test_shutdown.py's TestForcedExitOnAWedgedShutdown does
+                # drive the real lifespan to this exact line, with os._exit
+                # monkeypatched so no real exit happens -- but coverage.py does
+                # not attribute the line even so (it follows a genuine anyio
+                # timeout-cancellation being caught, a combination coverage.py
+                # is known to under-report). The pragma reflects that
+                # measurement gap, not an actual absence of exercise.
+                os._exit(_FORCED_EXIT_CODE)  # pragma: no cover
 
     server: MCPServer = MCPServer(
         SERVER_NAME,

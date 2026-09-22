@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import threading
 from typing import TYPE_CHECKING
 
@@ -37,6 +38,7 @@ from engrava import ConnectionQuarantinedError, SqliteEngravaCore
 
 from engrava_mcp import build_server, config
 from engrava_mcp.config import CONFIG_ENV_VAR, DB_PATH_ENV_VAR, resolve_store
+from engrava_mcp.server import _FORCED_EXIT_CODE
 from tests.inprocess_client import connect_client
 
 if TYPE_CHECKING:
@@ -294,6 +296,14 @@ def warnings_that_raise() -> Iterator[None]:
 class TestQuarantinedStoreAtShutdown:
     """A :class:`~engrava.ConnectionQuarantinedError` reported by the store's close is logged
     on a best-effort basis, not raised.
+
+    "Not raised" is true on both launch routes -- it never propagates as a
+    Python exception -- but it is not the same as "never ends the process" on
+    the :data:`~engrava_mcp.config.CONFIG_ENV_VAR` route: there, it is always
+    a wedge (see ``test_aclose_reports_a_wedge_on_the_yaml_route`` below), so
+    the real ``server.py`` lifespan forces exit on it instead of returning.
+    ``test_yaml_launch_forces_exit`` below patches ``os._exit`` for exactly
+    that reason -- without it, this class would kill the test process.
     """
 
     async def test_bare_database_launch_leaves_cleanly(
@@ -319,16 +329,22 @@ class TestQuarantinedStoreAtShutdown:
         assert recorder.completed_connection_closes == 1
         assert recorder.events == [STORE_CLOSE, CONNECTION_CLOSE]
 
-    async def test_yaml_launch_leaves_cleanly(
+    async def test_yaml_launch_forces_exit(
         self, recorder: ShutdownRecorder, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        # Unlike the bare-database launch above, this route's store owns the
+        # connection, so a ConnectionQuarantinedError from its close is always
+        # a wedge (see test_aclose_reports_a_wedge_on_the_yaml_route) and the
+        # real lifespan forces exit on it -- os._exit is patched here so that
+        # actually happens without ending this test process.
         select_yaml_launch(monkeypatch, tmp_path)
         recorder.store_close_raises(ConnectionQuarantinedError(QUARANTINE_REASON))
+        exit_calls: list[int] = []
+        monkeypatch.setattr(os, "_exit", exit_calls.append)
 
-        # The store owns its connection on this launch, so this server has no
-        # connection of its own to close; the test fails if leaving the client
-        # raises.
         await serve_then_leave()
+
+        assert exit_calls == [_FORCED_EXIT_CODE]
 
     async def test_the_quarantine_reason_is_logged_once(
         self, recorder: ShutdownRecorder, launch_route: str, caplog: pytest.LogCaptureFixture
@@ -345,6 +361,39 @@ class TestQuarantinedStoreAtShutdown:
         assert records[0].levelno == logging.WARNING
         assert QUARANTINE_REASON in records[0].getMessage()
         assert "quarantined" in records[0].getMessage()
+
+    async def test_aclose_reports_no_wedge_on_the_bare_database_route(
+        self, recorder: ShutdownRecorder, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # Negative pin: on this route the store never owns the connection
+        # (the manual constructor _resolve_from_db_path uses never marks it
+        # so), so a ConnectionQuarantinedError from store.close() carries no
+        # relationship to this server's own connection at all -- it must be
+        # reported the same way a clean close is, never as the fact that
+        # drives server.py's forced exit. The real bound-hit signal for this
+        # route comes from _close_connection instead (TestConnectionCloseIsBounded).
+        select_db_path_launch(monkeypatch, tmp_path)
+        recorder.store_close_raises(ConnectionQuarantinedError(QUARANTINE_REASON))
+        resolved = await resolve_store()
+
+        assert await resolved.aclose() is False
+
+    async def test_aclose_reports_a_wedge_on_the_yaml_route(
+        self, recorder: ShutdownRecorder, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # Positive pin, the mirror image of the bare-database case above: on
+        # this route the store owns its connection, so store.close() applies
+        # its own internal bound to the very same worker -- verified at the
+        # library's own source, the only way close() raises
+        # ConnectionQuarantinedError from within itself is that bound
+        # expiring with the physical close still not done. A quarantine
+        # reported here is therefore always a wedge, never a benign one, and
+        # must be reported True so server.py's lifespan can act on it.
+        select_yaml_launch(monkeypatch, tmp_path)
+        recorder.store_close_raises(ConnectionQuarantinedError(QUARANTINE_REASON))
+        resolved = await resolve_store()
+
+        assert await resolved.aclose() is True
 
 
 class TestOtherFailuresAreNotSwallowed:
@@ -474,8 +523,9 @@ class TestOrdinaryShutdown:
             resolved = await resolve_store()
             caplog.clear()
 
-            await resolved.aclose()
+            connection_close_hit_its_bound = await resolved.aclose()
 
+        assert connection_close_hit_its_bound is False
         assert shutdown_warnings(caplog) == []
         assert recorder.events == [STORE_CLOSE, CONNECTION_CLOSE]
         assert recorder.completed_connection_closes == 1
@@ -499,8 +549,9 @@ class TestConnectionCloseIsBounded:
             caplog.clear()
 
             with anyio.fail_after(GUARD_SECONDS):
-                await resolved.aclose()
+                connection_close_hit_its_bound = await resolved.aclose()
 
+        assert connection_close_hit_its_bound is True
         assert recorder.completed_connection_closes == 0
         records = shutdown_warnings(caplog)
         assert len(records) == 1
@@ -519,6 +570,11 @@ class TestConnectionCloseIsBounded:
         # on a worker thread and then awaits again in a ``finally`` block.  The
         # worker is wedged with a SQL function that blocks until the test
         # releases it.
+        #
+        # This is also the failability-evidence driver for the returned-fact
+        # plumbing itself: `connection_close_hit_its_bound` below is `True` only
+        # because a worker is genuinely, not simulated, wedged when the bound
+        # expires.
         select_db_path_launch(monkeypatch, tmp_path)
         monkeypatch.setattr(config, "_CONNECTION_CLOSE_TIMEOUT_SECONDS", SHORT_BOUND_SECONDS)
         threads_before = set(threading.enumerate())
@@ -541,7 +597,7 @@ class TestConnectionCloseIsBounded:
                 assert await asyncio.to_thread(wedged.wait, GUARD_SECONDS)
 
                 with anyio.fail_after(GUARD_SECONDS):
-                    await resolved.aclose()
+                    connection_close_hit_its_bound = await resolved.aclose()
             finally:
                 # Let the worker finish and drain its queue, and wait for it to
                 # exit, while the loop is still alive to receive its callbacks;
@@ -550,9 +606,63 @@ class TestConnectionCloseIsBounded:
                 await blocker
                 await asyncio.to_thread(worker.join, GUARD_SECONDS)
 
+        assert connection_close_hit_its_bound is True
         records = shutdown_warnings(caplog)
         assert len(records) == 1
         assert "did not close" in records[0].getMessage()
+
+    async def test_aclose_reports_a_wedge_on_the_yaml_routes_own_bound(
+        self,
+        recorder: ShutdownRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # The CONFIG_ENV_VAR-route counterpart to the genuine wedge above: on
+        # this route the store owns its connection, so it is the store's own
+        # close_timeout_seconds -- not this module's
+        # _CONNECTION_CLOSE_TIMEOUT_SECONDS -- that bounds the wait. Patched
+        # short directly on the resolved instance: close() reads
+        # self._close_timeout_seconds fresh on every call, never caching it
+        # elsewhere, so a post-construction patch takes effect.
+        #
+        # This is the failability-evidence driver for the fix itself:
+        # without it, ResolvedStore.aclose() on this route reported every
+        # ConnectionQuarantinedError from store.close() as False, including
+        # this genuinely wedged one.
+        select_yaml_launch(monkeypatch, tmp_path)
+        threads_before = set(threading.enumerate())
+        with caplog.at_level(logging.WARNING, logger=config.logger.name):
+            resolved = await resolve_store()
+            caplog.clear()
+            monkeypatch.setattr(resolved.store, "_close_timeout_seconds", SHORT_BOUND_SECONDS)
+            (connection,) = recorder.connections
+            (worker,) = set(threading.enumerate()) - threads_before
+            wedged = threading.Event()
+            release = threading.Event()
+
+            def _block() -> int:
+                wedged.set()
+                release.wait()
+                return 1
+
+            await connection.create_function("block_worker", 0, _block)
+            blocker = asyncio.ensure_future(connection.execute("SELECT block_worker()"))
+            try:
+                assert await asyncio.to_thread(wedged.wait, GUARD_SECONDS)
+
+                with anyio.fail_after(GUARD_SECONDS):
+                    connection_close_hit_its_bound = await resolved.aclose()
+            finally:
+                release.set()
+                await blocker
+                await asyncio.to_thread(worker.join, GUARD_SECONDS)
+
+        assert connection_close_hit_its_bound is True
+        records = shutdown_warnings(caplog)
+        assert len(records) == 1
+        assert "quarantined" in records[0].getMessage()
+        assert "did not complete within" in records[0].getMessage()
 
 
 class TestATimeoutRaisedByTheCloseItself:
@@ -645,3 +755,183 @@ class TestWarningsAreBestEffort:
             await resolved.aclose()
 
         assert recorder.events == [STORE_CLOSE, CONNECTION_CLOSE]
+
+
+class TestConnectionQuarantineDoesNotForceExit:
+    """On the bare-database route, a quarantined store close never forces the process to exit.
+
+    Negative pin, scoped to the :data:`~engrava_mcp.config.DB_PATH_ENV_VAR`
+    route specifically: on that route the store never owns the connection
+    this server opened (the manual constructor
+    :func:`~engrava_mcp.config._resolve_from_db_path` uses never marks it so),
+    so a :class:`~engrava.ConnectionQuarantinedError` from ``store.close()``
+    carries no relationship to it and must not be treated as a wedge.  The
+    mirror-image case -- the :data:`~engrava_mcp.config.CONFIG_ENV_VAR`
+    route, where that same exception from ``store.close()`` *is* always a
+    wedge -- is pinned positively by
+    ``TestQuarantinedStoreAtShutdown.test_yaml_launch_forces_exit`` above,
+    not here.
+
+    Driven through the real ``server.py`` lifespan
+    (:func:`~engrava_mcp.build_server`), not through
+    :meth:`~engrava_mcp.config.ResolvedStore.aclose` directly, so what is
+    pinned is the same real teardown path a wedge would otherwise be forced
+    through -- the omission this test rules out is "nobody wired the
+    quarantine path through to the exit decision at all", not merely "aclose
+    still reports False in isolation" (already covered by
+    ``TestQuarantinedStoreAtShutdown`` above).
+    """
+
+    async def test_quarantine_at_shutdown_never_calls_os_exit(
+        self, recorder: ShutdownRecorder, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        select_db_path_launch(monkeypatch, tmp_path)
+        recorder.store_close_raises(ConnectionQuarantinedError(QUARANTINE_REASON))
+        exit_calls: list[int] = []
+        monkeypatch.setattr(os, "_exit", exit_calls.append)
+
+        # Nothing to assert on the leave itself: the quarantine path already
+        # returns normally (TestQuarantinedStoreAtShutdown above), and that
+        # behaviour is not what this test is pinning.
+        await serve_then_leave()
+
+        assert exit_calls == []
+
+
+class TestForcedExitOnAWedgedShutdown:
+    """A close that genuinely hits its bound forces the real server process to exit."""
+
+    async def test_the_real_lifespan_forces_exit_on_a_genuinely_wedged_worker(
+        self,
+        recorder: ShutdownRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # Same genuine wedge as
+        # test_aclose_returns_once_the_bound_expires_on_a_wedged_worker above
+        # (a real aiosqlite worker thread blocked in a SQL function, released
+        # and joined in the ``finally``), but driven through the real
+        # ``server.py`` lifespan via ``build_server`` + ``connect_client``
+        # rather than a direct ``ResolvedStore.aclose()`` call, so what is
+        # proven is the actual server process's own teardown deciding to
+        # force an exit -- not just that ``aclose`` reports the fact
+        # correctly in isolation (that is
+        # test_aclose_returns_once_the_bound_expires_on_a_wedged_worker's
+        # job).
+        #
+        # ``os._exit`` is patched to a recorder rather than actually run: it
+        # is the one line this design leaves untested by construction (see
+        # ``_forced_exit_is_warranted``'s docstring in server.py), and a real
+        # call would kill this test process along with the rest of the suite.
+        # Everything upstream of that call -- the genuinely wedged worker,
+        # the real lifespan teardown, and the decision to force an exit -- is
+        # exercised for real.
+        select_db_path_launch(monkeypatch, tmp_path)
+        monkeypatch.setattr(config, "_CONNECTION_CLOSE_TIMEOUT_SECONDS", SHORT_BOUND_SECONDS)
+        exit_calls: list[int] = []
+        monkeypatch.setattr(os, "_exit", exit_calls.append)
+        threads_before = set(threading.enumerate())
+
+        wedged = threading.Event()
+        release = threading.Event()
+
+        def _block() -> int:
+            wedged.set()
+            release.wait()
+            return 1
+
+        # Set once the connection and worker are known, below; `None` here only
+        # covers a `finally` reached before either is (an early failure to even
+        # connect, which the assertions below would fail on anyway).
+        blocker = None
+        worker = None
+        with caplog.at_level(logging.WARNING, logger=config.logger.name):
+            server = build_server()
+            try:
+                with anyio.fail_after(GUARD_SECONDS):
+                    async with connect_client(server) as client:
+                        await client.list_tools()
+                        caplog.clear()  # the launch's own startup warnings are not under test
+                        (connection,) = recorder.connections
+                        (worker,) = set(threading.enumerate()) - threads_before
+                        await connection.create_function("block_worker", 0, _block)
+                        blocker = asyncio.ensure_future(connection.execute("SELECT block_worker()"))
+                        assert await asyncio.to_thread(wedged.wait, GUARD_SECONDS)
+                        # Leaving this block runs the real lifespan's `finally`:
+                        # `aclose()` hits the (patched, short) bound with the
+                        # worker still blocked, and the exit decision fires.
+            finally:
+                release.set()
+                if blocker is not None:
+                    await blocker
+                if worker is not None:
+                    await asyncio.to_thread(worker.join, GUARD_SECONDS)
+
+        assert exit_calls == [_FORCED_EXIT_CODE]
+        records = shutdown_warnings(caplog)
+        assert any("did not close" in record.getMessage() for record in records)
+        assert any("Forcing exit" in record.getMessage() for record in records)
+
+    async def test_the_real_lifespan_forces_exit_on_the_yaml_routes_genuinely_wedged_worker(
+        self,
+        recorder: ShutdownRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # The CONFIG_ENV_VAR-route counterpart to the test above: here it is
+        # the store's own close_timeout_seconds that bounds the wait (see
+        # ResolvedStore.aclose's docstring and resolve_store's config-route
+        # closer), not this module's _CONNECTION_CLOSE_TIMEOUT_SECONDS. The
+        # store instance does not exist before the real lifespan constructs
+        # it, so the bound is shortened at its source instead --
+        # SqliteEngravaCore.from_config's own keyword-only default, restored
+        # by monkeypatch once the test ends.
+        select_yaml_launch(monkeypatch, tmp_path)
+        monkeypatch.setitem(
+            SqliteEngravaCore.from_config.__func__.__kwdefaults__,
+            "close_timeout_seconds",
+            SHORT_BOUND_SECONDS,
+        )
+        exit_calls: list[int] = []
+        monkeypatch.setattr(os, "_exit", exit_calls.append)
+        threads_before = set(threading.enumerate())
+
+        wedged = threading.Event()
+        release = threading.Event()
+
+        def _block() -> int:
+            wedged.set()
+            release.wait()
+            return 1
+
+        blocker = None
+        worker = None
+        with caplog.at_level(logging.WARNING, logger=config.logger.name):
+            server = build_server()
+            try:
+                with anyio.fail_after(GUARD_SECONDS):
+                    async with connect_client(server) as client:
+                        await client.list_tools()
+                        caplog.clear()  # the launch's own startup warnings are not under test
+                        (connection,) = recorder.connections
+                        (worker,) = set(threading.enumerate()) - threads_before
+                        await connection.create_function("block_worker", 0, _block)
+                        blocker = asyncio.ensure_future(connection.execute("SELECT block_worker()"))
+                        assert await asyncio.to_thread(wedged.wait, GUARD_SECONDS)
+                        # Leaving this block runs the real lifespan's `finally`:
+                        # store.close() hits the (patched, short) bound with
+                        # the worker still blocked, and the exit decision
+                        # fires.
+            finally:
+                release.set()
+                if blocker is not None:
+                    await blocker
+                if worker is not None:
+                    await asyncio.to_thread(worker.join, GUARD_SECONDS)
+
+        assert exit_calls == [_FORCED_EXIT_CODE]
+        records = shutdown_warnings(caplog)
+        assert any("quarantined" in record.getMessage() for record in records)
+        assert any("Forcing exit" in record.getMessage() for record in records)

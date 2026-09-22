@@ -165,14 +165,15 @@ class ResolvedStore:
         store: The schema-ready ``SqliteEngravaCore`` to serve queries.
         _closer: Async callback that closes the store and, on the
             :data:`DB_PATH_ENV_VAR` launch, then the connection this server
-            opened for it.
+            opened for it.  Reports whether that connection close abandoned a
+            wedged worker rather than closing cleanly (see :meth:`aclose`).
 
     """
 
     store: SqliteEngravaCore
-    _closer: Callable[[], Awaitable[None]]
+    _closer: Callable[[], Awaitable[bool]]
 
-    async def aclose(self) -> None:
+    async def aclose(self) -> bool:
         """Close the store, then the underlying database connection.
 
         On the :data:`DB_PATH_ENV_VAR` launch the store is built around a
@@ -186,11 +187,39 @@ class ResolvedStore:
 
         If closing the store raises
         :class:`~engrava.ConnectionQuarantinedError`, a best-effort warning
-        carrying the library's reason is emitted and this method returns instead
-        of raising it.
+        carrying the library's reason is emitted and this method returns
+        ``False`` instead of raising it -- but only when that close does not
+        leave a wedged worker thread behind.  On the :data:`CONFIG_ENV_VAR`
+        launch it can: the store owns its connection there, so its own close
+        applies its own internal bound on the very same worker, and the
+        library's own :class:`~engrava.ConnectionQuarantinedError` raised
+        *from that close* is verified (at the library's own source) to mean
+        exactly that bound expiring with the physical close still not done --
+        never a benign quarantine for some unrelated reason.  That case is
+        caught and reported ``True`` before it ever reaches this method (see
+        :func:`resolve_store`'s own closer for the :data:`CONFIG_ENV_VAR`
+        launch); what reaches this ``except`` clause is therefore only ever
+        the :data:`DB_PATH_ENV_VAR` launch's own residual case, where the
+        store never owned the connection this server is asking about at all,
+        so a quarantine reported here carries no relationship to it.
 
         Warnings are best effort: an :class:`Exception` raised while emitting
         one is dropped and changes nothing else about the outcome.
+
+        Returns:
+            Whether the connection close abandoned a worker thread that never
+            answered within its bound, rather than closing cleanly -- either
+            :data:`_CONNECTION_CLOSE_TIMEOUT_SECONDS` on the
+            :data:`DB_PATH_ENV_VAR` launch, or the store's own
+            ``close_timeout_seconds`` on the :data:`CONFIG_ENV_VAR` launch.
+            ``False`` on a clean close, and on the
+            :class:`~engrava.ConnectionQuarantinedError` path above (the
+            :data:`DB_PATH_ENV_VAR` launch's residual case only -- see it for
+            why).  This is the fact ``server.py``'s ``lifespan`` uses to
+            decide whether the worker is genuinely wedged and the process
+            must force its own exit — callers that do not need that decision
+            (every test in ``tests/test_shutdown.py`` that calls this method
+            directly) are free to ignore it.
 
         Raises:
             Exception: Anything the store's close raises other than
@@ -203,9 +232,10 @@ class ResolvedStore:
 
         """
         try:
-            await self._closer()
+            return await self._closer()
         except ConnectionQuarantinedError as exc:
             _warn_softly(_STORE_QUARANTINED_AT_SHUTDOWN, exc.reason)
+            return False
 
 
 async def resolve_store() -> ResolvedStore:
@@ -230,7 +260,43 @@ async def resolve_store() -> ResolvedStore:
         if config.embeddings is None or config.embeddings.provider is None:
             logger.warning(_NO_PROVIDER_WARNING)
         store = await SqliteEngravaCore.from_config(config_path)
-        return ResolvedStore(store=store, _closer=store.close)
+
+        async def _closer() -> bool:
+            """Close the store, reporting whether its own bound abandoned a wedged worker.
+
+            The store owns its connection here, so ``store.close()`` performs
+            the whole close, including its own internal bound on that same
+            non-daemon aiosqlite worker thread.  Verified at the library's own
+            source (``SqliteEngravaCore.close`` / ``_finish_close_wait``): the
+            *only* place ``close()`` raises
+            :class:`~engrava.ConnectionQuarantinedError` from within itself is
+            when its own wait for the physical close exceeds
+            ``close_timeout_seconds`` with that task still not done -- the
+            task is never cancelled, only abandoned, so it keeps running (or
+            not) in the background exactly like :func:`_close_connection`
+            leaves the :data:`DB_PATH_ENV_VAR` route's own connection.  There
+            is therefore no other, benign reason for ``close()`` itself to
+            raise this here, and it is caught and reported as a wedge rather
+            than left to :meth:`ResolvedStore.aclose`'s own catch, which is
+            the correct default only for a caller that cannot make this same
+            guarantee (see the :data:`DB_PATH_ENV_VAR` route, where
+            ``store.close()`` never owns the connection at all).
+
+            Returns:
+                ``True`` when ``store.close()`` raised
+                :class:`~engrava.ConnectionQuarantinedError` -- always a report
+                of its own bound expiring with the worker not answering.
+                ``False`` on a clean close.
+
+            """
+            try:
+                await store.close()
+            except ConnectionQuarantinedError as exc:
+                _warn_softly(_STORE_QUARANTINED_AT_SHUTDOWN, exc.reason)
+                return True
+            return False
+
+        return ResolvedStore(store=store, _closer=_closer)
 
     db_path = os.environ.get(DB_PATH_ENV_VAR)
     if db_path:
@@ -367,7 +433,7 @@ async def _configure_connection(connection: aiosqlite.Connection) -> None:
     connection.row_factory = aiosqlite.Row
 
 
-async def _close_connection(connection: aiosqlite.Connection) -> None:
+async def _close_connection(connection: aiosqlite.Connection) -> bool:
     """Close a connection, giving up the wait after the bound.
 
     The bound is :data:`_CONNECTION_CLOSE_TIMEOUT_SECONDS`.  When it expires a
@@ -377,11 +443,18 @@ async def _close_connection(connection: aiosqlite.Connection) -> None:
     Args:
         connection: The connection to close.
 
+    Returns:
+        Whether the bound expired before the close finished -- an abandoned
+        wait on a worker that never answered, not a clean close.  The caller
+        decides what abandoning it means; this function only reports whether
+        it happened.
+
     """
     with anyio.move_on_after(_CONNECTION_CLOSE_TIMEOUT_SECONDS) as scope:
         await connection.close()
     if scope.cancelled_caught:
         _warn_softly(_CONNECTION_CLOSE_TIMED_OUT, _CONNECTION_CLOSE_TIMEOUT_SECONDS)
+    return scope.cancelled_caught
 
 
 async def _resolve_from_db_path(db_path: str) -> ResolvedStore:
@@ -454,7 +527,7 @@ async def _resolve_from_db_path(db_path: str) -> ResolvedStore:
             await connection.close()
         raise
 
-    async def _closer() -> None:
+    async def _closer() -> bool:
         """Close the store, then the connection this server opened for it.
 
         The connection goes second so a pending flush still has an open
@@ -468,6 +541,13 @@ async def _resolve_from_db_path(db_path: str) -> ResolvedStore:
         connection close then raises an :class:`Exception`, that is reported in
         a warning and the store's exception is what ``_closer`` raises; anything
         else the connection close raises propagates instead.
+
+        Returns:
+            Whether the connection close abandoned the connection at its bound
+            (see :func:`_close_connection`).  Not reported when the store's own
+            close raises -- this function re-raises that instead, and
+            :meth:`ResolvedStore.aclose` decides what to report for that case.
+
         """
         try:
             await store.close()
@@ -478,6 +558,6 @@ async def _resolve_from_db_path(db_path: str) -> ResolvedStore:
             except Exception:  # noqa: BLE001 - reported below; the store's error is re-raised
                 _warn_softly(_CONNECTION_CLOSE_FAILED, exc_info=True)
             raise
-        await _close_connection(connection)
+        return await _close_connection(connection)
 
     return ResolvedStore(store=store, _closer=_closer)

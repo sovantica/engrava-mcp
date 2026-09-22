@@ -39,6 +39,8 @@ dependencies = [
     # floor is 2.2.0, the version this port was tested against, and it
     # transitively constrains pydantic>=2.12,<3.
     "mcp>=2.2,<3",
+    # Used directly by server.py/config.py; declare instead of relying on mcp transitively.
+    "anyio>=4.9",
     # Default bundle for the bare `uvx engrava-mcp` (the registry one-click):
     # the vector backend plus the http-based embedding providers' dependency,
     # so semantic search and OpenAI/Ollama embeddings work out of the box once

@@ -58,6 +58,8 @@ from engrava import (
     DerivedRecordError,
     DeriveGates,
     EdgeType,
+    EmbeddingGenerationError,
+    EmbeddingModelMismatchError,
     EmbeddingQueryPrefixMismatchError,
     MindQLParseError,
     Priority,
@@ -148,6 +150,16 @@ _LEAK_MARKERS = (
     "EmbeddingQueryNotSupportedError",
     "OverflowError",
     "convert to SQLite INTEGER",
+    # Write-path auto-embed errors must not name their own types or echo
+    # EmbeddingModelMismatchError's / EmbeddingGenerationError's raw phrasing
+    # (which embeds the store's internal model bookkeeping, or -- for
+    # EmbeddingGenerationError -- the embedding provider's own diagnostic
+    # text verbatim).
+    "EmbeddingModelMismatchError",
+    "EmbeddingGenerationError",
+    "Embedding model mismatch:",
+    "Failed to auto-embed thought",
+    "was not produced",
     # The search-time embedding-mismatch errors must not name their own type
     # or echo the store's raw dimension integers / prefix values.
     "VectorDimensionMismatchError",
@@ -1465,6 +1477,223 @@ class TestUnusableStore:
         _assert_no_leak(text)
 
 
+class _FakeEmbeddingProvider:
+    """Minimal embedding provider for real write-path auto-embed reproductions.
+
+    Implements only the mandatory ``embed`` / ``embed_batch`` plus
+    ``dimension`` / ``model_name`` -- no role-aware prefixing -- so engrava's
+    own dispatch (``_embed_document``) falls back to plain ``embed``, the
+    common, unprefixed case. With ``failure`` set, every call raises it
+    instead of returning a vector.
+    """
+
+    def __init__(
+        self,
+        *,
+        dimension: int = 3,
+        model_name: str = "fake-embedder",
+        failure: BaseException | None = None,
+    ) -> None:
+        self.dimension = dimension
+        self.model_name = model_name
+        self._failure = failure
+
+    async def embed(self, text: str) -> list[float]:
+        if self._failure is not None:
+            raise self._failure
+        return [0.1] * self.dimension
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        if self._failure is not None:
+            raise self._failure
+        return [[0.1] * self.dimension for _ in texts]
+
+
+@asynccontextmanager
+async def _auto_embed_store(
+    *, provider: _FakeEmbeddingProvider, require_embedding: bool = False
+) -> AsyncIterator[SqliteEngravaCore]:
+    """Yield a fresh store with a real, write-path auto-embed configured.
+
+    Unlike the shared ``store`` fixture (no embedding provider, so
+    auto-embed never triggers), this wires ``provider`` in with
+    ``embeddings.auto_embed`` on, so ``create_thought`` / ``update_thought``
+    really call it through the genuine call path these tests reproduce,
+    rather than a stand-in for it.
+
+    Args:
+        provider: The embedding provider to configure.
+        require_embedding: Forwarded to ``SqliteEngravaCore`` as
+            ``require_embedding``.
+
+    Yields:
+        A store with no seeded thoughts, ready for ``create_thought`` /
+        ``update_thought`` calls.
+
+    """
+    connection = await aiosqlite.connect(":memory:")
+    connection.row_factory = aiosqlite.Row
+    await connection.execute("PRAGMA foreign_keys=ON")
+    backend = SqliteEngravaCore(
+        connection,
+        embedding_provider=provider,  # type: ignore[arg-type]
+        auto_embed=True,
+        require_embedding=require_embedding,
+    )
+    await backend.ensure_schema()
+    try:
+        yield backend
+    finally:
+        await connection.close()
+
+
+class TestEmbeddingModelMismatch:
+    """A write-path embedding whose model no longer matches this store's own.
+
+    ``EmbeddingModelMismatchError`` is raised by ``store_embedding`` (via
+    ``_ensure_embedding_model_lock``), reached through ``create_thought`` /
+    ``update_thought`` only when ``embeddings.auto_embed`` is on. By the time
+    it can fire, the thought row itself is already committed -- both commit
+    before auto-embed ever runs -- so the message must say the thought was
+    stored, never that the write failed.
+    """
+
+    async def test_direct_error_maps_to_a_config_correction_message(self) -> None:
+        err = EmbeddingModelMismatchError(
+            stored_model="internal-locked-model-v7",
+            configured_model="internal-configured-model-v9",
+            stored_dimension=384,
+            configured_dimension=768,
+        )
+        with pytest.raises(ToolError) as excinfo:
+            async with _tool_errors():
+                raise err
+
+        text = str(excinfo.value)
+        lowered = text.lower()
+        assert "stored" in lowered
+        assert "embedding" in lowered
+        assert "model" in lowered
+        assert "search_memory" in text
+        assert "retry" in lowered
+        assert "whoever operates this server" in lowered
+        # The store's own model names and raw dimensions are internal
+        # bookkeeping, not caller-actionable -- neither is echoed.
+        assert "internal-locked-model-v7" not in text
+        assert "internal-configured-model-v9" not in text
+        assert "384" not in text
+        assert "768" not in text
+        _assert_no_leak(text)
+
+    async def test_update_thought_reports_the_mismatch_over_the_wire_and_still_wrote_the_update(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider_a = _FakeEmbeddingProvider(dimension=3, model_name="provider-a-model")
+        async with _auto_embed_store(provider=provider_a) as backend:
+            await backend.create_thought(
+                make_thought(
+                    "thought-gamma",
+                    essence="Original essence",
+                    content="Original content.",
+                )
+            )
+            # provider_a's embed above locked this store's corpus identity at
+            # dimension 3. Swapping to a provider with a different dimension
+            # reproduces a store whose configured provider no longer matches
+            # what it already holds -- the only condition this check exists
+            # to catch, per its own docstring.
+            monkeypatch.setattr(
+                backend,
+                "_embedding_provider",
+                _FakeEmbeddingProvider(dimension=5, model_name="provider-b-model"),
+            )
+
+            async with _client_for(backend) as client:
+                result = await client.call_tool(
+                    "update_thought",
+                    {"thought_id": "thought-gamma", "essence": "Updated essence"},
+                )
+
+            # State first: the update was applied despite the embedding failure --
+            # update_thought commits before auto-embed ever runs.
+            read_back = await backend.get_thought("thought-gamma")
+            assert read_back is not None
+            assert read_back.essence == "Updated essence"
+
+            assert result.is_error is True
+            text = _error_text(result.content)
+            lowered = text.lower()
+            assert "stored" in lowered
+            assert "embedding" in lowered
+            assert "provider-a-model" not in text
+            assert "provider-b-model" not in text
+            _assert_no_leak(text)
+
+
+class TestEmbeddingGenerationRequired:
+    """A write-path embedding failure under ``embeddings.require_embedding``.
+
+    ``EmbeddingGenerationError`` is raised by ``_on_auto_embed_failure`` only
+    when ``embeddings.require_embedding`` is also on; its own message embeds
+    the provider's raw exception text verbatim, so ``_tool_errors`` must
+    never echo it. The thought row is already committed by the time this can
+    fire -- require_embedding's fail-fast does not undo the write.
+    """
+
+    async def test_direct_error_maps_to_a_required_embedding_message(self) -> None:
+        err = EmbeddingGenerationError(
+            "thought-with-a-secret-id", "provider raw diagnostic sk-live-FAKESECRET0000"
+        )
+        with pytest.raises(ToolError) as excinfo:
+            async with _tool_errors():
+                raise err
+
+        text = str(excinfo.value)
+        lowered = text.lower()
+        assert "stored" in lowered
+        assert "embedding" in lowered
+        assert "require" in lowered
+        assert "search_memory" in text
+        assert "re-embedded" in lowered
+        # The provider's raw diagnostic text, embedded verbatim in this
+        # type's own message, must never reach the client.
+        assert "provider raw diagnostic" not in text
+        assert "sk-live-FAKESECRET0000" not in text
+        assert "thought-with-a-secret-id" not in text
+        _assert_no_leak(text)
+
+    async def test_store_thought_reports_the_failure_over_the_wire_and_still_stored_it(
+        self,
+    ) -> None:
+        secret = "sk-live-FAKESECRET1111111111"  # noqa: S105 -- fabricated, not real
+        provider = _FakeEmbeddingProvider(failure=RuntimeError(f"upstream rejected key {secret}"))
+        async with _auto_embed_store(provider=provider, require_embedding=True) as backend:
+            async with _client_for(backend) as client:
+                result = await client.call_tool(
+                    "store_thought",
+                    {
+                        "essence": "Requires embedding",
+                        "content": "This write's auto-embed fails under require_embedding.",
+                        "thought_id": "thought-requires-embedding",
+                    },
+                )
+
+            # State first: the thought was stored despite require_embedding's
+            # fail-fast -- create_thought commits before auto-embed ever runs.
+            read_back = await backend.get_thought("thought-requires-embedding")
+            assert read_back is not None
+            assert read_back.essence == "Requires embedding"
+
+            assert result.is_error is True
+            text = _error_text(result.content)
+            lowered = text.lower()
+            assert "stored" in lowered
+            assert "embedding" in lowered
+            assert secret not in text
+            assert "upstream rejected key" not in text
+            _assert_no_leak(text)
+
+
 class _FixedDimensionProvider:
     """A minimal embedding-provider double that produces a fixed-size vector.
 
@@ -2154,22 +2383,6 @@ _OUT_OF_SCOPE: dict[str, str] = {
         "search) and the provider has no public one; the only providers this "
         "server can be given, through an engrava.yaml, are the four built-in "
         "ones, and all four have it"
-    ),
-    "EmbeddingModelMismatchError": (
-        "raised by the first embedding a store writes (store_thought or "
-        "update_thought, when the engrava.yaml turns on embeddings.auto_embed "
-        "with a provider), not when the store opens -- nothing on this server's "
-        "startup path checks the model; the check compares the embedding metadata "
-        "the database already stores (model name, vector length, document-prefix "
-        "fingerprint) with what the configured provider actually produces at that "
-        "first write, and raises when they differ, whatever made them differ"
-    ),
-    "EmbeddingGenerationError": (
-        "raised by store_thought or update_thought only when the engrava.yaml "
-        "this server is pointed at turns on embeddings.auto_embed and "
-        "embeddings.require_embedding and the embedding provider then fails; "
-        "with either off, or with no provider (the bare ENGRAVA_DB_PATH launch), "
-        "this type is never raised"
     ),
     "JournalIntegrityError": (
         "raised only by from_config's on-open journal verification, before the "

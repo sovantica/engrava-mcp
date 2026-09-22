@@ -130,6 +130,8 @@ from engrava import (
     DuplicateEdgeError,
     EdgeRecord,
     EdgeType,
+    EmbeddingGenerationError,
+    EmbeddingModelMismatchError,
     EmbeddingQueryPrefixMismatchError,
     EngravaError,
     FieldOp,
@@ -808,13 +810,17 @@ async def _tool_errors() -> AsyncIterator[None]:  # noqa: C901, PLR0912, PLR0915
     long-running write ahead of this one) and a store that has become
     unusable and needs a restart. A numeric argument that overflows SQLite's own
     bound-integer range gets a generic but honest message, since the raw
-    ``OverflowError`` carries no argument name to attribute it to. A
-    ``search_memory`` whose configured embedding provider no longer matches
-    what the store declares or holds -- a changed vector size, or a changed
-    query prefix on an asymmetric model -- is likewise mapped rather than
-    left as an internal store message; both are read-path, configuration-only
-    conditions, so the messages report no result and no change rather than
-    suggesting a retry.
+    ``OverflowError`` carries no argument name to attribute it to. A write-path
+    embedding failure under ``embeddings.auto_embed`` (a model, vector-size or
+    document-prefix mismatch against what this store's embeddings were built
+    with, or a provider failure under ``embeddings.require_embedding``) is
+    likewise mapped, in both cases stating that the thought text was
+    nonetheless stored and only its embedding is missing. A ``search_memory``
+    whose configured embedding provider no longer matches what the store
+    declares or holds -- a changed vector size, or a changed query prefix on
+    an asymmetric model -- is likewise mapped rather than left as an internal
+    store message; both are read-path, configuration-only conditions, so the
+    messages report no result and no change rather than suggesting a retry.
     A ``store_thought`` whose configured derived-records producer rejects its
     own output (``DerivedRecordError``, over-cap or an identity collision)
     or fails outright while running (an unnamed exception, only reachable
@@ -850,6 +856,53 @@ async def _tool_errors() -> AsyncIterator[None]:  # noqa: C901, PLR0912, PLR0915
         # states why (raw vector bytes have no JSON representation) and what
         # to query instead; echoing it keeps that wording in one place.
         raise ToolError(str(exc)) from exc
+    except EmbeddingModelMismatchError as exc:
+        # store_thought / update_thought with embeddings.auto_embed on: fires
+        # from the first embedding this store instance ever writes (never on
+        # startup -- nothing on this server's own startup path checks the
+        # model). The thought row itself is already committed by the time
+        # this can fire (create_thought / update_thought both commit before
+        # auto-embed ever runs -- see _on_auto_embed_failure's own
+        # docstring), so only the embedding write is what failed. The check
+        # compares the embedding metadata this store already has on record
+        # (model name, vector size, and document-prefix fingerprint) against
+        # what the configured provider produces now, and raises on any
+        # difference -- the raw values are the store's own internal
+        # bookkeeping, not something the caller supplied, and the check does
+        # not distinguish what produced the difference, so neither is echoed
+        # or guessed at here.
+        msg = (
+            "The thought was stored, but its embedding could not be written: "
+            "this store's existing embeddings were built with a different "
+            "model, vector size, or document prefix than the embedding "
+            "provider now configured for this server produces. Semantic "
+            "search (search_memory) will not find this thought, and every "
+            "future write's auto-embed will fail the same way until the "
+            "mismatch is fixed. Retrying will not help -- the embedding "
+            "configuration needs to be corrected (or restored), or a "
+            "matching database used, by whoever operates this server."
+        )
+        raise ToolError(msg) from exc
+    except EmbeddingGenerationError as exc:
+        # store_thought / update_thought, and only when embeddings.auto_embed
+        # AND embeddings.require_embedding are both on. This type's own
+        # message embeds str() of the provider's original exception verbatim
+        # (see its __init__), which may carry provider-internal detail, so it
+        # is never echoed here. The thought row is already committed by the
+        # time this can fire (see this type's own docstring: create_thought /
+        # update_thought commit before auto-embed ever runs), so
+        # require_embedding's fail-fast does not undo the write -- only the
+        # embedding is missing.
+        msg = (
+            "The thought was stored, but its embedding could not be "
+            "generated (this server requires embeddings -- "
+            "embeddings.require_embedding is enabled). Semantic search "
+            "(search_memory) will not find this thought until it is "
+            "re-embedded -- update its essence or content again once the "
+            "provider issue is resolved, to trigger a fresh embed attempt, "
+            "or report the failure to whoever operates this server."
+        )
+        raise ToolError(msg) from exc
     except VectorDimensionMismatchError as exc:
         # search_hybrid gathers its lexical (FTS5) arm before its vector arm,
         # so whenever FTS5 is available and query_text is non-empty (the
@@ -1968,6 +2021,12 @@ async def store_thought_impl(
         ValueError: If a caller-supplied ``thought_id`` collides with an
             existing thought (only reachable with ``deduplicate=False``,
             since the dedup path resolves by content hash, not id).
+        EmbeddingModelMismatchError: If ``embeddings.auto_embed`` is on and
+            this store's existing embeddings were built with a different
+            model, vector size, or document prefix.
+        EmbeddingGenerationError: If ``embeddings.auto_embed`` and
+            ``embeddings.require_embedding`` are both on and the embedding
+            provider fails.
         DerivedRecordError: If the engrava.yaml this server is pointed at
             turns on derived records with a hooks class and a failure
             policy of ``"raise"``, and the producer's return is rejected
@@ -2039,6 +2098,13 @@ async def update_thought_impl(
         ThoughtNotFoundError: If no thought has the given identifier.
         StaleDataError: If the thought changed concurrently.
         InvalidTransitionError: If the lifecycle change is not permitted.
+        EmbeddingModelMismatchError: If ``essence`` or ``content`` changes,
+            ``embeddings.auto_embed`` is on, and this store's existing
+            embeddings were built with a different model, vector size, or
+            document prefix.
+        EmbeddingGenerationError: If ``essence`` or ``content`` changes,
+            ``embeddings.auto_embed`` and ``embeddings.require_embedding``
+            are both on, and the embedding provider fails.
 
     """
     changes: dict[str, object] = {}

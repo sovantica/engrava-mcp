@@ -13,10 +13,10 @@ from engrava import (
     EdgeType,
     LifecycleStatus,
     Priority,
-    ThoughtNotFoundError,
     ThoughtType,
 )
 from engrava.domain.exceptions import DuplicateEdgeError, ReferentialIntegrityError
+from mcp.server.mcpserver.exceptions import ToolError
 
 from engrava_mcp.server import (
     get_thought_impl,
@@ -133,7 +133,12 @@ class TestUpdateThought:
         assert after_thought["priority"] == "P3"
 
     async def test_missing_thought_raises(self, store: SqliteEngravaCore) -> None:
-        with pytest.raises(ThoughtNotFoundError):
+        # update_thought_impl wraps store.update_thought in the residual write
+        # guard (see _residual_write_guard), which classifies every exception
+        # through _tool_errors's own chain -- including a curated one like
+        # ThoughtNotFoundError -- and re-raises the resulting ToolError, even
+        # called directly outside a tool's own _tool_errors context.
+        with pytest.raises(ToolError, match="No thought exists with id"):
             await update_thought_impl(store, "does-not-exist", essence="x")
 
 

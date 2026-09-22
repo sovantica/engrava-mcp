@@ -133,7 +133,6 @@ from engrava import (
     EmbeddingGenerationError,
     EmbeddingModelMismatchError,
     EmbeddingQueryPrefixMismatchError,
-    EngravaError,
     FieldOp,
     FieldPredicate,
     InvalidFilterError,
@@ -620,123 +619,126 @@ def _check_prompt_bound(name: str, value: int, *, minimum: int, maximum: int | N
 _SQLITE_CONSTRAINT_PRIMARYKEY = 1555
 
 
-#: Exception types a derive-records write guard (:func:`_derive_producer_guard`)
-#: must never mistake for an unnamed producer failure, because :func:`_tool_errors`
-#: already gives each of them its own curated branch. Every typed engrava
-#: exception shares the :class:`~engrava.EngravaError` base, so naming that base
-#: once covers all of them -- including :class:`~engrava.DerivedRecordError`
-#: itself, which is what stops a real one from being re-wrapped as the generic
-#: producer-failure case. The remaining members cover the failure modes
-#: reachable from ``store.create_thought`` that are not an
-#: :class:`~engrava.EngravaError` subclass: engrava's own bare ``ValueError``
-#: (a duplicate ``thought_id``), pydantic's ``ValidationError`` (itself a
-#: ``ValueError`` subclass, named explicitly for clarity), ``sqlite3.IntegrityError``,
-#: ``OverflowError``, this module's own :class:`StoreNotReadyError` (a
-#: ``RuntimeError``, not an :class:`~engrava.EngravaError`), and
-#: :class:`~engrava.MindQLParseError` (a bare ``Exception`` subclass, not
-#: even a ``ValueError``). None of the last two can be *produced by*
-#: ``store.create_thought`` itself today -- ``StoreNotReadyError`` comes from
-#: :meth:`StoreProvider.require`, called strictly before the guarded call,
-#: never from inside it; ``MindQLParseError`` comes from MindQL parsing and
-#: execution, which the write path never invokes at all -- elsewhere in this
-#: module or in engrava, either type may have other raise sites, which is
-#: irrelevant here since none of them sit inside this guard's own ``try``.
-#: This tuple is hand-maintained, not derived; see
-#: ``TestDeriveProducerGuardExclusionCompleteness`` in ``test_errors.py`` for
-#: the check that keeps it in sync with :func:`_tool_errors`'s own branches.
-#:
-#: A second guard exists here rather than one shared with a write-path
-#: auto-embed guard because the two residual cases are reached from
-#: different, sequential phases of the same ``store.create_thought`` call
-#: (auto-embed runs, then the derived-records dispatch runs, and only one of
-#: them can be the source of any given call's failure) -- see this guard's
-#: own docstring for why an outside wrapper cannot attribute a residual
-#: exception to one phase over the other without narrowing what it excludes
-#: to just its own phase's already-named exceptions.
-_ALREADY_HANDLED_DERIVE_EXCEPTIONS: tuple[type[BaseException], ...] = (
-    EngravaError,
-    ValueError,
-    ValidationError,
-    sqlite3.IntegrityError,
-    OverflowError,
-    StoreNotReadyError,
-    MindQLParseError,
-)
+class _ResidualWriteError(Exception):
+    """Wraps a write-path exception :func:`_tool_errors`'s own chain does not curate.
 
+    :func:`_residual_write_guard` wraps both ``store.create_thought`` (in
+    :func:`store_thought_impl`) and ``store.update_thought`` (in
+    :func:`update_thought_impl`) -- one guard, phase-agnostic: nothing here
+    distinguishes which of a call's several post-commit steps raised, or
+    whether the exception fired before the write's own commit or after it.
+    "Residual" is defined by what :func:`_tool_errors`'s own chain does with
+    the exception, not by a hand-maintained list of types: the chain re-raised
+    it unchanged (its type is unnamed, or it is a named type no branch
+    curates -- a bare ``ValueError`` matching neither recognised prefix, an
+    unrecognised ``sqlite3.IntegrityError``, an unbranched
+    :class:`~engrava.EngravaError` subclass), or classifying it raised
+    something new (an extension's ``__str__`` that itself raises, say), or the
+    guarded call raised a :class:`ToolError` itself, which the chain has no
+    branch for and so passes through unchanged. See
+    :func:`_residual_write_guard` for how that is decided.
 
-class _DeriveProducerFailedError(Exception):
-    """Wraps a derive-records producer's own raised exception, whose type is unnamed.
+    Because a residual exception may have fired either before or after the
+    write's own commit, and this guard cannot tell which, the message this
+    maps to (see :func:`_tool_errors`) never states whether the write took
+    effect, and never names a step -- neither is something this server can
+    know from here.
 
-    ``SqliteEngravaCore``'s ``_collect_derived`` re-raises, bare and
-    unwrapped, whatever the configured derive-records producer's own
-    ``derive_records()`` call raises -- or whatever raises while consuming
-    the sequence it returns -- whenever ``DeriveGates.on_error`` is
-    ``"raise"`` (the non-default policy; the default, ``"log"``, never
-    raises through this path at all). That exception's type belongs to the
-    producer, an operator-supplied extension, not to engrava, and cannot be
-    known in advance, so it cannot be named in an ``except <EngravaType>``
-    branch the way :class:`~engrava.DerivedRecordError` is.
+    The original exception is kept only in exception chaining and is never
+    copied into the client-facing message this maps to: neither its type
+    name nor its text reaches the client. An unnamed exception may belong to
+    an operator-supplied extension and carry detail that extension composed,
+    not a diagnostic string engrava wrote.
 
-    :func:`_derive_producer_guard` is what produces this: wrapped narrowly
-    around just the ``store.create_thought`` call in
-    :func:`store_thought_impl` (``DerivedRecordError`` is reachable only
-    through ``store_thought``, never ``update_thought``), it re-raises every
-    exception :func:`_tool_errors` already names above unchanged (see
-    :data:`_ALREADY_HANDLED_DERIVE_EXCEPTIONS`) and wraps only what is left
-    over in this type, so :func:`_tool_errors` has something to name for it.
-
-    The original exception is kept only as ``__cause__``. Its own message is
-    deliberately never read anywhere on this path: it is composed by an
-    operator-supplied producer, not a diagnostic string engrava wrote, so it
-    must not reach the client.
+    Args:
+        tool: Which tool's write raised -- ``"store_thought"`` or
+            ``"update_thought"`` -- so :func:`_tool_errors` states the right
+            fact (stored, or applied) as unconfirmed.
+        thought_id: The identifier the write attempted: the caller-supplied
+            or server-generated id for ``store_thought``, or the caller's own
+            id for ``update_thought``. Not an internal value, so it is safe
+            to hand back as the id to check.
+        deduplicate: The ``store_thought`` call's own ``deduplicate`` value.
+            Unused for ``update_thought``, which has no such argument: the
+            asymmetry in what reading ``thought_id`` back can prove applies
+            only to ``store_thought``.
 
     """
 
-    def __init__(self) -> None:
-        super().__init__(
-            "derive-records producer failed with an exception type engrava-mcp does not name"
-        )
+    def __init__(
+        self,
+        *,
+        tool: Literal["store_thought", "update_thought"],
+        thought_id: str,
+        deduplicate: bool = False,
+    ) -> None:
+        self.tool = tool
+        self.thought_id = thought_id
+        self.deduplicate = deduplicate
+        super().__init__(f"{tool} raised an exception type engrava-mcp does not classify")
 
 
 @asynccontextmanager
-async def _derive_producer_guard() -> AsyncIterator[None]:
-    """Narrow a derive-records producer's own failure to a type ``_tool_errors`` can name.
+async def _residual_write_guard(
+    *,
+    tool: Literal["store_thought", "update_thought"],
+    thought_id: str,
+    deduplicate: bool = False,
+) -> AsyncIterator[None]:
+    """Classify a write failure once, and wrap it only if nothing curates it.
 
-    Wraps only the ``store.create_thought`` call itself -- not
-    :func:`_tool_errors`'s own ``try`` block, which also covers this
-    module's own argument handling and would turn a genuine bug in this
-    server's own code into a misleading "derived record failed" message.
-    Because Python tries ``except`` clauses in source order against the
-    first matching type, a bare ``except Exception`` placed anywhere in
-    :func:`_tool_errors`'s existing chain would also swallow every branch
-    below it -- this guard exists specifically so the unnamed case can be
-    caught without doing that.
+    Wraps only the ``store.create_thought`` / ``store.update_thought`` call
+    itself -- not :func:`_tool_errors`'s own ``try`` block, which also covers
+    this module's own argument handling and would turn a genuine bug in this
+    server's own code into a misleading write-failure message.
 
-    Every exception already named in a :func:`_tool_errors` branch above --
-    see :data:`_ALREADY_HANDLED_DERIVE_EXCEPTIONS` -- is re-raised here
-    unchanged, so it still reaches its own specific handler there
-    (including :class:`~engrava.DerivedRecordError` itself). Only the
-    residual (by construction, the derive-records producer's own exception,
-    re-raised bare by ``_collect_derived`` under ``on_error="raise"``; see
-    :class:`_DeriveProducerFailedError`) is wrapped.
+    Classification keeps no list of its own. It runs :func:`_tool_errors`'s
+    own ordered chain exactly once, by re-raising the caught exception
+    (``exc``) inside a nested ``async with _tool_errors():``. Every current
+    mapping branch there raises ``ToolError(msg) from exc``, so a caught
+    :class:`ToolError` whose ``__cause__ is exc`` is a curated result --
+    re-raised here unchanged, and passed through untouched by the real,
+    outer :func:`_tool_errors` this function's own caller runs inside, since
+    no branch there matches a :class:`ToolError` either (it derives from
+    ``MCPServerError`` -> ``Exception``, and the chain has no broad catch).
+    Anything else is residual: the same exception re-raised unchanged
+    because no branch names its type, a new exception raised while a branch
+    was composing its message (a throwing ``__str__``, say), or a
+    :class:`ToolError` the guarded call raised itself -- indistinguishable
+    from a curated one by type alone, but its ``__cause__`` cannot be
+    ``exc``, since no branch catches ``ToolError``.
+
+    Args:
+        tool: Forwarded to :class:`_ResidualWriteError`.
+        thought_id: Forwarded to :class:`_ResidualWriteError`.
+        deduplicate: Forwarded to :class:`_ResidualWriteError`.
 
     Yields:
         ``None``; the caller runs the guarded store call inside the ``with``.
 
     Raises:
-        _DeriveProducerFailedError: When the guarded call raises anything not
-            already named in a :func:`_tool_errors` branch.
+        _ResidualWriteError: When the guarded call raises anything
+            :func:`_tool_errors`'s own chain does not curate.
 
     """
     try:
         yield
-    except _ALREADY_HANDLED_DERIVE_EXCEPTIONS:
-        raise
-    # The producer may raise any type; wrapped here, never swallowed --
-    # _tool_errors's own branch for _DeriveProducerFailedError is what turns
-    # it into a client-facing message.
-    except Exception as exc:
-        raise _DeriveProducerFailedError from exc
+    except Exception as exc:  # noqa: BLE001 -- must classify whatever the store call
+        # raises, including a type this module has never seen; that is what
+        # _ResidualWriteError exists for.
+        try:
+            async with _tool_errors():
+                raise  # re-raises exc, which is still the exception being handled here
+        except ToolError as out:
+            if out.__cause__ is exc:
+                raise
+            raise _ResidualWriteError(
+                tool=tool, thought_id=thought_id, deduplicate=deduplicate
+            ) from exc
+        except Exception:  # noqa: BLE001 -- same reason as the outer clause above
+            raise _ResidualWriteError(
+                tool=tool, thought_id=thought_id, deduplicate=deduplicate
+            ) from exc
 
 
 # C901 (mccabe complexity), PLR0912 (branch count), and PLR0915 (statement
@@ -822,12 +824,15 @@ async def _tool_errors() -> AsyncIterator[None]:  # noqa: C901, PLR0912, PLR0915
     store message; both are read-path, configuration-only conditions, so the
     messages report no result and no change rather than suggesting a retry.
     A ``store_thought`` whose configured derived-records producer rejects its
-    own output (``DerivedRecordError``, over-cap or an identity collision)
-    or fails outright while running (an unnamed exception, only reachable
-    wrapped as :class:`_DeriveProducerFailedError`; see
-    :func:`_derive_producer_guard`) is likewise mapped, in both cases
-    stating that the thought itself was nonetheless stored and only its
-    derived record is missing.
+    own output (``DerivedRecordError``, over-cap or an identity collision) is
+    likewise mapped, stating that the thought itself was nonetheless stored
+    and only its derived record is missing. A ``store_thought`` or
+    ``update_thought`` write that ends with an exception this function's own
+    chain does not otherwise curate -- reachable only wrapped as
+    :class:`_ResidualWriteError`; see :func:`_residual_write_guard` -- gets a
+    message that states neither which step raised nor whether the write took
+    effect, because a residual exception may have fired either before or
+    after the write's own commit, and this function cannot tell which.
 
     Yields:
         ``None``; the caller runs the guarded tool body inside the ``with``.
@@ -1088,30 +1093,55 @@ async def _tool_errors() -> AsyncIterator[None]:  # noqa: C901, PLR0912, PLR0915
             "the server."
         )
         raise ToolError(msg) from exc
-    except _DeriveProducerFailedError as exc:
-        # store_thought only, and only when the engrava.yaml this server is
-        # pointed at turns on derived records with a hooks class and a
-        # failure policy of raise: the producer's own derive_records() call
-        # -- or the consumption of its returned sequence -- raised
-        # something other than DerivedRecordError, and engrava re-raises
-        # that exception bare, unwrapped. Its type belongs to an
-        # operator-supplied extension and cannot be known in advance, so it
-        # cannot be named in an except <EngravaType> branch the way
-        # DerivedRecordError is above; see _DeriveProducerFailedError and
-        # _derive_producer_guard for how it reaches this branch at all. The
-        # producer's own exception text is never read: it may carry detail
-        # the producer itself composed, not a diagnostic string engrava
-        # wrote, so it must not reach the client. The thought row is
-        # already committed by the time this can fire, for the same reason
-        # as the DerivedRecordError branch above.
-        msg = (
-            "The thought itself was stored successfully, but a derived "
-            "record could not be produced for it: the derive-records "
-            "producer this server is configured with failed while running. "
-            "This is a property of the server's derived-records "
-            "configuration, not of the fields you supplied -- report it to "
-            "whoever operates the server."
-        )
+    except _ResidualWriteError as exc:
+        # store_thought / update_thought: the write ended with an exception
+        # _residual_write_guard's classification (running it once through
+        # this function's own chain) did not curate -- an unnamed type, a
+        # named type no branch above recognises, a failure raised while
+        # classifying it, or a ToolError the guarded call raised itself. It
+        # may have fired before the write's own commit (an error on the
+        # thought row's own INSERT) or after it (every other step either
+        # call can reach) -- this function cannot tell which, so the message
+        # never states whether the write took effect, and never names which
+        # step raised. exc.thought_id is the id the write attempted -- the
+        # caller's own, or the one this server generated for store_thought --
+        # not an internal value, so it is safe to hand back as the id to
+        # check. exc.deduplicate only changes what checking that id back can
+        # prove, and only for store_thought.
+        if exc.tool == "update_thought":
+            msg = (
+                f"update_thought for {exc.thought_id!r} ended with an error "
+                "this server does not recognise, so whether the update was "
+                "applied could not be confirmed. Read the thought back with "
+                "get_thought before retrying. The error may originate in "
+                "engrava itself, or in an extension this server's "
+                "engrava.yaml configures -- this server cannot tell which "
+                "from here."
+            )
+        elif exc.deduplicate:
+            msg = (
+                f"store_thought for {exc.thought_id!r} (deduplicate=True) "
+                "ended with an error this server does not recognise, so "
+                "whether the thought was stored could not be confirmed. "
+                "With deduplicate=True the call may have matched an "
+                f"existing thought with identical content instead of "
+                f"storing a new one, so reading {exc.thought_id!r} back "
+                "with get_thought cannot settle what happened: finding it "
+                "shows a thought with that id exists, not that this call "
+                "stored it. The error may originate in engrava itself, or "
+                "in an extension this server's engrava.yaml configures -- "
+                "this server cannot tell which from here."
+            )
+        else:
+            msg = (
+                f"store_thought for {exc.thought_id!r} ended with an error "
+                "this server does not recognise, so whether the thought was "
+                "stored could not be confirmed. Read it back with "
+                "get_thought before retrying -- a blind retry can store a "
+                "second copy. The error may originate in engrava itself, or "
+                "in an extension this server's engrava.yaml configures -- "
+                "this server cannot tell which from here."
+            )
         raise ToolError(msg) from exc
     except ReferentialIntegrityError as exc:
         msg = (
@@ -2018,24 +2048,23 @@ async def store_thought_impl(
         existing record, its identifier is returned.
 
     Raises:
-        ValueError: If a caller-supplied ``thought_id`` collides with an
-            existing thought (only reachable with ``deduplicate=False``,
-            since the dedup path resolves by content hash, not id).
-        EmbeddingModelMismatchError: If ``embeddings.auto_embed`` is on and
-            this store's existing embeddings were built with a different
-            model, vector size, or document prefix.
-        EmbeddingGenerationError: If ``embeddings.auto_embed`` and
-            ``embeddings.require_embedding`` are both on and the embedding
-            provider fails.
-        DerivedRecordError: If the engrava.yaml this server is pointed at
-            turns on derived records with a hooks class and a failure
-            policy of ``"raise"``, and the producer's return is rejected
-            (over-cap, or an identity collision with the source thought or
-            with an unrelated stored thought).
-        _DeriveProducerFailedError: Same configuration as above, when the
-            producer's own ``derive_records()`` call fails instead --
-            wraps the producer's own, otherwise-unnamed exception (see
-            :func:`_derive_producer_guard`).
+        ValidationError: If a supplied field fails domain validation while
+            :class:`~engrava.ThoughtRecord` is constructed -- before the
+            guarded store call, so this propagates unchanged, never reshaped
+            by :func:`_residual_write_guard`.
+        ToolError: If ``store.create_thought`` raises an exception
+            :func:`_tool_errors`'s own chain curates -- a caller-supplied
+            ``thought_id`` colliding with an existing thought, an
+            embedding-model mismatch, a required embedding's provider
+            failing, or a rejected derived record, among others -- reached
+            through :func:`_residual_write_guard`'s classification, carrying
+            that branch's own curated message.
+        _ResidualWriteError: If ``store.create_thought`` fails and
+            classifying that failure through the :func:`_tool_errors` chain
+            does not yield a curated message -- the chain re-raised it, or
+            raised something else while classifying it. Whether the thought
+            was stored could not be confirmed (see
+            :func:`_residual_write_guard`).
 
     """
     record = ThoughtRecord(
@@ -2050,7 +2079,9 @@ async def store_thought_impl(
         source=source,
         confidence=confidence,
     )
-    async with _derive_producer_guard():
+    async with _residual_write_guard(
+        tool="store_thought", thought_id=record.thought_id, deduplicate=deduplicate
+    ):
         created = await store.create_thought(record, deduplicate=deduplicate)
     return {
         "thought": {
@@ -2095,16 +2126,19 @@ async def update_thought_impl(
         ``thought_id``, ``essence``, ``priority`` and ``lifecycle_status``.
 
     Raises:
-        ThoughtNotFoundError: If no thought has the given identifier.
-        StaleDataError: If the thought changed concurrently.
-        InvalidTransitionError: If the lifecycle change is not permitted.
-        EmbeddingModelMismatchError: If ``essence`` or ``content`` changes,
-            ``embeddings.auto_embed`` is on, and this store's existing
-            embeddings were built with a different model, vector size, or
-            document prefix.
-        EmbeddingGenerationError: If ``essence`` or ``content`` changes,
-            ``embeddings.auto_embed`` and ``embeddings.require_embedding``
-            are both on, and the embedding provider fails.
+        ToolError: If ``store.update_thought`` raises an exception
+            :func:`_tool_errors`'s own chain curates -- a missing thought, a
+            concurrent-write conflict, an illegal lifecycle transition, an
+            embedding-model mismatch, or a required embedding's provider
+            failing, among others -- reached through
+            :func:`_residual_write_guard`'s classification, carrying that
+            branch's own curated message.
+        _ResidualWriteError: If ``store.update_thought`` fails and
+            classifying that failure through the :func:`_tool_errors` chain
+            does not yield a curated message -- the chain re-raised it, or
+            raised something else while classifying it. Whether the update
+            was applied could not be confirmed (see
+            :func:`_residual_write_guard`).
 
     """
     changes: dict[str, object] = {}
@@ -2119,7 +2153,8 @@ async def update_thought_impl(
     if confidence is not None:
         changes["confidence"] = confidence
 
-    updated = await store.update_thought(thought_id, **changes)
+    async with _residual_write_guard(tool="update_thought", thought_id=thought_id):
+        updated = await store.update_thought(thought_id, **changes)
     return {
         "thought": {
             "thought_id": updated.thought_id,

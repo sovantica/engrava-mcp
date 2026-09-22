@@ -40,11 +40,9 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import builtins
 import inspect
 import re
 import sqlite3
-import sys
 import textwrap
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, NoReturn
@@ -61,7 +59,6 @@ from engrava import (
     EmbeddingGenerationError,
     EmbeddingModelMismatchError,
     EmbeddingQueryPrefixMismatchError,
-    MindQLParseError,
     Priority,
     SqliteEngravaCore,
     StaleDataError,
@@ -84,7 +81,6 @@ from engrava_mcp.server import (
     SQLITE_MAX_BOUND_INT,
     EmbeddingQueryNotSupportedError,
     StoreProvider,
-    _DeriveProducerFailedError,
     _query_declares_find,
     _tool_errors,
     link_thoughts_impl,
@@ -171,10 +167,13 @@ _LEAK_MARKERS = (
     # DerivedRecordError's raw message names its own type's wrapping and the
     # library's internal per-reason phrasing; none of it may reach the client.
     "DerivedRecordError",
-    "_DeriveProducerFailedError",
     "max_derived_per_source",
     "identity collides with",
     "[source=",
+    # The residual write guard must not name its own private type, or the
+    # exception type/text of whatever it wrapped.
+    "_ResidualWriteError",
+    "does not classify",
 )
 
 #: Phrases that would wrongly suggest raw SQL is runnable over the wire.
@@ -2155,207 +2154,689 @@ class TestDerivedRecordForeignCollision:
             _assert_no_leak(text)
 
 
-class TestDeriveProducerException:
-    """The derive-records producer's own ``derive_records`` call raises.
+# ---------------------------------------------------------------------------
+# store_thought / update_thought: the phase-agnostic residual write guard.
+# ---------------------------------------------------------------------------
 
-    Not a ``DerivedRecordError`` -- the producer's own exception type,
-    which engrava's ``_collect_derived`` re-raises bare (unwrapped) under
-    ``on_error="raise"``. Its type belongs to an operator-supplied
-    extension and cannot be named in a ``_tool_errors`` except clause in
-    advance, so :func:`engrava_mcp.server._derive_producer_guard` wraps it
-    in :class:`engrava_mcp.server._DeriveProducerFailedError` first.
+
+class _UnclassifiedError(Exception):
+    """Stand-in for an exception type this server does not classify.
+
+    Deliberately not an :class:`~engrava.EngravaError` subclass, not a
+    ``ValueError``, and not anything else a :func:`_tool_errors` branch
+    names -- the point is that its type is unknown to this server, exactly
+    like an operator-supplied extension's own exception would be.
     """
 
-    async def test_reports_a_clean_message_and_never_leaks_the_producers_own_text(
-        self,
-    ) -> None:
-        class _ProducerBoomError(RuntimeError):
-            """The producer's own exception type -- unknown to this server."""
 
-        producer_diagnostic = "proprietary producer diagnostic, never for the client"
+class _ThrowingStrError(ValueError):
+    """A ``ValueError`` whose own ``__str__`` raises.
+
+    Reproduces a classification failure rather than a recognised or excused
+    exception: the generic ``ValueError`` branch in ``_tool_errors`` calls
+    ``str(exc)`` to check the message prefix, and this makes that call
+    itself raise.
+    """
+
+    def __str__(self) -> str:
+        msg = "this extension's __str__ itself fails"
+        raise RuntimeError(msg)
+
+
+class _RaisingHooks(DefaultEngravaHooks):
+    """Hooks double whose ``on_store`` raises for a chosen trigger content.
+
+    ``on_store`` runs only after the source thought's own commit (see
+    ``SqliteEngravaCore._finish_create_thought``), so every test that
+    triggers this fires strictly after the write it wraps has already taken
+    effect.
+    """
+
+    def __init__(self, *, trigger_content: str, raises: BaseException) -> None:
+        self._trigger_content = trigger_content
+        self._raises = raises
+
+    async def on_store(self, thought: ThoughtRecord) -> ThoughtRecord:
+        """Raise the configured exception for the trigger content; pass through otherwise."""
+        if thought.content == self._trigger_content:
+            raise self._raises
+        return thought
+
+
+@asynccontextmanager
+async def _hooks_store(hooks: DefaultEngravaHooks) -> AsyncIterator[SqliteEngravaCore]:
+    """Yield a fresh store configured only with the given hooks.
+
+    No embedding provider and no derived records -- the minimal
+    configuration under which ``hooks.on_store`` is the only thing that can
+    raise on a write.
+
+    Args:
+        hooks: The hooks double to install.
+
+    Yields:
+        A schema-initialised store with no seeded thoughts, closed on exit.
+
+    """
+    connection = await aiosqlite.connect(":memory:")
+    connection.row_factory = aiosqlite.Row
+    backend = SqliteEngravaCore(connection, hooks=hooks)
+    await backend.ensure_schema()
+    try:
+        yield backend
+    finally:
+        await connection.close()
+
+
+def _expected_update_residual_message(thought_id: str) -> str:
+    """The exact ``update_thought`` residual message, written out literally.
+
+    Not imported from :mod:`engrava_mcp.server` -- comparing against an
+    imported constant would make the exact-equality check below
+    tautological. This is this test module's own, independent copy of the
+    approved wording.
+
+    Args:
+        thought_id: The identifier the update attempted.
+
+    Returns:
+        The exact message text, unprefixed by MCPServer's own
+        ``"Error executing tool <name>: "`` wrapper.
+
+    """
+    return (
+        f"update_thought for {thought_id!r} ended with an error this "
+        "server does not recognise, so whether the update was applied "
+        "could not be confirmed. Read the thought back with get_thought "
+        "before retrying. The error may originate in engrava itself, or "
+        "in an extension this server's engrava.yaml configures -- this "
+        "server cannot tell which from here."
+    )
+
+
+def _expected_store_residual_message(thought_id: str) -> str:
+    """The exact ``store_thought`` (``deduplicate=False``) residual message.
+
+    See :func:`_expected_update_residual_message` for why this is written
+    out literally rather than imported.
+
+    Args:
+        thought_id: The identifier the store attempted.
+
+    Returns:
+        The exact message text, unprefixed by MCPServer's own
+        ``"Error executing tool <name>: "`` wrapper.
+
+    """
+    return (
+        f"store_thought for {thought_id!r} ended with an error this "
+        "server does not recognise, so whether the thought was stored "
+        "could not be confirmed. Read it back with get_thought before "
+        "retrying -- a blind retry can store a second copy. The error may "
+        "originate in engrava itself, or in an extension this server's "
+        "engrava.yaml configures -- this server cannot tell which from "
+        "here."
+    )
+
+
+def _expected_store_deduplicate_residual_message(thought_id: str) -> str:
+    """The exact ``store_thought`` (``deduplicate=True``) residual message.
+
+    See :func:`_expected_update_residual_message` for why this is written
+    out literally rather than imported.
+
+    Args:
+        thought_id: The identifier the store attempted.
+
+    Returns:
+        The exact message text, unprefixed by MCPServer's own
+        ``"Error executing tool <name>: "`` wrapper.
+
+    """
+    return (
+        f"store_thought for {thought_id!r} (deduplicate=True) ended with "
+        "an error this server does not recognise, so whether the thought "
+        "was stored could not be confirmed. With deduplicate=True the "
+        f"call may have matched an existing thought with identical "
+        f"content instead of storing a new one, so reading {thought_id!r} "
+        "back with get_thought cannot settle what happened: finding it "
+        "shows a thought with that id exists, not that this call stored "
+        "it. The error may originate in engrava itself, or in an "
+        "extension this server's engrava.yaml configures -- this server "
+        "cannot tell which from here."
+    )
+
+
+def _assert_residual_message(
+    text: str, *, tool: str, thought_id: str, deduplicate: bool = False
+) -> None:
+    """Assert ``text`` is exactly the residual write-failure message for ``tool``.
+
+    Compares by exact equality against one of the three ``_expected_*``
+    functions above, each an independent literal copy of the approved
+    wording (never imported from :mod:`engrava_mcp.server` -- that would
+    make the comparison tautological, always passing regardless of what the
+    real message says). A regex or forbidden-phrase sweep was tried first
+    and dropped: it cannot be complete -- it missed active-voice claims
+    ("the call stored the thought") and step names ("journal", "commit",
+    "insert") the approved wording never needed to guard against, because
+    the wording itself does not say them. Exact equality pins the real
+    contract directly.
+
+    Args:
+        text: The client-facing error message to inspect, including
+            MCPServer's own ``"Error executing tool <name>: "`` prefix.
+        tool: The tool name (``"store_thought"`` or ``"update_thought"``).
+        thought_id: The identifier the write attempted, exactly as the
+            message should echo it.
+        deduplicate: The ``store_thought`` call's own ``deduplicate``
+            value; ignored for ``update_thought``.
+
+    """
+    if tool == "update_thought":
+        expected = _expected_update_residual_message(thought_id)
+    elif deduplicate:
+        expected = _expected_store_deduplicate_residual_message(thought_id)
+    else:
+        expected = _expected_store_residual_message(thought_id)
+    assert text == f"Error executing tool {tool}: {expected}"
+
+
+class TestResidualWriteFailure:
+    """A write that ends with an exception this server does not classify.
+
+    Every case here leaves the underlying write in whatever state it was
+    already in by the time the injected exception fires -- durable for
+    every injection except the one that fails the thought row's own
+    ``INSERT`` -- and the client-facing message never states which, and
+    never names a step.
+    """
+
+    async def test_on_store_hook_raising_reports_the_residual_message(self) -> None:
+        hooks = _RaisingHooks(
+            trigger_content="on_store fails for this content",
+            raises=_UnclassifiedError("hook blew up"),
+        )
+        async with _hooks_store(hooks) as backend:
+            async with _client_for(backend) as client:
+                result = await client.call_tool(
+                    "store_thought",
+                    {
+                        "essence": "on_store failure",
+                        "content": "on_store fails for this content",
+                        "thought_id": "thought-on-store-fail",
+                    },
+                )
+
+            # State first: the thought is durable -- on_store runs after the
+            # source's own commit.
+            stored = await backend.get_thought("thought-on-store-fail")
+            assert stored is not None
+            assert stored.content == "on_store fails for this content"
+
+            assert result.is_error is True
+            text = _error_text(result.content)
+            _assert_residual_message(text, tool="store_thought", thought_id="thought-on-store-fail")
+            _assert_no_leak(text)
+
+    async def test_derive_records_producer_raising_reports_the_residual_message(self) -> None:
         hooks = _DeriveHooks(
-            trigger_content="producer-exception source content",
-            raises=_ProducerBoomError(producer_diagnostic),
+            trigger_content="producer fails for this content",
+            raises=_UnclassifiedError("producer blew up"),
         )
         async with _derive_store(hooks) as backend:
             async with _client_for(backend) as client:
                 result = await client.call_tool(
                     "store_thought",
                     {
-                        "essence": "producer-exception source",
-                        "content": "producer-exception source content",
-                        "thought_id": "producer-exception-source",
+                        "essence": "producer failure",
+                        "content": "producer fails for this content",
+                        "thought_id": "thought-derive-fail",
                     },
                 )
 
-            source = await backend.get_thought("producer-exception-source")
-            assert source is not None
-            assert source.content == "producer-exception source content"
+            stored = await backend.get_thought("thought-derive-fail")
+            assert stored is not None
+            assert stored.content == "producer fails for this content"
 
             assert result.is_error is True
             text = _error_text(result.content)
-            assert "stored" in text.lower()
-            assert "derived record" in text.lower()
-            assert producer_diagnostic not in text
-            assert "_ProducerBoomError" not in text
+            _assert_residual_message(text, tool="store_thought", thought_id="thought-derive-fail")
             _assert_no_leak(text)
 
-    async def test_direct_error_maps_to_the_same_message_shape(self) -> None:
-        # Regression guard for the message contract itself, independent of
-        # how the producer failure is reproduced.
-        with pytest.raises(ToolError) as excinfo:
-            async with _tool_errors():
-                raise _DeriveProducerFailedError
-        text = str(excinfo.value)
+    async def test_embedding_provider_raising_with_derivation_off_reports_the_residual_message(
+        self,
+    ) -> None:
+        provider = _FakeEmbeddingProvider(failure=_UnclassifiedError("provider blew up"))
+        async with _auto_embed_store(provider=provider) as backend:
+            async with _client_for(backend) as client:
+                result = await client.call_tool(
+                    "store_thought",
+                    {
+                        "essence": "provider failure, derivation off",
+                        "content": "content one",
+                        "thought_id": "thought-write-fail-no-derive",
+                    },
+                )
+
+            stored = await backend.get_thought("thought-write-fail-no-derive")
+            assert stored is not None
+
+            assert result.is_error is True
+            text = _error_text(result.content)
+            _assert_residual_message(
+                text, tool="store_thought", thought_id="thought-write-fail-no-derive"
+            )
+            _assert_no_leak(text)
+
+    async def test_embedding_provider_raising_with_derivation_on_reports_the_same_residual_message(
+        self,
+    ) -> None:
+        # Phase-agnostic proof: configuring derivation too (with a producer
+        # that never triggers for this content) does not change the message
+        # -- the guard classifies by exception type, never by which phases
+        # are configured.
+        provider = _FakeEmbeddingProvider(failure=_UnclassifiedError("provider blew up"))
+        connection = await aiosqlite.connect(":memory:")
+        connection.row_factory = aiosqlite.Row
+        backend = SqliteEngravaCore(
+            connection,
+            hooks=_DeriveHooks(trigger_content="never triggers", records=()),
+            embedding_provider=provider,
+            auto_embed=True,
+            derive_gates=DeriveGates(enabled=True, on_error="raise"),
+        )
+        await backend.ensure_schema()
+        try:
+            async with _client_for(backend) as client:
+                result = await client.call_tool(
+                    "store_thought",
+                    {
+                        "essence": "provider failure, derivation on",
+                        "content": "content two",
+                        "thought_id": "thought-write-fail-derive-on",
+                    },
+                )
+
+            stored = await backend.get_thought("thought-write-fail-derive-on")
+            assert stored is not None
+
+            assert result.is_error is True
+            text = _error_text(result.content)
+            _assert_residual_message(
+                text, tool="store_thought", thought_id="thought-write-fail-derive-on"
+            )
+            _assert_no_leak(text)
+        finally:
+            await connection.close()
+
+    async def test_operational_error_on_the_insert_reports_the_residual_message_and_nothing_stored(
+        self, store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real_execute = store._db.execute
+        insert_failure = sqlite3.OperationalError("disk I/O error")
+
+        async def _failing_execute(sql: str, parameters: object = None) -> object:
+            if sql.startswith("INSERT INTO thought "):
+                raise insert_failure
+            return await real_execute(sql, parameters)
+
+        monkeypatch.setattr(store._db, "execute", _failing_execute)
+
+        async with _client_for(store) as client:
+            result = await client.call_tool(
+                "store_thought",
+                {
+                    "essence": "pre-commit failure",
+                    "content": "never reaches durability",
+                    "thought_id": "thought-operational-error",
+                },
+            )
+
+        # State first: unlike every other case in this class, the insert
+        # itself failed, so the thought was never stored.
+        stored = await store.get_thought("thought-operational-error")
+        assert stored is None
+
+        assert result.is_error is True
+        text = _error_text(result.content)
+        _assert_residual_message(text, tool="store_thought", thought_id="thought-operational-error")
+        _assert_no_leak(text)
+
+    async def test_embedding_provider_raising_on_update_thought_reports_the_residual_message(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with _auto_embed_store(provider=_FakeEmbeddingProvider()) as backend:
+            await backend.create_thought(
+                make_thought(
+                    "thought-update-target",
+                    essence="Original essence",
+                    content="Original content.",
+                )
+            )
+            failing_provider = _FakeEmbeddingProvider(
+                failure=_UnclassifiedError("provider blew up")
+            )
+            monkeypatch.setattr(backend, "_embedding_provider", failing_provider)
+
+            async with _client_for(backend) as client:
+                result = await client.call_tool(
+                    "update_thought",
+                    {"thought_id": "thought-update-target", "content": "Updated content."},
+                )
+
+            # State first: the update was applied -- update_thought commits
+            # before auto-embed ever runs.
+            updated = await backend.get_thought("thought-update-target")
+            assert updated is not None
+            assert updated.content == "Updated content."
+
+            assert result.is_error is True
+            text = _error_text(result.content)
+            _assert_residual_message(
+                text, tool="update_thought", thought_id="thought-update-target"
+            )
+            _assert_no_leak(text)
+
+    async def test_embedding_provider_raising_plain_value_error_reports_the_residual_message(
+        self,
+    ) -> None:
+        # The widening this guard closes: previously a bare ValueError from
+        # an extension was treated by both prior guards as an already-
+        # handled type, so it escaped raw through _tool_errors's own
+        # trailing `raise` in its ValueError branch instead of being
+        # curated or wrapped.
+        provider = _FakeEmbeddingProvider(failure=ValueError("provider says something unrelated"))
+        async with _auto_embed_store(provider=provider) as backend:
+            async with _client_for(backend) as client:
+                result = await client.call_tool(
+                    "store_thought",
+                    {
+                        "essence": "provider raises a plain ValueError",
+                        "content": "content three",
+                        "thought_id": "thought-write-value-error",
+                    },
+                )
+
+            stored = await backend.get_thought("thought-write-value-error")
+            assert stored is not None
+
+            assert result.is_error is True
+            text = _error_text(result.content)
+            _assert_residual_message(
+                text, tool="store_thought", thought_id="thought-write-value-error"
+            )
+            assert "provider says something unrelated" not in text
+            _assert_no_leak(text)
+
+    async def test_store_thought_with_deduplicate_true_reports_the_conditional_advice(self) -> None:
+        hooks = _RaisingHooks(
+            trigger_content="dedup content",
+            raises=_UnclassifiedError("hook blew up"),
+        )
+        async with _hooks_store(hooks) as backend:
+            async with _client_for(backend) as client:
+                result = await client.call_tool(
+                    "store_thought",
+                    {
+                        "essence": "dedup source",
+                        "content": "dedup content",
+                        "thought_id": "thought-dedup-attempt",
+                        "deduplicate": True,
+                    },
+                )
+
+            # State first: a content-hash miss inserts the attempted id
+            # before on_store ever runs, so it is durable despite the
+            # failure that follows.
+            stored = await backend.get_thought("thought-dedup-attempt")
+            assert stored is not None
+            assert stored.content == "dedup content"
+
+            assert result.is_error is True
+            text = _error_text(result.content)
+            _assert_residual_message(
+                text,
+                tool="store_thought",
+                thought_id="thought-dedup-attempt",
+                deduplicate=True,
+            )
+            _assert_no_leak(text)
+
+    async def test_deduplicate_true_on_a_content_hash_hit_reports_the_conditional_advice(
+        self, store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The other dedup test above covers a content-hash miss (the
+        # attempted id really is inserted, then on_store fails). This one
+        # covers the opposite lane the corrected advice exists for: a hash
+        # *hit*, where the attempted id is never inserted at all -- the
+        # confirmation-count bump on the existing thought is what fails.
+        existing = await store_thought_impl(
+            store, essence="dedup hit source", content="dedup hit content"
+        )
+        existing_id = existing["thought"]["thought_id"]
+
+        confirmation_failure = _UnclassifiedError("confirmation step blew up")
+
+        async def _broken_increment(self: SqliteEngravaCore, existing: object) -> NoReturn:
+            raise confirmation_failure
+
+        monkeypatch.setattr(type(store), "_increment_confirmation", _broken_increment)
+
+        async with _client_for(store) as client:
+            result = await client.call_tool(
+                "store_thought",
+                {
+                    "essence": "dedup hit source",
+                    "content": "dedup hit content",
+                    "thought_id": "thought-dedup-hit-attempt",
+                    "deduplicate": True,
+                },
+            )
+
+        # State first: a content-hash hit never inserts the attempted id --
+        # only the pre-existing thought (still there, untouched by the
+        # failed confirmation bump) is ever touched.
+        attempted = await store.get_thought("thought-dedup-hit-attempt")
+        assert attempted is None
+        existing_after = await store.get_thought(existing_id)
+        assert existing_after is not None
+        assert existing_after.content == "dedup hit content"
+
+        assert result.is_error is True
+        text = _error_text(result.content)
+        _assert_residual_message(
+            text,
+            tool="store_thought",
+            thought_id="thought-dedup-hit-attempt",
+            deduplicate=True,
+        )
+        _assert_no_leak(text)
+
+    async def test_throwing_str_extension_exception_reports_the_residual_message(self) -> None:
+        hooks = _RaisingHooks(
+            trigger_content="throwing str content",
+            raises=_ThrowingStrError("never read"),
+        )
+        async with _hooks_store(hooks) as backend:
+            async with _client_for(backend) as client:
+                result = await client.call_tool(
+                    "store_thought",
+                    {
+                        "essence": "throwing str",
+                        "content": "throwing str content",
+                        "thought_id": "thought-throwing-str",
+                    },
+                )
+
+            stored = await backend.get_thought("thought-throwing-str")
+            assert stored is not None
+
+            assert result.is_error is True
+            text = _error_text(result.content)
+            _assert_residual_message(text, tool="store_thought", thought_id="thought-throwing-str")
+            _assert_no_leak(text)
+
+    async def test_extension_raising_tool_error_reports_the_residual_message_not_its_own_text(
+        self,
+    ) -> None:
+        extension_text = "extension's own curated-looking message, must not reach the client"
+        hooks = _RaisingHooks(
+            trigger_content="extension tool error content",
+            raises=ToolError(extension_text),
+        )
+        async with _hooks_store(hooks) as backend:
+            async with _client_for(backend) as client:
+                result = await client.call_tool(
+                    "store_thought",
+                    {
+                        "essence": "extension raises ToolError",
+                        "content": "extension tool error content",
+                        "thought_id": "thought-extension-tool-error",
+                    },
+                )
+
+            stored = await backend.get_thought("thought-extension-tool-error")
+            assert stored is not None
+
+            assert result.is_error is True
+            text = _error_text(result.content)
+            _assert_residual_message(
+                text, tool="store_thought", thought_id="thought-extension-tool-error"
+            )
+            assert extension_text not in text
+            _assert_no_leak(text)
+
+
+class TestResidualGuardPassesThroughCuratedExceptions:
+    """A curated exception raised from inside the guarded call keeps its own message.
+
+    :func:`_residual_write_guard` wraps ``store.create_thought`` and
+    ``store.update_thought``; classifying a curated exception through
+    :func:`_tool_errors`'s own chain must not change what the client sees
+    for it -- one case reachable through each guarded call. The typed-error
+    test classes elsewhere in this module (derived records, the write-time
+    embedding errors) exercise the rest of the reachable branches and must
+    keep passing unmodified.
+    """
+
+    async def test_write_contention_through_store_thought_keeps_its_own_message(
+        self, store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _contended_create(
+            self: SqliteEngravaCore, thought: ThoughtRecord, **kwargs: object
+        ) -> NoReturn:
+            raise WriteContentionError(operation="create_thought", attempts=1)
+
+        monkeypatch.setattr(type(store), "create_thought", _contended_create)
+
+        async with _client_for(store) as client:
+            result = await client.call_tool(
+                "store_thought", {"essence": "contended", "content": "raced by another writer"}
+            )
+
+        assert result.is_error is True
+        text = _error_text(result.content)
         lowered = text.lower()
-        assert "stored" in lowered
-        assert "derived record" in lowered
+        assert "busy" in lowered
+        assert "another writer" in lowered
+        assert "does not recognise" not in lowered
+        _assert_no_leak(text)
+
+    async def test_thought_not_found_through_update_thought_keeps_its_own_message(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        async with _client_for(store) as client:
+            result = await client.call_tool(
+                "update_thought", {"thought_id": "does-not-exist", "essence": "x"}
+            )
+
+        assert result.is_error is True
+        text = _error_text(result.content)
+        assert "No thought exists with id" in text
+        assert "does not recognise" not in text.lower()
         _assert_no_leak(text)
 
 
-#: Namespaces :func:`_resolve_exception_class` searches, in order, to turn an
-#: except-clause identifier into the class object it names. ``sqlite3`` is
-#: needed for ``sqlite3.IntegrityError`` (an attribute access, which
-#: :func:`_except_clause_type_names` resolves to just its trailing
-#: identifier).
-_DERIVE_GUARD_RESOLUTION_NAMESPACES: tuple[object, ...] = (server_module, builtins, sqlite3)
-
-
-def _resolve_exception_class(
-    name: str, namespaces: tuple[object, ...]
-) -> type[BaseException] | None:
-    """Resolve an identifier to the class object it names, in ``namespaces``.
+def _tool_error_raises_not_chained_from_handler(func: object) -> list[str]:
+    """``raise ToolError(...)`` statements inside ``func`` not chained ``from`` their own handler.
 
     Args:
-        name: An identifier an ``except`` clause spelled (see
-            :func:`_except_clause_type_names`).
-        namespaces: Objects to look ``name`` up on, in order; the first hit
-            that is actually a class wins.
+        func: The function to inspect (its own except handlers).
 
     Returns:
-        The resolved class, or ``None`` if no namespace has it as a class.
+        A description per violation; empty when every ``ToolError`` raised
+        from inside an except handler is chained ``from`` that handler's own
+        bound name -- the mark :func:`_residual_write_guard` relies on to
+        recognise a curated classification result.
 
     """
-    for namespace in namespaces:
-        candidate = getattr(namespace, name, None)
-        if isinstance(candidate, type):
-            return candidate
-    return None
+    source = textwrap.dedent(inspect.getsource(func))  # type: ignore[arg-type]
+    tree = ast.parse(source)
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ExceptHandler):
+            continue
+        handler_name = node.name
+        for sub in ast.walk(node):
+            if sub is node:
+                continue
+            if (
+                isinstance(sub, ast.Raise)
+                and isinstance(sub.exc, ast.Call)
+                and isinstance(sub.exc.func, ast.Name)
+                and sub.exc.func.id == "ToolError"
+            ):
+                chained = (
+                    handler_name is not None
+                    and isinstance(sub.cause, ast.Name)
+                    and sub.cause.id == handler_name
+                )
+                if not chained:
+                    violations.append(
+                        f"line {sub.lineno}: raise ToolError(...) not chained "
+                        f"from except handler {handler_name!r}"
+                    )
+    return violations
 
 
-def _uncovered_derive_guard_names(
-    named: set[str],
-    *,
-    exempt: set[str],
-    covered: tuple[type[BaseException], ...],
-    namespaces: tuple[object, ...],
-) -> tuple[list[str], list[str]]:
-    """Names in ``named`` that ``covered`` does not account for.
+class TestToolErrorsChainsEveryMappingBranch:
+    """Every ``_tool_errors`` mapping branch chains ``ToolError(...) from`` its own exception.
 
-    The pure check both the real completeness test and its own failability
-    demonstration call, so the demonstration exercises the actual logic
-    rather than a copy of it.
-
-    Args:
-        named: Identifiers named in ``_tool_errors``'s own except clauses.
-        exempt: Names to skip regardless (the guard's own output type).
-        covered: The exclusion tuple to check ``issubclass`` membership
-            against.
-        namespaces: Objects to resolve each name against, in order.
-
-    Returns:
-        A ``(unresolved, uncovered)`` pair, both sorted: names that could not
-        be resolved to a class at all, and resolved names ``covered`` does
-        not account for.
-
-    """
-    unresolved: list[str] = []
-    uncovered: list[str] = []
-    for name in sorted(named - exempt):
-        cls = _resolve_exception_class(name, namespaces)
-        if cls is None:
-            unresolved.append(name)
-        elif not issubclass(cls, covered):
-            uncovered.append(name)
-    return unresolved, uncovered
-
-
-class TestDeriveProducerGuardExclusionCompleteness:
-    """``_ALREADY_HANDLED_DERIVE_EXCEPTIONS`` must cover every ``_tool_errors`` branch.
-
-    The exclusion tuple :func:`engrava_mcp.server._derive_producer_guard`
-    checks against is hand-maintained, not derived from ``_tool_errors``
-    itself -- so it can silently fall out of sync with it: a type that gets
-    its own ``_tool_errors`` branch in the future but is never added here
-    would, if ever raised from inside the guarded ``store.create_thought``
-    call, be wrapped as ``_DeriveProducerFailedError`` and produce the wrong
-    client-facing message instead of reaching its own handler. This test
-    makes that drift fail loudly: every type named in a ``_tool_errors``
-    except clause must be covered (``issubclass``) by
-    ``_ALREADY_HANDLED_DERIVE_EXCEPTIONS`` -- the one exemption is
-    ``_DeriveProducerFailedError`` itself, the guard's own *output* type,
-    never something ``store.create_thought`` can raise as an input to it.
+    :func:`_residual_write_guard` recognises a curated classification result
+    by ``out.__cause__ is exc`` -- this pins the precondition that mark
+    depends on, so a future branch that raises ``ToolError`` without
+    chaining it from its own handler's exception is caught here before it
+    silently breaks that mark.
     """
 
-    def test_every_tool_errors_branch_is_covered_by_the_derive_guard_exclusion(self) -> None:
-        named = _except_clause_type_names(server_module._tool_errors)
-        unresolved, uncovered = _uncovered_derive_guard_names(
-            named,
-            exempt={"_DeriveProducerFailedError"},
-            covered=server_module._ALREADY_HANDLED_DERIVE_EXCEPTIONS,
-            namespaces=_DERIVE_GUARD_RESOLUTION_NAMESPACES,
-        )
+    def test_every_mapping_branch_chains_from_its_own_handler(self) -> None:
+        violations = _tool_error_raises_not_chained_from_handler(server_module._tool_errors)
+        assert violations == [], violations
 
-        assert not unresolved, (
-            f"could not resolve {unresolved} to a class via engrava_mcp.server, "
-            "builtins, or sqlite3 -- extend _DERIVE_GUARD_RESOLUTION_NAMESPACES"
-        )
-        assert not uncovered, (
-            f"_tool_errors names {uncovered} in its own except clauses, but "
-            "_ALREADY_HANDLED_DERIVE_EXCEPTIONS does not cover it -- "
-            "_derive_producer_guard could wrap a real instance as "
-            "_DeriveProducerFailedError instead of letting it reach its own "
-            "_tool_errors branch. Add it to _ALREADY_HANDLED_DERIVE_EXCEPTIONS."
-        )
+    def test_detects_a_deliberately_unchained_raise(self) -> None:
+        # Never called -- only its source is read -- so the try body does not
+        # need to actually raise ValueError for this to be a valid fixture.
+        def _broken() -> None:
+            msg = "oops"
+            try:
+                pass
+            except ValueError:
+                raise ToolError(msg)  # noqa: B904 -- deliberately unchained, for the test
 
-    def test_sweep_fails_on_a_deliberately_uncovered_type(self) -> None:
-        # Proves the completeness check above actually catches a gap, on the
-        # exact shape of gap this test class exists to prevent: a real
-        # _tool_errors branch (MindQLParseError, resolvable via this test
-        # module's own import of it) for a type a too-narrow exclusion tuple
-        # misses.
-        unresolved, uncovered = _uncovered_derive_guard_names(
-            {"MindQLParseError"},
-            exempt=set(),
-            covered=(ValueError,),
-            namespaces=(sys.modules[__name__],),
-        )
-        assert unresolved == []
-        assert uncovered == ["MindQLParseError"]
+        violations = _tool_error_raises_not_chained_from_handler(_broken)
+        assert violations != []
 
-    def test_sweep_passes_once_the_type_is_added_to_the_exclusion(self) -> None:
-        # Foil to the previous test: adding the missing type to the covered
-        # tuple clears the gap, confirming the check treats that as fixed.
-        unresolved, uncovered = _uncovered_derive_guard_names(
-            {"MindQLParseError"},
-            exempt=set(),
-            covered=(ValueError, MindQLParseError),
-            namespaces=(sys.modules[__name__],),
-        )
-        assert unresolved == []
-        assert uncovered == []
+    def test_passes_when_the_raise_is_chained(self) -> None:
+        def _fixed() -> None:
+            msg = "oops"
+            try:
+                pass
+            except ValueError as exc:
+                raise ToolError(msg) from exc
 
-    def test_sweep_ignores_an_exempted_name_regardless_of_coverage(self) -> None:
-        # _DeriveProducerFailedError itself must never be flagged even
-        # though it is not (and must not be) in the exclusion tuple.
-        unresolved, uncovered = _uncovered_derive_guard_names(
-            {"MindQLParseError", "_DeriveProducerFailedError"},
-            exempt={"_DeriveProducerFailedError"},
-            covered=(ValueError, MindQLParseError),
-            namespaces=(sys.modules[__name__],),
-        )
-        assert unresolved == []
-        assert uncovered == []
+        violations = _tool_error_raises_not_chained_from_handler(_fixed)
+        assert violations == []
 
 
 # ---------------------------------------------------------------------------

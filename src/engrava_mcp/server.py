@@ -126,10 +126,12 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 import anyio
 from engrava import (
     ConnectionQuarantinedError,
+    DerivedRecordError,
     DuplicateEdgeError,
     EdgeRecord,
     EdgeType,
     EmbeddingQueryPrefixMismatchError,
+    EngravaError,
     FieldOp,
     FieldPredicate,
     InvalidFilterError,
@@ -616,6 +618,125 @@ def _check_prompt_bound(name: str, value: int, *, minimum: int, maximum: int | N
 _SQLITE_CONSTRAINT_PRIMARYKEY = 1555
 
 
+#: Exception types a derive-records write guard (:func:`_derive_producer_guard`)
+#: must never mistake for an unnamed producer failure, because :func:`_tool_errors`
+#: already gives each of them its own curated branch. Every typed engrava
+#: exception shares the :class:`~engrava.EngravaError` base, so naming that base
+#: once covers all of them -- including :class:`~engrava.DerivedRecordError`
+#: itself, which is what stops a real one from being re-wrapped as the generic
+#: producer-failure case. The remaining members cover the failure modes
+#: reachable from ``store.create_thought`` that are not an
+#: :class:`~engrava.EngravaError` subclass: engrava's own bare ``ValueError``
+#: (a duplicate ``thought_id``), pydantic's ``ValidationError`` (itself a
+#: ``ValueError`` subclass, named explicitly for clarity), ``sqlite3.IntegrityError``,
+#: ``OverflowError``, this module's own :class:`StoreNotReadyError` (a
+#: ``RuntimeError``, not an :class:`~engrava.EngravaError`), and
+#: :class:`~engrava.MindQLParseError` (a bare ``Exception`` subclass, not
+#: even a ``ValueError``). None of the last two can be *produced by*
+#: ``store.create_thought`` itself today -- ``StoreNotReadyError`` comes from
+#: :meth:`StoreProvider.require`, called strictly before the guarded call,
+#: never from inside it; ``MindQLParseError`` comes from MindQL parsing and
+#: execution, which the write path never invokes at all -- elsewhere in this
+#: module or in engrava, either type may have other raise sites, which is
+#: irrelevant here since none of them sit inside this guard's own ``try``.
+#: This tuple is hand-maintained, not derived; see
+#: ``TestDeriveProducerGuardExclusionCompleteness`` in ``test_errors.py`` for
+#: the check that keeps it in sync with :func:`_tool_errors`'s own branches.
+#:
+#: A second guard exists here rather than one shared with a write-path
+#: auto-embed guard because the two residual cases are reached from
+#: different, sequential phases of the same ``store.create_thought`` call
+#: (auto-embed runs, then the derived-records dispatch runs, and only one of
+#: them can be the source of any given call's failure) -- see this guard's
+#: own docstring for why an outside wrapper cannot attribute a residual
+#: exception to one phase over the other without narrowing what it excludes
+#: to just its own phase's already-named exceptions.
+_ALREADY_HANDLED_DERIVE_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    EngravaError,
+    ValueError,
+    ValidationError,
+    sqlite3.IntegrityError,
+    OverflowError,
+    StoreNotReadyError,
+    MindQLParseError,
+)
+
+
+class _DeriveProducerFailedError(Exception):
+    """Wraps a derive-records producer's own raised exception, whose type is unnamed.
+
+    ``SqliteEngravaCore``'s ``_collect_derived`` re-raises, bare and
+    unwrapped, whatever the configured derive-records producer's own
+    ``derive_records()`` call raises -- or whatever raises while consuming
+    the sequence it returns -- whenever ``DeriveGates.on_error`` is
+    ``"raise"`` (the non-default policy; the default, ``"log"``, never
+    raises through this path at all). That exception's type belongs to the
+    producer, an operator-supplied extension, not to engrava, and cannot be
+    known in advance, so it cannot be named in an ``except <EngravaType>``
+    branch the way :class:`~engrava.DerivedRecordError` is.
+
+    :func:`_derive_producer_guard` is what produces this: wrapped narrowly
+    around just the ``store.create_thought`` call in
+    :func:`store_thought_impl` (``DerivedRecordError`` is reachable only
+    through ``store_thought``, never ``update_thought``), it re-raises every
+    exception :func:`_tool_errors` already names above unchanged (see
+    :data:`_ALREADY_HANDLED_DERIVE_EXCEPTIONS`) and wraps only what is left
+    over in this type, so :func:`_tool_errors` has something to name for it.
+
+    The original exception is kept only as ``__cause__``. Its own message is
+    deliberately never read anywhere on this path: it is composed by an
+    operator-supplied producer, not a diagnostic string engrava wrote, so it
+    must not reach the client.
+
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "derive-records producer failed with an exception type engrava-mcp does not name"
+        )
+
+
+@asynccontextmanager
+async def _derive_producer_guard() -> AsyncIterator[None]:
+    """Narrow a derive-records producer's own failure to a type ``_tool_errors`` can name.
+
+    Wraps only the ``store.create_thought`` call itself -- not
+    :func:`_tool_errors`'s own ``try`` block, which also covers this
+    module's own argument handling and would turn a genuine bug in this
+    server's own code into a misleading "derived record failed" message.
+    Because Python tries ``except`` clauses in source order against the
+    first matching type, a bare ``except Exception`` placed anywhere in
+    :func:`_tool_errors`'s existing chain would also swallow every branch
+    below it -- this guard exists specifically so the unnamed case can be
+    caught without doing that.
+
+    Every exception already named in a :func:`_tool_errors` branch above --
+    see :data:`_ALREADY_HANDLED_DERIVE_EXCEPTIONS` -- is re-raised here
+    unchanged, so it still reaches its own specific handler there
+    (including :class:`~engrava.DerivedRecordError` itself). Only the
+    residual (by construction, the derive-records producer's own exception,
+    re-raised bare by ``_collect_derived`` under ``on_error="raise"``; see
+    :class:`_DeriveProducerFailedError`) is wrapped.
+
+    Yields:
+        ``None``; the caller runs the guarded store call inside the ``with``.
+
+    Raises:
+        _DeriveProducerFailedError: When the guarded call raises anything not
+            already named in a :func:`_tool_errors` branch.
+
+    """
+    try:
+        yield
+    except _ALREADY_HANDLED_DERIVE_EXCEPTIONS:
+        raise
+    # The producer may raise any type; wrapped here, never swallowed --
+    # _tool_errors's own branch for _DeriveProducerFailedError is what turns
+    # it into a client-facing message.
+    except Exception as exc:
+        raise _DeriveProducerFailedError from exc
+
+
 # C901 (mccabe complexity), PLR0912 (branch count), and PLR0915 (statement
 # count) are all waived here, and for the same reason: this function is a flat
 # translation table, not branching logic. Its "branches" are one ``except``
@@ -694,6 +815,13 @@ async def _tool_errors() -> AsyncIterator[None]:  # noqa: C901, PLR0912, PLR0915
     left as an internal store message; both are read-path, configuration-only
     conditions, so the messages report no result and no change rather than
     suggesting a retry.
+    A ``store_thought`` whose configured derived-records producer rejects its
+    own output (``DerivedRecordError``, over-cap or an identity collision)
+    or fails outright while running (an unnamed exception, only reachable
+    wrapped as :class:`_DeriveProducerFailedError`; see
+    :func:`_derive_producer_guard`) is likewise mapped, in both cases
+    stating that the thought itself was nonetheless stored and only its
+    derived record is missing.
 
     Yields:
         ``None``; the caller runs the guarded tool body inside the ``with``.
@@ -878,6 +1006,58 @@ async def _tool_errors() -> AsyncIterator[None]:  # noqa: C901, PLR0912, PLR0915
             "This server's memory store is in an unusable state, and every "
             "request that needs it will fail until the server is restarted. "
             "Retrying will not help. Report this to whoever operates the server."
+        )
+        raise ToolError(msg) from exc
+    except DerivedRecordError as exc:
+        # store_thought only, reachable only when the engrava.yaml this
+        # server is pointed at turns on derived records with a hooks class
+        # and sets the failure policy to raise (the default -- log --
+        # never raises through this path at all). One message covers all
+        # three reasons this type carries (an over-cap producer return, a
+        # derived record's identity colliding with its own source thought,
+        # or colliding with an unrelated pre-existing thought) rather than
+        # three different ones: none is actionable differently by the
+        # caller, and what all three share -- the thought itself is
+        # durably stored (derivation dispatches only after the source
+        # thought's own commit), only its derived record is not -- is what
+        # the client needs to know. The library's own message differs per
+        # reason and names only its internal mechanism (e.g.
+        # "[source=...] derived record identity collides with..."), so it
+        # is not echoed.
+        msg = (
+            "The thought itself was stored successfully, but a derived "
+            "record could not be produced for it: the derived-records "
+            "producer this server is configured with either returned more "
+            "records than the configured limit, or produced one whose "
+            "identity collided with an existing thought. This is a "
+            "property of the server's derived-records configuration, not "
+            "of the fields you supplied -- report it to whoever operates "
+            "the server."
+        )
+        raise ToolError(msg) from exc
+    except _DeriveProducerFailedError as exc:
+        # store_thought only, and only when the engrava.yaml this server is
+        # pointed at turns on derived records with a hooks class and a
+        # failure policy of raise: the producer's own derive_records() call
+        # -- or the consumption of its returned sequence -- raised
+        # something other than DerivedRecordError, and engrava re-raises
+        # that exception bare, unwrapped. Its type belongs to an
+        # operator-supplied extension and cannot be known in advance, so it
+        # cannot be named in an except <EngravaType> branch the way
+        # DerivedRecordError is above; see _DeriveProducerFailedError and
+        # _derive_producer_guard for how it reaches this branch at all. The
+        # producer's own exception text is never read: it may carry detail
+        # the producer itself composed, not a diagnostic string engrava
+        # wrote, so it must not reach the client. The thought row is
+        # already committed by the time this can fire, for the same reason
+        # as the DerivedRecordError branch above.
+        msg = (
+            "The thought itself was stored successfully, but a derived "
+            "record could not be produced for it: the derive-records "
+            "producer this server is configured with failed while running. "
+            "This is a property of the server's derived-records "
+            "configuration, not of the fields you supplied -- report it to "
+            "whoever operates the server."
         )
         raise ToolError(msg) from exc
     except ReferentialIntegrityError as exc:
@@ -1788,6 +1968,15 @@ async def store_thought_impl(
         ValueError: If a caller-supplied ``thought_id`` collides with an
             existing thought (only reachable with ``deduplicate=False``,
             since the dedup path resolves by content hash, not id).
+        DerivedRecordError: If the engrava.yaml this server is pointed at
+            turns on derived records with a hooks class and a failure
+            policy of ``"raise"``, and the producer's return is rejected
+            (over-cap, or an identity collision with the source thought or
+            with an unrelated stored thought).
+        _DeriveProducerFailedError: Same configuration as above, when the
+            producer's own ``derive_records()`` call fails instead --
+            wraps the producer's own, otherwise-unnamed exception (see
+            :func:`_derive_producer_guard`).
 
     """
     record = ThoughtRecord(
@@ -1802,7 +1991,8 @@ async def store_thought_impl(
         source=source,
         confidence=confidence,
     )
-    created = await store.create_thought(record, deduplicate=deduplicate)
+    async with _derive_producer_guard():
+        created = await store.create_thought(record, deduplicate=deduplicate)
     return {
         "thought": {
             "thought_id": created.thought_id,

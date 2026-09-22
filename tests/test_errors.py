@@ -40,9 +40,11 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import builtins
 import inspect
 import re
 import sqlite3
+import sys
 import textwrap
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, NoReturn
@@ -51,16 +53,24 @@ import aiosqlite
 import pytest
 from engrava import (
     ConnectionQuarantinedError,
+    DefaultEngravaHooks,
+    DerivedRecord,
+    DerivedRecordError,
+    DeriveGates,
     EdgeType,
     EmbeddingQueryPrefixMismatchError,
+    MindQLParseError,
+    Priority,
     SqliteEngravaCore,
     StaleDataError,
+    ThoughtType,
     VectorDimensionMismatchError,
     WriteContentionError,
     WriteLockTimeoutError,
 )
 from engrava.domain import exceptions as engrava_exceptions
 from engrava.domain.exceptions import DuplicateEdgeError, EngravaError
+from engrava.infrastructure.sqlite.engrava_core import _derived_thought_id
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
@@ -72,6 +82,7 @@ from engrava_mcp.server import (
     SQLITE_MAX_BOUND_INT,
     EmbeddingQueryNotSupportedError,
     StoreProvider,
+    _DeriveProducerFailedError,
     _query_declares_find,
     _tool_errors,
     link_thoughts_impl,
@@ -80,11 +91,13 @@ from engrava_mcp.server import (
     store_thought_impl,
     update_thought_impl,
 )
+from tests.conftest import make_thought
 from tests.inprocess_client import connect_client
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Sequence
 
+    from engrava import DeriveContext, ThoughtRecord
     from mcp import Client
 
 #: Substrings that would indicate a leaked traceback or internal symbol.
@@ -143,6 +156,13 @@ _LEAK_MARKERS = (
     "EmbeddingQueryPrefixMismatchError",
     "Embedding query prefix mismatch",
     "corpus was built to pair with",
+    # DerivedRecordError's raw message names its own type's wrapping and the
+    # library's internal per-reason phrasing; none of it may reach the client.
+    "DerivedRecordError",
+    "_DeriveProducerFailedError",
+    "max_derived_per_source",
+    "identity collides with",
+    "[source=",
 )
 
 #: Phrases that would wrongly suggest raw SQL is runnable over the wire.
@@ -1646,6 +1666,470 @@ class TestEmbeddingQueryPrefixMismatch:
 
 
 # ---------------------------------------------------------------------------
+# store_thought's derive-records failures.
+# ---------------------------------------------------------------------------
+
+
+class _DeriveHooks(DefaultEngravaHooks):
+    """Operator-supplied hooks double that also produces derived records.
+
+    A real implementation of :class:`~engrava.DerivedRecordProducerProtocol`
+    (detected structurally by ``isinstance`` -- it is a
+    ``@runtime_checkable`` ``Protocol`` -- so no mock is needed), configured
+    per test to reproduce exactly one of the four failure shapes this WS
+    covers.
+
+    ``derive_records`` only produces (or raises) anything for the one
+    source content each test configures as its trigger; every other create
+    on the same store -- in particular a test's own setup call that
+    pre-seeds an unrelated, foreign thought at a chosen id -- derives
+    nothing, so that setup call is a plain, inert insert.
+    """
+
+    def __init__(
+        self,
+        *,
+        trigger_content: str,
+        records: Sequence[DerivedRecord] = (),
+        raises: BaseException | None = None,
+    ) -> None:
+        self._trigger_content = trigger_content
+        self._records = records
+        self._raises = raises
+
+    async def derive_records(
+        self,
+        thought: ThoughtRecord,
+        ctx: DeriveContext,
+    ) -> Sequence[DerivedRecord]:
+        """Return the configured records, raise, or no-op for a non-trigger source."""
+        if thought.content != self._trigger_content:
+            return ()
+        if self._raises is not None:
+            raise self._raises
+        return self._records
+
+
+@asynccontextmanager
+async def _derive_store(
+    hooks: _DeriveHooks, *, max_derived_per_source: int = 32
+) -> AsyncIterator[SqliteEngravaCore]:
+    """Build a fresh in-memory store with derived records enabled and raising.
+
+    ``on_error`` is always ``"raise"`` here -- the only policy under which
+    any of this WS's four cases reach a client at all; the default,
+    ``"log"``, swallows every one of them internally (logged, source left
+    durable, remaining children/derivation simply skipped) and never raises
+    through this path.
+
+    Args:
+        hooks: The producer double to install.
+        max_derived_per_source: The over-cap threshold to configure.
+
+    Yields:
+        A schema-initialised store, closed on exit.
+
+    """
+    connection = await aiosqlite.connect(":memory:")
+    connection.row_factory = aiosqlite.Row
+    backend = SqliteEngravaCore(
+        connection,
+        hooks=hooks,
+        derive_gates=DeriveGates(
+            enabled=True,
+            on_error="raise",
+            max_derived_per_source=max_derived_per_source,
+        ),
+    )
+    await backend.ensure_schema()
+    try:
+        yield backend
+    finally:
+        await connection.close()
+
+
+class TestDerivedRecordOverCap:
+    """A derive-records producer returns more records than the configured cap.
+
+    ``_collect_derived`` rejects the over-cap return -- as a typed
+    ``DerivedRecordError`` -- before any child is written, but strictly
+    after the source thought's own insert has already committed (derivation
+    dispatches only once ``_finish_create_thought`` runs, itself only
+    reached after ``_insert_new_thought_row``'s own ``_maybe_commit``).
+    """
+
+    async def test_reports_a_clean_message_over_the_wire(self) -> None:
+        hooks = _DeriveHooks(
+            trigger_content="over-cap source content",
+            records=[
+                DerivedRecord(
+                    content="over-cap derived child one",
+                    thought_type=ThoughtType.OBSERVATION,
+                    priority=Priority.P3,
+                ),
+                DerivedRecord(
+                    content="over-cap derived child two",
+                    thought_type=ThoughtType.OBSERVATION,
+                    priority=Priority.P3,
+                ),
+            ],
+        )
+        async with _derive_store(hooks, max_derived_per_source=1) as backend:
+            async with _client_for(backend) as client:
+                result = await client.call_tool(
+                    "store_thought",
+                    {
+                        "essence": "over-cap source",
+                        "content": "over-cap source content",
+                        "thought_id": "over-cap-source",
+                    },
+                )
+
+            # State first: the source thought is durable even though its
+            # derived records were rejected.
+            source = await backend.get_thought("over-cap-source")
+            assert source is not None
+            assert source.content == "over-cap source content"
+
+            assert result.is_error is True
+            text = _error_text(result.content)
+            assert "stored" in text.lower()
+            assert "derived record" in text.lower()
+            _assert_no_leak(text)
+
+    async def test_direct_error_maps_to_the_same_message_shape(self) -> None:
+        # Regression guard for the message contract itself, independent of
+        # how the over-cap condition is reproduced.
+        err = DerivedRecordError(
+            "over-cap-source",
+            "producer returned more than max_derived_per_source=1 records",
+        )
+        with pytest.raises(ToolError) as excinfo:
+            async with _tool_errors():
+                raise err
+        text = str(excinfo.value)
+        lowered = text.lower()
+        assert "stored" in lowered
+        assert "derived record" in lowered
+        assert "over-cap-source" not in text
+        _assert_no_leak(text)
+
+
+class TestDerivedRecordSelfCollision:
+    """A derived record's identity collides with its own source thought.
+
+    ``_persist_derived_child`` raises before any database work for this
+    child -- a pure pre-check on the deterministic, content-addressed id --
+    but the source thought itself is already durably committed by the time
+    derivation (and this check) ever runs.
+    """
+
+    async def test_reports_a_clean_message_over_the_wire(self) -> None:
+        child_content = "self-collision derived content"
+        # engrava's own private derived-id function, imported to construct a
+        # real, deterministic id collision -- not reimplemented, so a future
+        # change to the hashing scheme cannot silently produce a false pass.
+        colliding_id = _derived_thought_id(child_content)
+        hooks = _DeriveHooks(
+            trigger_content="self-collision source content",
+            records=[
+                DerivedRecord(
+                    content=child_content,
+                    thought_type=ThoughtType.OBSERVATION,
+                    priority=Priority.P3,
+                )
+            ],
+        )
+        async with _derive_store(hooks) as backend:
+            async with _client_for(backend) as client:
+                result = await client.call_tool(
+                    "store_thought",
+                    {
+                        "essence": "self-collision source",
+                        "content": "self-collision source content",
+                        "thought_id": colliding_id,
+                    },
+                )
+
+            source = await backend.get_thought(colliding_id)
+            assert source is not None
+            assert source.content == "self-collision source content"
+
+            assert result.is_error is True
+            text = _error_text(result.content)
+            assert "stored" in text.lower()
+            assert "derived record" in text.lower()
+            _assert_no_leak(text)
+
+
+class TestDerivedRecordForeignCollision:
+    """A derived record's identity collides with an unrelated stored thought.
+
+    The pre-existing thought's stored content differs from what the
+    producer derived, so the conflict-as-reuse hit is treated as a
+    collision (no provenance edge attached) rather than silently asserting
+    a false "derived from" relationship against someone else's row.
+    """
+
+    async def test_reports_a_clean_message_and_leaves_the_foreign_thought_untouched(
+        self,
+    ) -> None:
+        child_content = "foreign-collision derived content"
+        foreign_id = _derived_thought_id(child_content)
+        hooks = _DeriveHooks(
+            trigger_content="foreign-collision source content",
+            records=[
+                DerivedRecord(
+                    content=child_content,
+                    thought_type=ThoughtType.OBSERVATION,
+                    priority=Priority.P3,
+                )
+            ],
+        )
+        async with _derive_store(hooks) as backend:
+            # The pre-existing, unrelated thought at the derived child's own
+            # deterministic id. derive_records returns nothing for it (its
+            # content is not the configured trigger), so this setup insert
+            # does not itself dispatch a colliding derivation.
+            await backend.create_thought(
+                make_thought(
+                    foreign_id,
+                    essence="unrelated foreign thought",
+                    content="unrelated pre-existing content",
+                )
+            )
+
+            async with _client_for(backend) as client:
+                result = await client.call_tool(
+                    "store_thought",
+                    {
+                        "essence": "foreign-collision source",
+                        "content": "foreign-collision source content",
+                        "thought_id": "foreign-collision-source",
+                    },
+                )
+
+            # State first: the source thought is durable, and the unrelated
+            # foreign thought was reused, not overwritten with the derived
+            # content or given a false provenance edge.
+            source = await backend.get_thought("foreign-collision-source")
+            assert source is not None
+            assert source.content == "foreign-collision source content"
+            foreign = await backend.get_thought(foreign_id)
+            assert foreign is not None
+            assert foreign.content == "unrelated pre-existing content"
+
+            assert result.is_error is True
+            text = _error_text(result.content)
+            assert "stored" in text.lower()
+            assert "derived record" in text.lower()
+            _assert_no_leak(text)
+
+
+class TestDeriveProducerException:
+    """The derive-records producer's own ``derive_records`` call raises.
+
+    Not a ``DerivedRecordError`` -- the producer's own exception type,
+    which engrava's ``_collect_derived`` re-raises bare (unwrapped) under
+    ``on_error="raise"``. Its type belongs to an operator-supplied
+    extension and cannot be named in a ``_tool_errors`` except clause in
+    advance, so :func:`engrava_mcp.server._derive_producer_guard` wraps it
+    in :class:`engrava_mcp.server._DeriveProducerFailedError` first.
+    """
+
+    async def test_reports_a_clean_message_and_never_leaks_the_producers_own_text(
+        self,
+    ) -> None:
+        class _ProducerBoomError(RuntimeError):
+            """The producer's own exception type -- unknown to this server."""
+
+        producer_diagnostic = "proprietary producer diagnostic, never for the client"
+        hooks = _DeriveHooks(
+            trigger_content="producer-exception source content",
+            raises=_ProducerBoomError(producer_diagnostic),
+        )
+        async with _derive_store(hooks) as backend:
+            async with _client_for(backend) as client:
+                result = await client.call_tool(
+                    "store_thought",
+                    {
+                        "essence": "producer-exception source",
+                        "content": "producer-exception source content",
+                        "thought_id": "producer-exception-source",
+                    },
+                )
+
+            source = await backend.get_thought("producer-exception-source")
+            assert source is not None
+            assert source.content == "producer-exception source content"
+
+            assert result.is_error is True
+            text = _error_text(result.content)
+            assert "stored" in text.lower()
+            assert "derived record" in text.lower()
+            assert producer_diagnostic not in text
+            assert "_ProducerBoomError" not in text
+            _assert_no_leak(text)
+
+    async def test_direct_error_maps_to_the_same_message_shape(self) -> None:
+        # Regression guard for the message contract itself, independent of
+        # how the producer failure is reproduced.
+        with pytest.raises(ToolError) as excinfo:
+            async with _tool_errors():
+                raise _DeriveProducerFailedError
+        text = str(excinfo.value)
+        lowered = text.lower()
+        assert "stored" in lowered
+        assert "derived record" in lowered
+        _assert_no_leak(text)
+
+
+#: Namespaces :func:`_resolve_exception_class` searches, in order, to turn an
+#: except-clause identifier into the class object it names. ``sqlite3`` is
+#: needed for ``sqlite3.IntegrityError`` (an attribute access, which
+#: :func:`_except_clause_type_names` resolves to just its trailing
+#: identifier).
+_DERIVE_GUARD_RESOLUTION_NAMESPACES: tuple[object, ...] = (server_module, builtins, sqlite3)
+
+
+def _resolve_exception_class(
+    name: str, namespaces: tuple[object, ...]
+) -> type[BaseException] | None:
+    """Resolve an identifier to the class object it names, in ``namespaces``.
+
+    Args:
+        name: An identifier an ``except`` clause spelled (see
+            :func:`_except_clause_type_names`).
+        namespaces: Objects to look ``name`` up on, in order; the first hit
+            that is actually a class wins.
+
+    Returns:
+        The resolved class, or ``None`` if no namespace has it as a class.
+
+    """
+    for namespace in namespaces:
+        candidate = getattr(namespace, name, None)
+        if isinstance(candidate, type):
+            return candidate
+    return None
+
+
+def _uncovered_derive_guard_names(
+    named: set[str],
+    *,
+    exempt: set[str],
+    covered: tuple[type[BaseException], ...],
+    namespaces: tuple[object, ...],
+) -> tuple[list[str], list[str]]:
+    """Names in ``named`` that ``covered`` does not account for.
+
+    The pure check both the real completeness test and its own failability
+    demonstration call, so the demonstration exercises the actual logic
+    rather than a copy of it.
+
+    Args:
+        named: Identifiers named in ``_tool_errors``'s own except clauses.
+        exempt: Names to skip regardless (the guard's own output type).
+        covered: The exclusion tuple to check ``issubclass`` membership
+            against.
+        namespaces: Objects to resolve each name against, in order.
+
+    Returns:
+        A ``(unresolved, uncovered)`` pair, both sorted: names that could not
+        be resolved to a class at all, and resolved names ``covered`` does
+        not account for.
+
+    """
+    unresolved: list[str] = []
+    uncovered: list[str] = []
+    for name in sorted(named - exempt):
+        cls = _resolve_exception_class(name, namespaces)
+        if cls is None:
+            unresolved.append(name)
+        elif not issubclass(cls, covered):
+            uncovered.append(name)
+    return unresolved, uncovered
+
+
+class TestDeriveProducerGuardExclusionCompleteness:
+    """``_ALREADY_HANDLED_DERIVE_EXCEPTIONS`` must cover every ``_tool_errors`` branch.
+
+    The exclusion tuple :func:`engrava_mcp.server._derive_producer_guard`
+    checks against is hand-maintained, not derived from ``_tool_errors``
+    itself -- so it can silently fall out of sync with it: a type that gets
+    its own ``_tool_errors`` branch in the future but is never added here
+    would, if ever raised from inside the guarded ``store.create_thought``
+    call, be wrapped as ``_DeriveProducerFailedError`` and produce the wrong
+    client-facing message instead of reaching its own handler. This test
+    makes that drift fail loudly: every type named in a ``_tool_errors``
+    except clause must be covered (``issubclass``) by
+    ``_ALREADY_HANDLED_DERIVE_EXCEPTIONS`` -- the one exemption is
+    ``_DeriveProducerFailedError`` itself, the guard's own *output* type,
+    never something ``store.create_thought`` can raise as an input to it.
+    """
+
+    def test_every_tool_errors_branch_is_covered_by_the_derive_guard_exclusion(self) -> None:
+        named = _except_clause_type_names(server_module._tool_errors)
+        unresolved, uncovered = _uncovered_derive_guard_names(
+            named,
+            exempt={"_DeriveProducerFailedError"},
+            covered=server_module._ALREADY_HANDLED_DERIVE_EXCEPTIONS,
+            namespaces=_DERIVE_GUARD_RESOLUTION_NAMESPACES,
+        )
+
+        assert not unresolved, (
+            f"could not resolve {unresolved} to a class via engrava_mcp.server, "
+            "builtins, or sqlite3 -- extend _DERIVE_GUARD_RESOLUTION_NAMESPACES"
+        )
+        assert not uncovered, (
+            f"_tool_errors names {uncovered} in its own except clauses, but "
+            "_ALREADY_HANDLED_DERIVE_EXCEPTIONS does not cover it -- "
+            "_derive_producer_guard could wrap a real instance as "
+            "_DeriveProducerFailedError instead of letting it reach its own "
+            "_tool_errors branch. Add it to _ALREADY_HANDLED_DERIVE_EXCEPTIONS."
+        )
+
+    def test_sweep_fails_on_a_deliberately_uncovered_type(self) -> None:
+        # Proves the completeness check above actually catches a gap, on the
+        # exact shape of gap this test class exists to prevent: a real
+        # _tool_errors branch (MindQLParseError, resolvable via this test
+        # module's own import of it) for a type a too-narrow exclusion tuple
+        # misses.
+        unresolved, uncovered = _uncovered_derive_guard_names(
+            {"MindQLParseError"},
+            exempt=set(),
+            covered=(ValueError,),
+            namespaces=(sys.modules[__name__],),
+        )
+        assert unresolved == []
+        assert uncovered == ["MindQLParseError"]
+
+    def test_sweep_passes_once_the_type_is_added_to_the_exclusion(self) -> None:
+        # Foil to the previous test: adding the missing type to the covered
+        # tuple clears the gap, confirming the check treats that as fixed.
+        unresolved, uncovered = _uncovered_derive_guard_names(
+            {"MindQLParseError"},
+            exempt=set(),
+            covered=(ValueError, MindQLParseError),
+            namespaces=(sys.modules[__name__],),
+        )
+        assert unresolved == []
+        assert uncovered == []
+
+    def test_sweep_ignores_an_exempted_name_regardless_of_coverage(self) -> None:
+        # _DeriveProducerFailedError itself must never be flagged even
+        # though it is not (and must not be) in the exclusion tuple.
+        unresolved, uncovered = _uncovered_derive_guard_names(
+            {"MindQLParseError", "_DeriveProducerFailedError"},
+            exempt={"_DeriveProducerFailedError"},
+            covered=(ValueError, MindQLParseError),
+            namespaces=(sys.modules[__name__],),
+        )
+        assert unresolved == []
+        assert uncovered == []
+
+
+# ---------------------------------------------------------------------------
 # Deliverable 5: the exception-surface sweep.
 # ---------------------------------------------------------------------------
 
@@ -1705,13 +2189,6 @@ _OUT_OF_SCOPE: dict[str, str] = {
         "already holds data, an old layout whose empty tables have an outdated "
         "shape, or a file written by a newer engrava) stops the server from "
         "starting rather than failing a tool call"
-    ),
-    "DerivedRecordError": (
-        "raised by store_thought only when the engrava.yaml this server is "
-        "pointed at turns on derived records, names a hooks class that produces "
-        "them, and sets the failure policy to raise (the default logs and "
-        "continues); the server ships no producer, and the error then arrives "
-        "after the thought itself was stored"
     ),
     "SourceThoughtNotFoundError": (
         "requires the derived-records backfill entry point; no tool calls it"

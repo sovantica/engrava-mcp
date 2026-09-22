@@ -39,15 +39,24 @@ tests already use.
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 import re
 import sqlite3
 import textwrap
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
+import aiosqlite
 import pytest
-from engrava import EdgeType, StaleDataError
+from engrava import (
+    ConnectionQuarantinedError,
+    EdgeType,
+    SqliteEngravaCore,
+    StaleDataError,
+    WriteContentionError,
+    WriteLockTimeoutError,
+)
 from engrava.domain import exceptions as engrava_exceptions
 from engrava.domain.exceptions import DuplicateEdgeError, EngravaError
 from mcp.server.mcpserver import MCPServer
@@ -74,7 +83,6 @@ from tests.inprocess_client import connect_client
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-    from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
     from mcp import Client
 
 #: Substrings that would indicate a leaked traceback or internal symbol.
@@ -112,6 +120,11 @@ _LEAK_MARKERS = (
     # StaleDataError's raw message names the internal entity-type symbol.
     "StaleDataError",
     "Stale data:",
+    # The busy-store, long-write-timeout and unusable-store errors must not name
+    # their own types.
+    "WriteContentionError",
+    "WriteLockTimeoutError",
+    "ConnectionQuarantinedError",
     # A bare ValueError's raw phrasing (duplicate thought_id, oversized edge
     # metadata) must be replaced, not forwarded.
     "Thought already exists:",
@@ -1238,6 +1251,190 @@ class TestEmbeddingQueryRefusal:
         assert isinstance(result["rows"], list)
 
 
+class TestBusyStore:
+    """A guarded write that could not start because another writer held the database.
+
+    ``WriteContentionError`` is raised when a second process (or connection) holds
+    the database's write lock past SQLite's own busy wait. Its docstring promises
+    that nothing was written and that retrying the whole call is safe, so the
+    message may say both. The server does not retry on its own.
+    """
+
+    @pytest.mark.parametrize(
+        ("operation", "attempts"), [("create_thought", 3), ("update_thought", 1)]
+    )
+    async def test_direct_error_maps_to_a_retry_safe_message(
+        self, operation: str, attempts: int
+    ) -> None:
+        with pytest.raises(ToolError) as excinfo:
+            async with _tool_errors():
+                raise WriteContentionError(operation=operation, attempts=attempts)
+
+        text = str(excinfo.value)
+        lowered = text.lower()
+        assert "busy" in lowered
+        assert "another writer" in lowered
+        assert "nothing was changed" in lowered
+        assert "retry" in lowered
+        # The library's own bookkeeping and SQLite's vocabulary stay out.
+        assert operation not in text
+        assert "attempt" not in lowered
+        assert "lock" not in lowered
+        assert "sqlite" not in lowered
+        assert "BEGIN" not in text
+        _assert_no_leak(text)
+
+    async def test_update_thought_reports_the_busy_store_over_the_wire(
+        self, store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _contended_update(
+            self: SqliteEngravaCore, thought_id: str, **changes: object
+        ) -> NoReturn:
+            raise WriteContentionError(operation="update_thought", attempts=1)
+
+        monkeypatch.setattr(type(store), "update_thought", _contended_update)
+
+        async with _client_for(store) as client:
+            result = await client.call_tool(
+                "update_thought",
+                {"thought_id": "thought-alpha", "essence": "contended update"},
+            )
+
+        # State first: the refused update wrote nothing.
+        read_back = await store.get_thought("thought-alpha")
+        assert read_back is not None
+        assert read_back.essence != "contended update"
+
+        assert result.is_error is True
+        text = _error_text(result.content)
+        assert "busy" in text.lower()
+        assert "nothing was changed" in text.lower()
+        assert "retry" in text.lower()
+        _assert_no_leak(text)
+
+
+class TestWriteTimeout:
+    """A write that timed out waiting for a long-running write ahead of it.
+
+    ``WriteLockTimeoutError`` is raised when a task cannot get the store's
+    in-process write lock within its bound. The library does not promise that
+    the timed-out call left nothing behind, so -- unlike the busy-store message
+    -- the wording must not claim that, and must tell the caller to check first.
+    """
+
+    async def test_direct_error_maps_to_a_check_before_repeating_message(self) -> None:
+        with pytest.raises(ToolError) as excinfo:
+            async with _tool_errors():
+                raise WriteLockTimeoutError(timeout_seconds=600.0)
+
+        text = str(excinfo.value)
+        lowered = text.lower()
+        assert "long-running write" in lowered
+        assert "timed out" in lowered
+        assert "retry" in lowered
+        assert "read the affected thought back" in lowered
+        # No promise the library does not make ...
+        assert "nothing" not in lowered
+        assert "safe" not in lowered
+        # ... and none of its internals.
+        assert "600" not in text
+        assert "second" not in lowered
+        assert "lock" not in lowered
+        assert "suspend_auto_commit" not in text
+        _assert_no_leak(text)
+
+    async def test_a_write_waiting_past_the_bound_reports_it_over_the_wire(self) -> None:
+        # A real reproduction, not a stand-in: a store whose write-lock bound is
+        # tiny, and a second task that holds a suspend_auto_commit() window open.
+        # The tool call runs in a different task from the holder, so it can
+        # neither share the hold nor outwait it.
+        connection = await aiosqlite.connect(":memory:")
+        connection.row_factory = aiosqlite.Row
+        backend = SqliteEngravaCore(connection, write_lock_acquire_timeout_seconds=0.05)
+        await backend.ensure_schema()
+        window_open = asyncio.Event()
+        close_window = asyncio.Event()
+
+        async def _hold_the_window() -> None:
+            async with backend.suspend_auto_commit():
+                window_open.set()
+                await close_window.wait()
+
+        holder = asyncio.create_task(_hold_the_window())
+        try:
+            await window_open.wait()
+            async with _client_for(backend) as client:
+                result = await client.call_tool(
+                    "store_thought",
+                    {
+                        "essence": "waited too long",
+                        "content": "This write queues behind the open window.",
+                        "thought_id": "thought-timed-out",
+                    },
+                )
+            close_window.set()
+            await holder
+
+            assert await backend.get_thought("thought-timed-out") is None
+        finally:
+            close_window.set()
+            await holder
+            await connection.close()
+
+        assert result.is_error is True
+        text = _error_text(result.content)
+        assert "long-running write" in text.lower()
+        assert "read the affected thought back" in text.lower()
+        assert "nothing" not in text.lower()
+        _assert_no_leak(text)
+
+
+class TestUnusableStore:
+    """The store's connection was quarantined after an unrecoverable rollback failure.
+
+    ``ConnectionQuarantinedError`` is terminal for the server's store instance:
+    every later operation fails fast with it, and only a restart recovers. The
+    message says so, and does not echo the quarantine's ``reason``.
+    """
+
+    async def test_direct_error_maps_to_a_restart_message(self) -> None:
+        reason = "open transaction left behind by a failed rollback"
+        with pytest.raises(ToolError) as excinfo:
+            async with _tool_errors():
+                raise ConnectionQuarantinedError(reason)
+
+        text = str(excinfo.value)
+        lowered = text.lower()
+        assert "unusable" in lowered
+        assert "restarted" in lowered
+        assert "retrying will not help" in lowered
+        assert "whoever operates the server" in lowered
+        # The reason is the library's own diagnostic text.
+        assert reason not in text
+        assert "quarantine" not in lowered
+        _assert_no_leak(text)
+
+    async def test_a_read_tool_reports_the_unusable_store_over_the_wire(
+        self, store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        reason = "open transaction left behind by a failed rollback"
+
+        async def _quarantined_read(self: SqliteEngravaCore, thought_id: str) -> NoReturn:
+            raise ConnectionQuarantinedError(reason)
+
+        monkeypatch.setattr(type(store), "get_thought", _quarantined_read)
+
+        async with _client_for(store) as client:
+            result = await client.call_tool("get_thought", {"thought_id": "thought-alpha"})
+
+        assert result.is_error is True
+        text = _error_text(result.content)
+        assert "unusable" in text.lower()
+        assert "restarted" in text.lower()
+        assert reason not in text
+        _assert_no_leak(text)
+
+
 # ---------------------------------------------------------------------------
 # Deliverable 5: the exception-surface sweep.
 # ---------------------------------------------------------------------------
@@ -1259,22 +1456,40 @@ _OUT_OF_SCOPE: dict[str, str] = {
         "this type cannot be raised through this server"
     ),
     "EmbeddingProviderContractError": (
-        "raised only at embedding-provider construction, before the server "
-        "lifespan starts serving any tool call"
+        "raised when the store needs an embedding provider's dimension (for a "
+        "search) and the provider has no public one; the only providers this "
+        "server can be given, through an engrava.yaml, are the four built-in "
+        "ones, and all four have it"
     ),
     "EmbeddingModelMismatchError": (
-        "raised only when a store opens against a mismatched embedding model, "
-        "during the lifespan's store resolution -- before any tool call runs"
+        "raised by the first embedding a store writes (store_thought or "
+        "update_thought, when the engrava.yaml turns on embeddings.auto_embed "
+        "with a provider), not when the store opens -- nothing on this server's "
+        "startup path checks the model; the check compares the embedding metadata "
+        "the database already stores (model name, vector length, document-prefix "
+        "fingerprint) with what the configured provider actually produces at that "
+        "first write, and raises when they differ, whatever made them differ"
     ),
     "VectorDimensionMismatchError": (
-        "raised only by search_similar against a caller-supplied query vector; "
-        "no tool on this surface accepts one"
+        "search_memory embeds the query text with the configured embedding "
+        "provider and searches with that vector, so this is raised when the "
+        "provider's vector size differs from the size the store declares or "
+        "holds; no tool accepts a caller-supplied vector, and with no provider "
+        "(the bare ENGRAVA_DB_PATH launch) no query vector is built"
     ),
     "EmbeddingQueryPrefixMismatchError": (
-        "a configured-provider-versus-corpus mismatch; no tool argument can construct it"
+        "raised at search time (search_memory) when the query prefix configured "
+        "for the embedding provider differs from the one the database's "
+        "embeddings were built with; the two prefixes come from the engrava.yaml "
+        "and from whatever built the database's embeddings, never from a tool "
+        "argument"
     ),
     "EmbeddingGenerationError": (
-        "only raised when require_embedding=True is configured; this server never sets it"
+        "raised by store_thought or update_thought only when the engrava.yaml "
+        "this server is pointed at turns on embeddings.auto_embed and "
+        "embeddings.require_embedding and the embedding provider then fails; "
+        "with either off, or with no provider (the bare ENGRAVA_DB_PATH launch), "
+        "this type is never raised"
     ),
     "JournalIntegrityError": (
         "raised only by from_config's on-open journal verification, before the "
@@ -1282,10 +1497,26 @@ _OUT_OF_SCOPE: dict[str, str] = {
     ),
     "ExtensionMigrationError": "requires an installed extension; this server registers none",
     "CoreMigrationError": (
-        "raised only during schema migration at store open, before any tool call runs"
+        "raised when a schema-migration step leaves its target structure missing; "
+        "migrations run when the store opens, before any tool call, and the one "
+        "step re-run later (at the first embedding a store writes) creates a "
+        "small bookkeeping table and checks it exists, so it can only raise this "
+        "if that create silently did nothing"
     ),
-    "SchemaVersionError": "raised only during store open, before any tool call runs",
-    "DerivedRecordError": "requires the derived-records extension seam; no tool calls it",
+    "SchemaVersionError": (
+        "raised only when the store is opened, which the server does once at "
+        "startup: a database this build refuses to open (an old layout that "
+        "already holds data, an old layout whose empty tables have an outdated "
+        "shape, or a file written by a newer engrava) stops the server from "
+        "starting rather than failing a tool call"
+    ),
+    "DerivedRecordError": (
+        "raised by store_thought only when the engrava.yaml this server is "
+        "pointed at turns on derived records, names a hooks class that produces "
+        "them, and sets the failure policy to raise (the default logs and "
+        "continues); the server ships no producer, and the error then arrives "
+        "after the thought itself was stored"
+    ),
     "SourceThoughtNotFoundError": (
         "requires the derived-records backfill entry point; no tool calls it"
     ),
@@ -1294,22 +1525,12 @@ _OUT_OF_SCOPE: dict[str, str] = {
         "requires an explicit current_cycle together with recency_now; "
         "current_cycle is never wire-exposed, so no call can construct the conflict"
     ),
-    "ConnectionQuarantinedError": (
-        "requires a prior cancellation-induced rollback failure on this connection; "
-        "not one of the cases this WS closes -- tracked as follow-up"
-    ),
-    "WriteContentionError": (
-        "requires exhausting the dedup-window's bounded BEGIN IMMEDIATE retries "
-        "under contention; not one of the cases this WS closes -- tracked as follow-up"
-    ),
-    "WriteLockTimeoutError": (
-        "requires a task spawned and awaited from inside another task's own "
-        "suspend_auto_commit() window; no tool handler does this"
-    ),
     "DedupLockReentryError": (
-        "requires a same-task re-entry into the dedup lock, which on this surface "
-        "would need an extension hook this server does not ship -- a boundary, not "
-        "a live defect (see engrava's docs/extension-hooks.md)"
+        "requires a store subclass that overrides a method the deduplicating "
+        "create runs and re-enters that create from it; the server builds the "
+        "library's own store class directly, so no override can be installed, and "
+        "the window itself runs none of the configured hooks (on_store runs after "
+        "both of its locks are released)"
     ),
 }
 
@@ -1484,3 +1705,6 @@ class TestExceptionSurfaceSweep:
         assert "ThoughtNotFoundError" in handled
         assert "DuplicateEdgeError" in handled
         assert "StaleDataError" in handled
+        assert "WriteContentionError" in handled
+        assert "WriteLockTimeoutError" in handled
+        assert "ConnectionQuarantinedError" in handled

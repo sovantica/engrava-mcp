@@ -125,6 +125,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 import anyio
 from engrava import (
+    ConnectionQuarantinedError,
     EdgeRecord,
     EdgeType,
     FieldOp,
@@ -141,6 +142,8 @@ from engrava import (
     ThoughtNotFoundError,
     ThoughtRecord,
     ThoughtType,
+    WriteContentionError,
+    WriteLockTimeoutError,
     parse,
 )
 
@@ -688,7 +691,9 @@ async def _tool_errors() -> AsyncIterator[None]:  # noqa: C901, PLR0912, PLR0915
     rather than described. A concurrent write that lost the optimistic-
     concurrency guard (``StaleDataError``), a duplicate ``thought_id``, and
     oversized edge metadata are likewise mapped rather than left as an
-    internal store message. A numeric argument that overflows SQLite's own
+    internal store message, as are a busy store (another writer, or a
+    long-running write ahead of this one) and a store that has become
+    unusable and needs a restart. A numeric argument that overflows SQLite's own
     bound-integer range gets a generic but honest message, since the raw
     ``OverflowError`` carries no argument name to attribute it to.
 
@@ -798,6 +803,43 @@ async def _tool_errors() -> AsyncIterator[None]:  # noqa: C901, PLR0912, PLR0915
             f"{exc.target_state}: that transition is not allowed. The lifecycle "
             "advances CREATED -> ACTIVE -> DONE -> ARCHIVED and cannot move "
             "backwards or skip ahead."
+        )
+        raise ToolError(msg) from exc
+    except WriteContentionError as exc:
+        # Another connection or process holds the database's write lock past
+        # SQLite's own busy wait. The library guarantees nothing was written and
+        # that retrying the whole call is safe, so the message says both. It does
+        # not echo the operation name or attempt count, and it does not retry
+        # here: the busy wait has already been spent, and a further server-side
+        # retry could push a blocked call past the client's own timeout.
+        msg = (
+            "The memory store is busy: another writer is holding the same "
+            "database, so this write could not start in time. Nothing was "
+            "changed, and retrying the call is safe. Pause briefly, then retry."
+        )
+        raise ToolError(msg) from exc
+    except WriteLockTimeoutError as exc:
+        # A write ahead of this one held the store past the bound. Unlike
+        # WriteContentionError, the library does not promise the timed-out call
+        # left nothing behind, so the message must not say "nothing was changed"
+        # and instead points the caller at reading the thought back. The bound
+        # itself is internal and is not echoed.
+        msg = (
+            "The memory store was held by a long-running write, and this "
+            "request timed out waiting for it. Wait a while, then retry. If "
+            "you are not sure whether the request was applied, read the "
+            "affected thought back first (get_thought or search_memory) "
+            "before repeating it."
+        )
+        raise ToolError(msg) from exc
+    except ConnectionQuarantinedError as exc:
+        # Terminal for this server's store: every later operation fails fast
+        # with the same error, so retrying can never help. The library's reason
+        # text is diagnostic for the operator and is not echoed to the client.
+        msg = (
+            "This server's memory store is in an unusable state, and every "
+            "request that needs it will fail until the server is restarted. "
+            "Retrying will not help. Report this to whoever operates the server."
         )
         raise ToolError(msg) from exc
     except ReferentialIntegrityError as exc:

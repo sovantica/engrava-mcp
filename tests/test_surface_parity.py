@@ -52,14 +52,11 @@ EXPECTED_RESOURCE_TEMPLATE_URIS = frozenset({"engrava://thought/{thought_id}"})
 #: Every prompt the server must advertise (3).
 EXPECTED_PROMPTS = frozenset({"summarize_recent_memory", "find_related", "reflect_on_topic"})
 
-#: Engrava import roots that are part of the documented public surface.  The
-#: top-level ``engrava`` package is public; ``engrava.domain.exceptions`` is the
-#: documented home of ``ReferentialIntegrityError`` (not re-exported from the
-#: top level); ``engrava.domain.models`` / ``engrava.domain.enums`` /
-#: ``engrava.mindql`` deep-import paths are shown in the engrava docs.  Any other
-#: ``engrava.<...>`` import (e.g. ``engrava.infrastructure``) is a private module.
+#: Engrava import roots this server may use: the top-level ``engrava`` package,
+#: which is engrava's public API, and the deep-import roots listed below.  Any
+#: ``engrava.<...>`` import that does not start with one of the prefixes below
+#: (e.g. ``engrava.infrastructure``) is treated as a private module.
 _PUBLIC_ENGRAVA_PREFIXES = (
-    "engrava.domain.exceptions",
     "engrava.domain.enums",
     "engrava.domain.models",
     "engrava.mindql",

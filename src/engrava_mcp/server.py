@@ -126,10 +126,14 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 import anyio
 from engrava import (
     ConnectionQuarantinedError,
+    DuplicateEdgeError,
     EdgeRecord,
     EdgeType,
     FieldOp,
     FieldPredicate,
+    InvalidFilterError,
+    InvalidFilterPathError,
+    InvalidRecencyArgumentError,
     InvalidTransitionError,
     KnowledgeSource,
     LifecycleStatus,
@@ -138,6 +142,7 @@ from engrava import (
     MindQLParseError,
     MindQLQuery,
     Priority,
+    ReferentialIntegrityError,
     StaleDataError,
     ThoughtNotFoundError,
     ThoughtRecord,
@@ -145,21 +150,6 @@ from engrava import (
     WriteContentionError,
     WriteLockTimeoutError,
     parse,
-)
-
-# ``ReferentialIntegrityError`` is part of engrava's public API but is
-# intentionally not re-exported from the top-level ``engrava`` package; the
-# documented way to catch these is to import them from
-# ``engrava.domain.exceptions``.  The metadata-filter and recency errors below
-# are surfaced by ``list_edges`` / ``search_memory``, and ``DuplicateEdgeError``
-# by ``link_thoughts``; all are mapped to clean ``ToolError`` messages in
-# :func:`_tool_errors`.
-from engrava.domain.exceptions import (
-    DuplicateEdgeError,
-    InvalidFilterError,
-    InvalidFilterPathError,
-    InvalidRecencyArgumentError,
-    ReferentialIntegrityError,
 )
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError

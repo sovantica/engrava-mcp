@@ -885,7 +885,7 @@ class TestDuplicateThoughtId:
 class TestConcurrentThoughtUpdate:
     """A concurrent write that loses the optimistic-concurrency guard.
 
-    ``update_thought`` reads the thought's ``updated_cycle`` and guards its
+    ``update_thought`` reads the thought's ``revision`` and guards its
     write on that value unconditionally -- not opt-in, and not exposed as a
     wire argument. Simulated here by advancing the stored row underneath the
     read ``update_thought`` already took, the same window a second real
@@ -908,7 +908,7 @@ class TestConcurrentThoughtUpdate:
         async def _racing_get_thought_row(self: SqliteEngravaCore, thought_id: str) -> object:
             row = await real_get_thought_row(self, thought_id)
             await self._db.execute(
-                "UPDATE thought SET updated_cycle = updated_cycle + 1 WHERE thought_id = ?",
+                "UPDATE thought SET revision = revision + 1 WHERE thought_id = ?",
                 (thought_id,),
             )
             return row

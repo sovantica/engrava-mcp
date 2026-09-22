@@ -773,7 +773,7 @@ async def _tool_errors() -> AsyncIterator[None]:  # noqa: C901, PLR0912, PLR0915
         )
         raise ToolError(msg) from exc
     except StaleDataError as exc:
-        # update_thought guards its write with the thought's updated_cycle at
+        # update_thought guards its write with the thought's revision at
         # the moment it was read; a zero-row match means another writer
         # changed (or deleted) the row in between, and nothing of this update
         # was applied. entity_type ("ThoughtRecord") is an internal class

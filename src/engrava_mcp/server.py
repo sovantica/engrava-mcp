@@ -129,6 +129,7 @@ from engrava import (
     DuplicateEdgeError,
     EdgeRecord,
     EdgeType,
+    EmbeddingQueryPrefixMismatchError,
     FieldOp,
     FieldPredicate,
     InvalidFilterError,
@@ -147,6 +148,7 @@ from engrava import (
     ThoughtNotFoundError,
     ThoughtRecord,
     ThoughtType,
+    VectorDimensionMismatchError,
     WriteContentionError,
     WriteLockTimeoutError,
     parse,
@@ -685,7 +687,13 @@ async def _tool_errors() -> AsyncIterator[None]:  # noqa: C901, PLR0912, PLR0915
     long-running write ahead of this one) and a store that has become
     unusable and needs a restart. A numeric argument that overflows SQLite's own
     bound-integer range gets a generic but honest message, since the raw
-    ``OverflowError`` carries no argument name to attribute it to.
+    ``OverflowError`` carries no argument name to attribute it to. A
+    ``search_memory`` whose configured embedding provider no longer matches
+    what the store declares or holds -- a changed vector size, or a changed
+    query prefix on an asymmetric model -- is likewise mapped rather than
+    left as an internal store message; both are read-path, configuration-only
+    conditions, so the messages report no result and no change rather than
+    suggesting a retry.
 
     Yields:
         ``None``; the caller runs the guarded tool body inside the ``with``.
@@ -714,6 +722,46 @@ async def _tool_errors() -> AsyncIterator[None]:  # noqa: C901, PLR0912, PLR0915
         # states why (raw vector bytes have no JSON representation) and what
         # to query instead; echoing it keeps that wording in one place.
         raise ToolError(str(exc)) from exc
+    except VectorDimensionMismatchError as exc:
+        # search_hybrid gathers its lexical (FTS5) arm before its vector arm,
+        # so whenever FTS5 is available and query_text is non-empty (the
+        # common case) a real keyword pass over the corpus has already run
+        # by the time this fires from the vector arm -- its results are just
+        # discarded, never fused or returned, because the call raises before
+        # fusion. The message must not claim nothing was searched; only that
+        # no result reached the caller and the store itself was not written
+        # to. The raw dimension integers are the store's and the provider's
+        # own numbers, not anything a caller can act on, so they are not
+        # echoed; retrying cannot help, since the mismatch depends only on
+        # server configuration, never on tool arguments.
+        msg = (
+            "search_memory could not run: the configured embedding provider "
+            "produces vectors of a different size than the ones already "
+            "stored in this memory. No result was returned, and nothing was "
+            "changed. Retrying will not help -- the embedding configuration "
+            "needs to be corrected (or restored) by whoever operates this "
+            "server."
+        )
+        raise ToolError(msg) from exc
+    except EmbeddingQueryPrefixMismatchError as exc:
+        # search_memory embeds the query text with the configured provider's
+        # active query prefix before searching; this fires only for an
+        # asymmetric embedding model whose active query prefix no longer
+        # pairs with the one this store's vectors were embedded to pair
+        # with -- typically because the engrava.yaml was pointed at a
+        # different prefix configuration after the store already had
+        # vectors. This is a read path: nothing was written. Neither prefix
+        # is a tool argument, so retrying the same search cannot help; only
+        # correcting the server's embedding configuration can.
+        msg = (
+            "search_memory could not run: the configured embedding "
+            "provider's active query prefix no longer matches the one this "
+            "memory's stored vectors were embedded to pair with. Nothing "
+            "was searched or changed. Retrying will not help -- the "
+            "embedding configuration needs to be corrected (or restored) by "
+            "whoever operates this server."
+        )
+        raise ToolError(msg) from exc
     except OutOfRangeBoundError as exc:
         # A numeric bound outside its accepted domain. The message names only
         # the caller's own argument, its value, and the accepted range — no

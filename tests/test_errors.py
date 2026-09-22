@@ -52,8 +52,10 @@ import pytest
 from engrava import (
     ConnectionQuarantinedError,
     EdgeType,
+    EmbeddingQueryPrefixMismatchError,
     SqliteEngravaCore,
     StaleDataError,
+    VectorDimensionMismatchError,
     WriteContentionError,
     WriteLockTimeoutError,
 )
@@ -133,6 +135,14 @@ _LEAK_MARKERS = (
     "EmbeddingQueryNotSupportedError",
     "OverflowError",
     "convert to SQLite INTEGER",
+    # The search-time embedding-mismatch errors must not name their own type
+    # or echo the store's raw dimension integers / prefix values.
+    "VectorDimensionMismatchError",
+    "query vector dimension mismatch",
+    "store expects",
+    "EmbeddingQueryPrefixMismatchError",
+    "Embedding query prefix mismatch",
+    "corpus was built to pair with",
 )
 
 #: Phrases that would wrongly suggest raw SQL is runnable over the wire.
@@ -1435,6 +1445,206 @@ class TestUnusableStore:
         _assert_no_leak(text)
 
 
+class _FixedDimensionProvider:
+    """A minimal embedding-provider double that produces a fixed-size vector.
+
+    Satisfies only the mandatory ``EmbeddingProviderProtocol`` (``dimension``,
+    ``model_name``, ``embed``, ``embed_batch``) -- no ``query_prefix`` /
+    ``document_prefix`` / role methods -- so ``_role_prefixes`` reports it
+    unprefixed and every embed call goes through the plain ``embed`` path.
+    """
+
+    def __init__(self, dimension: int, *, model_name: str = "test-provider") -> None:
+        self._dimension = dimension
+        self._model_name = model_name
+
+    @property
+    def dimension(self) -> int:
+        return self._dimension
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    async def embed(self, text: str) -> list[float]:
+        del text  # unused: this double ignores query content
+        return [0.1] * self._dimension
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        return [await self.embed(text) for text in texts]
+
+
+class _RoleAwareProvider(_FixedDimensionProvider):
+    """A ``RoleAwareEmbeddingProvider`` double with a configurable query prefix.
+
+    Implements the full role-aware capability (both prefixes and every role
+    method), so ``engrava``'s ``isinstance`` capability check picks it up and
+    ``search_hybrid`` embeds queries through ``embed_query`` -- the path
+    ``_ensure_query_prefix_pairs`` guards.
+    """
+
+    def __init__(
+        self,
+        dimension: int,
+        *,
+        query_prefix: str,
+        document_prefix: str = "passage: ",
+        model_name: str = "test-role-aware-provider",
+    ) -> None:
+        super().__init__(dimension, model_name=model_name)
+        self._query_prefix = query_prefix
+        self._document_prefix = document_prefix
+
+    @property
+    def query_prefix(self) -> str:
+        return self._query_prefix
+
+    @property
+    def document_prefix(self) -> str:
+        return self._document_prefix
+
+    async def embed_query(self, text: str) -> list[float]:
+        return await self.embed(text)
+
+    async def embed_document(self, text: str) -> list[float]:
+        return await self.embed(text)
+
+    async def embed_query_batch(self, texts: list[str]) -> list[list[float]]:
+        return await self.embed_batch(texts)
+
+    async def embed_document_batch(self, texts: list[str]) -> list[list[float]]:
+        return await self.embed_batch(texts)
+
+
+class TestVectorDimensionMismatch:
+    """The configured provider's vectors no longer match what the store holds.
+
+    ``VectorDimensionMismatchError`` is reachable through search_memory
+    whenever an embedding provider is configured: the tool embeds the query
+    text itself with whatever provider is currently configured, so a size
+    mismatch surfaces the moment the engrava.yaml is repointed at a different
+    embedding model after the store already has vectors of the old size. No
+    tool argument names a vector, so nothing a caller supplies can trigger or
+    avoid this -- only the server's own embedding configuration can.
+    """
+
+    async def test_direct_error_maps_to_a_configuration_message(self) -> None:
+        with pytest.raises(ToolError) as excinfo:
+            async with _tool_errors():
+                raise VectorDimensionMismatchError(expected=384, actual=768)
+
+        text = str(excinfo.value)
+        lowered = text.lower()
+        assert "search_memory" in text
+        assert "different size" in lowered
+        assert "no result was returned" in lowered
+        assert "nothing was changed" in lowered
+        assert "retrying will not help" in lowered
+        assert "whoever operates this server" in lowered
+        # The raw dimension integers are the store's and the provider's own
+        # numbers, not anything a caller can act on.
+        assert "384" not in text
+        assert "768" not in text
+        _assert_no_leak(text)
+
+    async def test_search_memory_reports_the_mismatch_over_the_wire(
+        self, store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A real reproduction, not a stand-in: store_embedding locks the
+        # store's corpus at a 3-dimensional vector with no provider involved,
+        # then the store's provider is reconfigured to one that produces
+        # 5-dimensional vectors -- exactly what an engrava.yaml repointed at a
+        # different embedding model after the store already has vectors
+        # looks like.
+        await store.store_embedding("thought-alpha", [0.1, 0.2, 0.3])
+        monkeypatch.setattr(store, "_embedding_provider", _FixedDimensionProvider(5))
+
+        async with _client_for(store) as client:
+            result = await client.call_tool("search_memory", {"query_text": "coffee"})
+
+        # State first: the failed search changed nothing -- the locked
+        # embedding is exactly the one stored above, untouched. (The query
+        # text is non-empty and FTS5 is available, so a real lexical pass
+        # over the corpus already ran internally before the vector arm
+        # raised; that pass is read-only and never reaches this assertion.)
+        embedding = await store.get_embedding("thought-alpha")
+        assert embedding is not None
+        assert embedding.dimension == 3
+
+        assert result.is_error is True
+        text = _error_text(result.content)
+        assert "search_memory" in text
+        assert "different size" in text.lower()
+        assert "no result was returned" in text.lower()
+        assert "nothing was changed" in text.lower()
+        _assert_no_leak(text)
+
+
+class TestEmbeddingQueryPrefixMismatch:
+    """The active query prefix no longer pairs with the stored corpus.
+
+    ``EmbeddingQueryPrefixMismatchError`` is reachable through search_memory
+    only for an asymmetric embedding model: it fires when the provider's
+    active query prefix no longer matches the one the corpus's vectors were
+    embedded to pair with, e.g. the engrava.yaml was repointed at a different
+    prefix configuration after the store already has vectors. Neither prefix
+    is a tool argument, so nothing a caller supplies can trigger or avoid
+    this -- only the server's own embedding configuration can.
+    """
+
+    async def test_direct_error_maps_to_a_configuration_message(self) -> None:
+        with pytest.raises(ToolError) as excinfo:
+            async with _tool_errors():
+                raise EmbeddingQueryPrefixMismatchError(
+                    stored_query_prefix="query: ",
+                    configured_query_prefix="search_query: ",
+                )
+
+        text = str(excinfo.value)
+        lowered = text.lower()
+        assert "search_memory" in text
+        assert "query prefix" in lowered
+        assert "nothing was searched" in lowered
+        assert "retrying will not help" in lowered
+        assert "whoever operates this server" in lowered
+        # The raw stored/configured prefix values are the library's own.
+        assert "query: " not in text
+        assert "search_query: " not in text
+        _assert_no_leak(text)
+
+    async def test_search_memory_reports_the_mismatch_over_the_wire(
+        self, store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A real reproduction, not a stand-in: configure a role-aware
+        # provider, lock the store's corpus with it (which records its query
+        # prefix in _metadata), then reconfigure the store's provider to one
+        # with a different query prefix but the same dimension -- exactly
+        # what an engrava.yaml repointed at a different prefix configuration
+        # after the store already has vectors looks like. Keeping the
+        # dimension equal isolates the prefix mismatch from a dimension one.
+        monkeypatch.setattr(
+            store, "_embedding_provider", _RoleAwareProvider(4, query_prefix="query: ")
+        )
+        await store.store_embedding(
+            "thought-alpha", [0.1, 0.2, 0.3, 0.4], model_name="role-aware-model"
+        )
+        monkeypatch.setattr(
+            store,
+            "_embedding_provider",
+            _RoleAwareProvider(4, query_prefix="search_query: "),
+        )
+
+        async with _client_for(store) as client:
+            result = await client.call_tool("search_memory", {"query_text": "coffee"})
+
+        assert result.is_error is True
+        text = _error_text(result.content)
+        assert "search_memory" in text
+        assert "query prefix" in text.lower()
+        assert "nothing was searched" in text.lower()
+        _assert_no_leak(text)
+
+
 # ---------------------------------------------------------------------------
 # Deliverable 5: the exception-surface sweep.
 # ---------------------------------------------------------------------------
@@ -1469,20 +1679,6 @@ _OUT_OF_SCOPE: dict[str, str] = {
         "the database already stores (model name, vector length, document-prefix "
         "fingerprint) with what the configured provider actually produces at that "
         "first write, and raises when they differ, whatever made them differ"
-    ),
-    "VectorDimensionMismatchError": (
-        "search_memory embeds the query text with the configured embedding "
-        "provider and searches with that vector, so this is raised when the "
-        "provider's vector size differs from the size the store declares or "
-        "holds; no tool accepts a caller-supplied vector, and with no provider "
-        "(the bare ENGRAVA_DB_PATH launch) no query vector is built"
-    ),
-    "EmbeddingQueryPrefixMismatchError": (
-        "raised at search time (search_memory) when the query prefix configured "
-        "for the embedding provider differs from the one the database's "
-        "embeddings were built with; the two prefixes come from the engrava.yaml "
-        "and from whatever built the database's embeddings, never from a tool "
-        "argument"
     ),
     "EmbeddingGenerationError": (
         "raised by store_thought or update_thought only when the engrava.yaml "

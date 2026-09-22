@@ -313,6 +313,34 @@ class TestServerEndToEnd:
         assert result.structured_content is not None
         assert result.structured_content["thought_count"] == 1
 
+    async def test_memory_stats_reports_unmeasured_when_metrics_disabled(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "stats-disabled.db"
+        await _seed_database(db_path)
+
+        config_path = tmp_path / "engrava.yaml"
+        config_path.write_text(
+            f"database:\n  path: {db_path}\nmetrics:\n  enabled: false\n",
+            encoding="utf-8",
+        )
+        monkeypatch.delenv(DB_PATH_ENV_VAR, raising=False)
+        monkeypatch.setenv(CONFIG_ENV_VAR, str(config_path))
+
+        server = build_server()
+        async with connect_client(server) as client:
+            result = await client.call_tool("memory_stats", {})
+
+        assert result.structured_content is not None
+        # The live, ungated count still reflects the seeded thought...
+        assert result.structured_content["thought_count"] == 1
+        # ...while the gated metrics snapshot is a zero-filled placeholder,
+        # and the flag says so.
+        assert result.structured_content["metrics"]["measured"] is False
+        assert result.structured_content["metrics"]["thoughts"]["total"] == 0
+
 
 async def _seed_varied_database(path: Path) -> None:
     """Create a database file spanning several types, statuses, priorities.

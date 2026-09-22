@@ -326,5 +326,5 @@ class TestFtsNormalizationRegression:
         # D4 lock: the public stats surface exposes exactly these metric groups
         # and never the concrete store's fts_match_failure_count diagnostic.
         stats = await memory_stats_impl(store)
-        assert set(stats["metrics"]) == {"thoughts", "edges", "storage_total_bytes"}
+        assert set(stats["metrics"]) == {"thoughts", "edges", "storage_total_bytes", "measured"}
         assert "fts_match_failure_count" not in json.dumps(stats)

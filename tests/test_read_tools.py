@@ -177,6 +177,9 @@ class TestMemoryStats:
         assert result["metrics"]["edges"]["total"] == 0
         assert result["metrics"]["thoughts"]["by_status"]["ACTIVE"] == 2
         assert isinstance(result["metrics"]["storage_total_bytes"], int)
+        # Metrics collection is enabled by default, so the snapshot is a real
+        # measurement, not a zero-filled placeholder.
+        assert result["metrics"]["measured"] is True
 
 
 class TestStoreProvider:

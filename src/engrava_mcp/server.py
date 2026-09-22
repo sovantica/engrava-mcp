@@ -1372,7 +1372,10 @@ async def memory_stats_impl(store: ReadOnlyMcpStore) -> dict[str, Any]:
 
     Returns:
         A dict with the live ``thought_count`` plus a ``metrics`` block
-        carrying thought/edge counts and a storage-byte total.
+        carrying thought/edge counts, a storage-byte total, and a
+        ``measured`` flag. When ``measured`` is ``False`` the store's
+        metrics collection is disabled and the counts are zero-filled
+        placeholders, not a real measurement.
 
     """
     thought_count = await store.count_thoughts()
@@ -1390,6 +1393,7 @@ async def memory_stats_impl(store: ReadOnlyMcpStore) -> dict[str, Any]:
                 "by_type": metrics.edges.by_type,
             },
             "storage_total_bytes": metrics.storage.total_bytes,
+            "measured": metrics.measured,
         },
     }
 
@@ -2135,7 +2139,11 @@ def register_resources(server: MCPServer, provider: StoreProvider) -> None:
         "engrava://stats",
         name="stats",
         title="Store statistics",
-        description="Aggregate thought and edge counts and total storage size.",
+        description=(
+            "Aggregate thought and edge counts and total storage size. Counts "
+            "are zero-filled placeholders (see 'measured') if metrics "
+            "collection is disabled."
+        ),
         mime_type=RESOURCE_MIME_TYPE,
     )
     async def stats_resource() -> str:
@@ -2377,7 +2385,10 @@ def register_tools(server: MCPServer, provider: StoreProvider, *, read_only: boo
         name="memory_stats",
         description=(
             "Return aggregate statistics about the memory store: thought and "
-            "edge counts and total storage size."
+            "edge counts and total storage size. If the store's metrics "
+            "collection is disabled, the counts in this response are "
+            "zero-filled placeholders rather than a real measurement — check "
+            "the 'measured' flag to tell the two cases apart."
         ),
         annotations=_READ_ONLY,
     )

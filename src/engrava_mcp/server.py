@@ -682,6 +682,66 @@ _LINK_THOUGHTS_BUSY_MESSAGE = (
     "SQLite reported database contention. Nothing was written, and retrying is safe."
 )
 
+#: Client-facing message for a busy ``sqlite3.OperationalError`` from
+#: ``store.delete_thought`` (``delete_thought``) or ``store.delete_edge``
+#: (``delete_edge``).  Each delete, when it opens its own transaction,
+#: takes the write lock (``BEGIN IMMEDIATE``) before its database reads and
+#: writes. A failure in its write unit (the delete, ``delete_thought``'s
+#: vector purge, the journal append) or in its commit is rolled back, or
+#: the connection quarantined, and nothing is written after the commit.
+#: And a plain ``ROLLBACK`` cannot report ``SQLITE_BUSY``. So a busy error
+#: from either call means nothing was deleted, and retrying is safe.
+_DELETE_BUSY_MESSAGE = (
+    "SQLite reported database contention. Nothing was deleted, and retrying is safe."
+)
+
+
+@asynccontextmanager
+async def _busy_guard(message: str) -> AsyncIterator[None]:
+    """Map a busy ``sqlite3.OperationalError`` from one store call to a curated ``ToolError``.
+
+    Shared by :func:`link_thoughts_impl` (around ``store.create_edge``),
+    :func:`delete_thought_impl` (around ``store.delete_thought``) and
+    :func:`delete_edge_impl` (around ``store.delete_edge``) -- one guard,
+    parameterised by *message*, rather than three copies. The ``with`` wraps
+    that single store call only, never the surrounding tool body, so a
+    failure in this module's own argument handling is never mistaken for a
+    store failure.
+
+    Each of the three guarded calls, when it opens its own transaction,
+    takes the write lock (``BEGIN IMMEDIATE``) before its database reads
+    and writes. A failure in its write unit (the write and its journal
+    append -- and, for ``delete_thought``, the vector purge) or in its
+    commit is rolled back, or the connection quarantined if that rollback
+    itself fails, and nothing is written after the commit. And a plain
+    ``ROLLBACK`` cannot report ``SQLITE_BUSY``. So a busy error from any
+    of the three calls means that call's own write did not happen, and
+    retrying is safe.
+
+    Args:
+        message: The client-facing text to raise when the guarded call fails
+            with a busy error -- :data:`_LINK_THOUGHTS_BUSY_MESSAGE` for
+            ``create_edge``, :data:`_DELETE_BUSY_MESSAGE` for the two delete
+            calls.
+
+    Yields:
+        ``None``; the caller runs the guarded store call inside the ``with``.
+
+    Raises:
+        ToolError: When the guarded call raises a busy
+            ``sqlite3.OperationalError`` (:func:`_is_busy_error`), carrying
+            *message*, chained ``from`` the original exception. Any other
+            exception raised inside the ``with`` -- including a non-busy
+            ``sqlite3.OperationalError`` -- propagates unchanged.
+
+    """
+    try:
+        yield
+    except sqlite3.OperationalError as exc:
+        if not _is_busy_error(exc):
+            raise
+        raise ToolError(message) from exc
+
 
 class _ResidualWriteError(Exception):
     """Wraps a write-path exception :func:`_tool_errors`'s own chain does not curate.
@@ -996,14 +1056,15 @@ async def _tool_errors() -> AsyncIterator[None]:  # noqa: C901, PLR0912, PLR0915
     message that states neither which step raised nor whether the write took
     effect, because a residual exception may have fired either before or
     after the write's own commit, and this function cannot tell which. A
-    busy ``sqlite3.OperationalError`` from ``store.create_thought`` or
-    ``store.create_edge`` never reaches this chain at all: each is answered
-    by a narrow guard around that one call (:func:`_residual_write_guard`,
-    :func:`link_thoughts_impl`) before classification would begin, because
-    the two calls establish different things about a busy failure (a
-    ``create_edge`` commit is followed by nothing that can still write; a
-    ``create_thought`` commit is not) and a chain-level branch here could
-    only give both the same answer.
+    busy ``sqlite3.OperationalError`` from ``store.create_thought``,
+    ``store.create_edge``, ``store.delete_thought`` or ``store.delete_edge``
+    never reaches this chain at all: each is answered by a narrow guard
+    around that one call (:func:`_residual_write_guard` for
+    ``create_thought``; :func:`_busy_guard`, shared, for the other three)
+    before classification would begin, because ``create_thought``'s commit
+    is followed by steps that can still write, while the other three's
+    commits are not, and a chain-level branch here could only give all of
+    them the same answer.
 
     Yields:
         ``None``; the caller runs the guarded tool body inside the ``with``.
@@ -2383,8 +2444,8 @@ async def link_thoughts_impl(
         ValueError: If ``metadata`` serializes above the store's size limit.
         ToolError: If ``store.create_edge`` raises a busy
             ``sqlite3.OperationalError`` (:func:`_is_busy_error`), carrying
-            :data:`_LINK_THOUGHTS_BUSY_MESSAGE`. Raised directly, from a
-            guard around this one call only -- never around this function's
+            :data:`_LINK_THOUGHTS_BUSY_MESSAGE`. Raised by :func:`_busy_guard`,
+            wrapped around this one call only -- never around this function's
             own argument handling.
 
     """
@@ -2403,13 +2464,10 @@ async def link_thoughts_impl(
     # from acquiring the lock or from the commit itself (a reader blocking
     # the upgrade, in rollback-journal mode), always means nothing was
     # written. Anything else propagates unchanged to the caller's own
-    # _tool_errors, as before this guard existed.
-    try:
+    # _tool_errors, as before this guard existed. See _busy_guard, shared
+    # with the two delete tools.
+    async with _busy_guard(_LINK_THOUGHTS_BUSY_MESSAGE):
         created = await store.create_edge(record)
-    except sqlite3.OperationalError as exc:
-        if not _is_busy_error(exc):
-            raise
-        raise ToolError(_LINK_THOUGHTS_BUSY_MESSAGE) from exc
     return {
         "edge": {
             "edge_id": created.edge_id,
@@ -2438,8 +2496,23 @@ async def delete_thought_impl(store: SqliteEngravaCore, thought_id: str) -> dict
         A dict with a ``deleted`` flag: ``True`` when a thought was
         removed, ``False`` when no thought had the given identifier.
 
+    Raises:
+        ToolError: If ``store.delete_thought`` raises a busy
+            ``sqlite3.OperationalError`` (:func:`_is_busy_error`), carrying
+            :data:`_DELETE_BUSY_MESSAGE`. Raised by :func:`_busy_guard`,
+            wrapped around this one call only -- never around this
+            function's own argument handling.
+
     """
-    deleted = await store.delete_thought(thought_id)
+    # delete_thought, when it opens its own transaction, takes the write lock
+    # (BEGIN IMMEDIATE) before its reads and writes. A failure in its write
+    # unit (the delete, the vector purge, the journal append) or in its commit
+    # is rolled back, or the connection quarantined, and nothing is written
+    # after the commit. And a plain ROLLBACK cannot report SQLITE_BUSY. So a
+    # busy error here means nothing was deleted; anything else propagates
+    # unchanged to the caller's own _tool_errors.
+    async with _busy_guard(_DELETE_BUSY_MESSAGE):
+        deleted = await store.delete_thought(thought_id)
     return {"deleted": deleted}
 
 
@@ -2457,8 +2530,23 @@ async def delete_edge_impl(store: SqliteEngravaCore, edge_id: str) -> dict[str, 
         A dict with a ``deleted`` flag: ``True`` when an edge was removed,
         ``False`` when no edge had the given identifier.
 
+    Raises:
+        ToolError: If ``store.delete_edge`` raises a busy
+            ``sqlite3.OperationalError`` (:func:`_is_busy_error`), carrying
+            :data:`_DELETE_BUSY_MESSAGE`. Raised by :func:`_busy_guard`,
+            wrapped around this one call only -- never around this
+            function's own argument handling.
+
     """
-    deleted = await store.delete_edge(edge_id)
+    # delete_edge, when it opens its own transaction, takes the write lock
+    # (BEGIN IMMEDIATE) before its reads and writes. A failure in its write
+    # unit (the delete, the journal append) or in its commit is rolled back,
+    # or the connection quarantined, and nothing is written after the commit.
+    # And a plain ROLLBACK cannot report SQLITE_BUSY. So a busy error here
+    # means nothing was deleted; anything else propagates unchanged to the
+    # caller's own _tool_errors.
+    async with _busy_guard(_DELETE_BUSY_MESSAGE):
+        deleted = await store.delete_edge(edge_id)
     return {"deleted": deleted}
 
 

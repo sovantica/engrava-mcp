@@ -1,14 +1,17 @@
-"""Tests for how a busy SQLite store is answered by ``link_thoughts`` and ``store_thought``.
+"""Tests for how a busy SQLite store is answered by the write tools this module covers.
 
 A busy ``sqlite3.OperationalError`` -- SQLite reported database contention -- means
-different things for the two write tools this module covers, because of *where* it can
+different things for the write tools this module covers, because of *where* it can
 come from (see ``engrava_mcp.server``'s own module-level docstrings for ``_is_busy_error``,
-``_store_thought_busy_message`` and ``_residual_write_guard``):
+``_store_thought_busy_message``, ``_residual_write_guard`` and ``_busy_guard``):
 
-* ``link_thoughts``'s ``store.create_edge`` is one write unit (a ``BEGIN IMMEDIATE``, its
-  journal append, then one commit) with nothing written after it, so a busy error there --
-  whether from acquiring the lock or from the commit itself -- always means nothing was
-  written, and the message says so.
+* ``link_thoughts``'s ``store.create_edge``, ``delete_thought``'s ``store.delete_thought``
+  and ``delete_edge``'s ``store.delete_edge`` each take the write lock before their writes,
+  and nothing is written after their commit. A failure while writing or committing is
+  rolled back (or the connection quarantined), and a plain ``ROLLBACK`` cannot report a
+  busy error. So a busy error there -- whether from acquiring the lock or from the commit
+  itself -- means nothing was written or deleted, and the message says so. All three share
+  one guard (``_busy_guard``), parameterised by message.
 * ``store_thought``'s ``store.create_thought`` commits before several steps that can still
   raise afterwards (auto-embed, hygiene cleanup, a hooks class, derived-record dispatch), so
   a busy error establishes nothing about the outcome. The message instead reports what one
@@ -45,9 +48,9 @@ from typing import TYPE_CHECKING, NoReturn
 
 import aiosqlite
 import pytest
-from engrava import EdgeType, SqliteEngravaCore
+from engrava import EdgeRecord, EdgeType, SqliteEngravaCore
 
-from engrava_mcp.server import link_thoughts_impl
+from engrava_mcp.server import delete_edge_impl, delete_thought_impl, link_thoughts_impl
 from tests.conftest import make_thought
 from tests.test_errors import _assert_no_leak, _client_for, _error_text
 
@@ -204,6 +207,20 @@ def _expected_link_thoughts_busy_message() -> str:
 
     """
     return "SQLite reported database contention. Nothing was written, and retrying is safe."
+
+
+def _expected_delete_busy_message() -> str:
+    """The exact ``delete_thought`` / ``delete_edge`` busy-store message, written out literally.
+
+    Not imported from :mod:`engrava_mcp.server` -- see
+    :func:`_expected_link_thoughts_busy_message` for why.
+
+    Returns:
+        The exact message text, unprefixed by MCPServer's own
+        ``"Error executing tool <name>: "`` wrapper.
+
+    """
+    return "SQLite reported database contention. Nothing was deleted, and retrying is safe."
 
 
 def _expected_store_thought_not_found_message(thought_id: str) -> str:
@@ -408,6 +425,132 @@ class TestLinkThoughtsBusyGuard:
 
             edges = await backend.list_edges(source="thought-a")
             assert len(edges) == 0
+
+
+class TestDeleteThoughtBusyGuard:
+    """A busy ``delete_thought`` maps to a curated, retry-safe message; nothing else does."""
+
+    async def test_non_busy_operational_error_propagates_unchanged(
+        self, store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        original = sqlite3.OperationalError("disk I/O error")
+        original.sqlite_errorcode = 10  # type: ignore[attr-defined]
+
+        async def _failing_delete_thought(self: SqliteEngravaCore, thought_id: str) -> NoReturn:
+            raise original
+
+        monkeypatch.setattr(type(store), "delete_thought", _failing_delete_thought)
+
+        with pytest.raises(sqlite3.OperationalError) as excinfo:
+            await delete_thought_impl(store, "thought-alpha")
+        assert excinfo.value is original
+
+    async def test_held_write_lock_reports_the_busy_message_and_thought_survives(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "delete-thought-busy-write-lock.db"
+        async with _file_store(db_path) as backend:
+            await backend.create_thought(
+                make_thought("thought-a", essence="doomed thought", content="a body")
+            )
+
+            holder = _grab_write_lock(db_path)
+            try:
+                async with _client_for(backend) as client:
+                    result = await client.call_tool("delete_thought", {"thought_id": "thought-a"})
+            finally:
+                _release(holder)
+
+            assert result.is_error is True
+            text = _error_text(result.content)
+            expected = _expected_delete_busy_message()
+            assert text == f"Error executing tool delete_thought: {expected}"
+            _assert_no_leak(text)
+
+            survivor = await backend.get_thought("thought-a")
+            assert survivor is not None
+
+    async def test_commit_time_busy_reports_the_busy_message_and_thought_survives(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "delete-thought-busy-commit.db"
+        async with _file_store(db_path, journal_mode="DELETE") as backend:
+            await backend.create_thought(
+                make_thought("thought-a", essence="doomed thought", content="a body")
+            )
+
+            holder = _grab_read_lock(db_path)
+            try:
+                async with _client_for(backend) as client:
+                    result = await client.call_tool("delete_thought", {"thought_id": "thought-a"})
+            finally:
+                _release(holder)
+
+            assert result.is_error is True
+            text = _error_text(result.content)
+            expected = _expected_delete_busy_message()
+            assert text == f"Error executing tool delete_thought: {expected}"
+            _assert_no_leak(text)
+
+            survivor = await backend.get_thought("thought-a")
+            assert survivor is not None
+
+
+class TestDeleteEdgeBusyGuard:
+    """A busy ``delete_edge`` maps to a curated, retry-safe message; nothing else does."""
+
+    async def test_non_busy_operational_error_propagates_unchanged(
+        self, store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        original = sqlite3.OperationalError("disk I/O error")
+        original.sqlite_errorcode = 10  # type: ignore[attr-defined]
+
+        async def _failing_delete_edge(self: SqliteEngravaCore, edge_id: str) -> NoReturn:
+            raise original
+
+        monkeypatch.setattr(type(store), "delete_edge", _failing_delete_edge)
+
+        with pytest.raises(sqlite3.OperationalError) as excinfo:
+            await delete_edge_impl(store, "edge-alpha")
+        assert excinfo.value is original
+
+    async def test_held_write_lock_reports_the_busy_message_and_edge_survives(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "delete-edge-busy-write-lock.db"
+        async with _file_store(db_path) as backend:
+            await backend.create_thought(
+                make_thought("thought-a", essence="edge source", content="a body")
+            )
+            await backend.create_thought(
+                make_thought("thought-b", essence="edge target", content="b body")
+            )
+            await backend.create_edge(
+                EdgeRecord(
+                    edge_id="edge-to-survive",
+                    from_thought_id="thought-a",
+                    to_thought_id="thought-b",
+                    edge_type=EdgeType.ASSOCIATED,
+                    weight=1.0,
+                    created_cycle=0,
+                )
+            )
+
+            holder = _grab_write_lock(db_path)
+            try:
+                async with _client_for(backend) as client:
+                    result = await client.call_tool("delete_edge", {"edge_id": "edge-to-survive"})
+            finally:
+                _release(holder)
+
+            assert result.is_error is True
+            text = _error_text(result.content)
+            expected = _expected_delete_busy_message()
+            assert text == f"Error executing tool delete_edge: {expected}"
+            _assert_no_leak(text)
+
+            edges = await backend.get_edges("thought-a", direction="OUT")
+            assert [edge.edge_id for edge in edges] == ["edge-to-survive"]
 
 
 class TestStoreThoughtBusyGuard:

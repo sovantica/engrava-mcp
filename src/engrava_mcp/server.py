@@ -625,6 +625,63 @@ def _check_prompt_bound(name: str, value: int, *, minimum: int, maximum: int | N
 #: text is also checked as a fallback.
 _SQLITE_CONSTRAINT_PRIMARYKEY = 1555
 
+#: SQLite result codes that report database contention: ``SQLITE_BUSY`` (5)
+#: and its extended forms ``SQLITE_BUSY_RECOVERY`` (261),
+#: ``SQLITE_BUSY_SNAPSHOT`` (517) and ``SQLITE_BUSY_TIMEOUT`` (773). The same
+#: set engrava's own (private) classifier uses; defined here rather than
+#: imported, since this server does not depend on engrava's private symbols.
+#: ``SQLITE_LOCKED`` (6) is a different family of locking conflict and is not
+#: included.
+_BUSY_ERRORCODES: frozenset[int] = frozenset(
+    {
+        getattr(sqlite3, "SQLITE_BUSY", 5),
+        getattr(sqlite3, "SQLITE_BUSY_RECOVERY", 261),
+        getattr(sqlite3, "SQLITE_BUSY_SNAPSHOT", 517),
+        getattr(sqlite3, "SQLITE_BUSY_TIMEOUT", 773),
+    }
+)
+
+
+def _is_busy_error(exc: sqlite3.OperationalError) -> bool:
+    """Return whether *exc* means SQLite reported database contention.
+
+    Classifies structurally, via :attr:`sqlite3.Error.sqlite_errorcode`,
+    never by matching ``str(exc)`` -- driver and locale text for "database is
+    locked" is not a stable contract. The other side of a busy error can be
+    a writer, or -- in rollback-journal mode, which ``engrava.yaml`` can
+    still select -- a reader blocking this connection's own commit; nothing
+    here or in any caller may claim which, or that a lock is held at the
+    moment the message is composed.
+
+    Args:
+        exc: The raised SQLite operational error.
+
+    Returns:
+        ``True`` when ``exc.sqlite_errorcode`` is one of :data:`_BUSY_ERRORCODES`.
+        ``False`` for ``SQLITE_LOCKED`` (6), any other code, and for an
+        exception with no (or a non-``int``) ``sqlite_errorcode`` -- e.g. one
+        built by hand rather than raised by the driver.
+
+    """
+    errorcode = getattr(exc, "sqlite_errorcode", None)
+    if not isinstance(errorcode, int):
+        return False
+    return errorcode in _BUSY_ERRORCODES
+
+
+#: Client-facing message for a busy ``sqlite3.OperationalError`` from
+#: ``store.create_edge`` (``link_thoughts``).  ``create_edge`` is one write
+#: unit begun ``BEGIN IMMEDIATE``, with its journal append inside it, then one
+#: commit through the store's own recovery path, and nothing written after it
+#: -- so a busy error here, whether it comes from acquiring the lock or from
+#: the commit itself, always means nothing was written, and retrying the
+#: whole call is safe.  Unlike ``store_thought`` (see
+#: :func:`_residual_write_guard`), nothing in this call can still write after
+#: that commit, so the message never varies.
+_LINK_THOUGHTS_BUSY_MESSAGE = (
+    "SQLite reported database contention. Nothing was written, and retrying is safe."
+)
+
 
 class _ResidualWriteError(Exception):
     """Wraps a write-path exception :func:`_tool_errors`'s own chain does not curate.
@@ -643,7 +700,11 @@ class _ResidualWriteError(Exception):
     something new (an extension's ``__str__`` that itself raises, say), or the
     guarded call raised a :class:`ToolError` itself, which the chain has no
     branch for and so passes through unchanged. See
-    :func:`_residual_write_guard` for how that is decided.
+    :func:`_residual_write_guard` for how that is decided. A busy
+    ``sqlite3.OperationalError`` from ``store.create_thought`` is a known
+    category, not a residual one: :func:`_residual_write_guard` recognises
+    and answers it before this classification ever runs, so it never becomes
+    a :class:`_ResidualWriteError`.
 
     Because a residual exception may have fired either before or after the
     write's own commit, and this guard cannot tell which, the message this
@@ -685,9 +746,74 @@ class _ResidualWriteError(Exception):
         super().__init__(f"{tool} raised an exception type engrava-mcp does not classify")
 
 
+async def _store_thought_busy_message(
+    store: SqliteEngravaCore, thought_id: str, *, deduplicate: bool
+) -> str:
+    """Build the client-facing message for a busy ``create_thought``.
+
+    Unlike ``create_edge`` (:data:`_LINK_THOUGHTS_BUSY_MESSAGE`),
+    ``create_thought``'s commit is followed by several steps that can each
+    still raise (auto-embed, hygiene cleanup, the configured hooks class,
+    derived-record dispatch), so a busy error here establishes nothing about
+    whether the thought was stored: it can come from before that commit or
+    from any of those later steps. This reads the attempted id back once,
+    with :meth:`~engrava.SqliteEngravaCore.get_thought`, and reports only
+    what that one read found -- never what this call did, and never a
+    durability or retry-safety claim the read cannot support: a present
+    thought could equally be a pre-existing one this call never touched, and
+    a read-then-report is a snapshot, not proof of what a retry would do.
+
+    Args:
+        store: The store to read the attempted id back from.
+        thought_id: The id ``store.create_thought`` attempted -- the
+            caller-supplied or server-generated id, not an internal value.
+        deduplicate: The ``store_thought`` call's own ``deduplicate``
+            value, used only when the read-back itself raises: it selects
+            between :func:`_ResidualWriteError`'s two ``store_thought``
+            pieces of advice, since a duplicate-content match changes what
+            reading ``thought_id`` back could have proven.
+
+    Returns:
+        The message text, unprefixed by MCPServer's own
+        ``"Error executing tool <name>: "`` wrapper.
+
+    """
+    try:
+        found = await store.get_thought(thought_id)
+    except Exception:  # noqa: BLE001 -- the read-back itself can fail for any reason
+        if deduplicate:
+            return (
+                f"store_thought for {thought_id!r} (deduplicate=True): SQLite "
+                "reported database contention; whether the thought was stored "
+                "could not be confirmed. With deduplicate=True the call may have "
+                "matched an existing thought with identical content instead of "
+                f"storing a new one, so reading {thought_id!r} back with "
+                "get_thought cannot settle what happened: finding it shows a "
+                "thought with that id exists, not that this call stored it."
+            )
+        return (
+            f"store_thought for {thought_id!r}: SQLite reported database "
+            "contention; whether the thought was stored could not be "
+            "confirmed. Read it back with get_thought before retrying -- a "
+            "blind retry can store a second copy."
+        )
+    if found is None:
+        return (
+            f"store_thought for {thought_id!r}: SQLite reported database "
+            "contention; whether the thought was stored could not be "
+            "confirmed. A read just now found no thought with this id."
+        )
+    return (
+        f"store_thought for {thought_id!r}: SQLite reported database "
+        "contention; whether the thought was stored could not be confirmed. "
+        "A read just now found a thought with this id."
+    )
+
+
 @asynccontextmanager
 async def _residual_write_guard(
     *,
+    store: SqliteEngravaCore,
     tool: Literal["store_thought", "update_thought"],
     thought_id: str,
     deduplicate: bool = False,
@@ -699,40 +825,70 @@ async def _residual_write_guard(
     this module's own argument handling and would turn a genuine bug in this
     server's own code into a misleading write-failure message.
 
-    Classification keeps no list of its own. It runs :func:`_tool_errors`'s
-    own ordered chain exactly once, by re-raising the caught exception
-    (``exc``) inside a nested ``async with _tool_errors():``. Every current
-    mapping branch there raises ``ToolError(msg) from exc``, so a caught
-    :class:`ToolError` whose ``__cause__ is exc`` is a curated result --
-    re-raised here unchanged, and passed through untouched by the real,
-    outer :func:`_tool_errors` this function's own caller runs inside, since
-    no branch there matches a :class:`ToolError` either (it derives from
-    ``MCPServerError`` -> ``Exception``, and the chain has no broad catch).
-    Anything else is residual: the same exception re-raised unchanged
-    because no branch names its type, a new exception raised while a branch
-    was composing its message (a throwing ``__str__``, say), or a
-    :class:`ToolError` the guarded call raised itself -- indistinguishable
-    from a curated one by type alone, but its ``__cause__`` cannot be
-    ``exc``, since no branch catches ``ToolError``.
+    A busy ``sqlite3.OperationalError`` (:func:`_is_busy_error`) from
+    ``store.create_thought`` is handled first, **before** anything reaches
+    :func:`_tool_errors`'s own ordered chain: it is a known category, not an
+    unrecognised one, so there is nothing to classify -- see
+    :func:`_store_thought_busy_message` for why the answer still cannot say
+    whether the thought was stored. A busy error from ``store.update_thought``
+    is not special-cased here: engrava raises its own typed
+    ``WriteContentionError`` for that path's contention (kept by
+    :func:`_tool_errors`'s existing branch), and a raw busy
+    ``sqlite3.OperationalError`` there falls through to the same
+    classify-once handling as any other residual exception, unchanged from
+    before.
+
+    Anything else is classified with no list of its own. It runs
+    :func:`_tool_errors`'s own ordered chain exactly once, by re-raising the
+    caught exception (``exc``) inside a nested ``async with
+    _tool_errors():``. Every current mapping branch there raises
+    ``ToolError(msg) from exc``, so a caught :class:`ToolError` whose
+    ``__cause__ is exc`` is a curated result -- re-raised here unchanged, and
+    passed through untouched by the real, outer :func:`_tool_errors` this
+    function's own caller runs inside, since no branch there matches a
+    :class:`ToolError` either (it derives from ``MCPServerError`` ->
+    ``Exception``, and the chain has no broad catch). Anything else is
+    residual: the same exception re-raised unchanged because no branch names
+    its type, a new exception raised while a branch was composing its
+    message (a throwing ``__str__``, say), or a :class:`ToolError` the
+    guarded call raised itself -- indistinguishable from a curated one by
+    type alone, but its ``__cause__`` cannot be ``exc``, since no branch
+    catches ``ToolError``.
 
     Args:
+        store: The store the guarded call writes through. Used only to read
+            a ``store_thought`` busy error's attempted id back -- unused for
+            ``update_thought`` and for every non-busy exception.
         tool: Forwarded to :class:`_ResidualWriteError`.
-        thought_id: Forwarded to :class:`_ResidualWriteError`.
-        deduplicate: Forwarded to :class:`_ResidualWriteError`.
+        thought_id: Forwarded to :class:`_ResidualWriteError`, and -- for
+            ``store_thought`` -- the id a busy error's own read-back checks.
+        deduplicate: Forwarded to :class:`_ResidualWriteError`, and -- for
+            ``store_thought`` -- forwarded again to
+            :func:`_store_thought_busy_message`.
 
     Yields:
         ``None``; the caller runs the guarded store call inside the ``with``.
 
     Raises:
-        _ResidualWriteError: When the guarded call raises anything
+        ToolError: When ``store.create_thought`` raises a busy
+            ``sqlite3.OperationalError`` (``tool="store_thought"`` only),
+            carrying :func:`_store_thought_busy_message`'s text.
+        _ResidualWriteError: When the guarded call raises anything else
             :func:`_tool_errors`'s own chain does not curate.
 
     """
     try:
         yield
-    except Exception as exc:  # noqa: BLE001 -- must classify whatever the store call
+    except Exception as exc:
         # raises, including a type this module has never seen; that is what
         # _ResidualWriteError exists for.
+        if (
+            tool == "store_thought"
+            and isinstance(exc, sqlite3.OperationalError)
+            and _is_busy_error(exc)
+        ):
+            message = await _store_thought_busy_message(store, thought_id, deduplicate=deduplicate)
+            raise ToolError(message) from exc
         try:
             async with _tool_errors():
                 raise  # re-raises exc, which is still the exception being handled here
@@ -839,7 +995,15 @@ async def _tool_errors() -> AsyncIterator[None]:  # noqa: C901, PLR0912, PLR0915
     :class:`_ResidualWriteError`; see :func:`_residual_write_guard` -- gets a
     message that states neither which step raised nor whether the write took
     effect, because a residual exception may have fired either before or
-    after the write's own commit, and this function cannot tell which.
+    after the write's own commit, and this function cannot tell which. A
+    busy ``sqlite3.OperationalError`` from ``store.create_thought`` or
+    ``store.create_edge`` never reaches this chain at all: each is answered
+    by a narrow guard around that one call (:func:`_residual_write_guard`,
+    :func:`link_thoughts_impl`) before classification would begin, because
+    the two calls establish different things about a busy failure (a
+    ``create_edge`` commit is followed by nothing that can still write; a
+    ``create_thought`` commit is not) and a chain-level branch here could
+    only give both the same answer.
 
     Yields:
         ``None``; the caller runs the guarded tool body inside the ``with``.
@@ -2065,7 +2229,10 @@ async def store_thought_impl(
             embedding-model mismatch, a required embedding's provider
             failing, or a rejected derived record, among others -- reached
             through :func:`_residual_write_guard`'s classification, carrying
-            that branch's own curated message.
+            that branch's own curated message. Also raised directly by
+            :func:`_residual_write_guard`, without reaching that chain, when
+            ``store.create_thought`` raises a busy ``sqlite3.OperationalError``
+            -- see :func:`_store_thought_busy_message`.
         _ResidualWriteError: If ``store.create_thought`` fails and
             classifying that failure through the :func:`_tool_errors` chain
             does not yield a curated message -- the chain re-raised it, or
@@ -2087,7 +2254,7 @@ async def store_thought_impl(
         confidence=confidence,
     )
     async with _residual_write_guard(
-        tool="store_thought", thought_id=record.thought_id, deduplicate=deduplicate
+        store=store, tool="store_thought", thought_id=record.thought_id, deduplicate=deduplicate
     ):
         created = await store.create_thought(record, deduplicate=deduplicate)
     return {
@@ -2160,7 +2327,7 @@ async def update_thought_impl(
     if confidence is not None:
         changes["confidence"] = confidence
 
-    async with _residual_write_guard(tool="update_thought", thought_id=thought_id):
+    async with _residual_write_guard(store=store, tool="update_thought", thought_id=thought_id):
         updated = await store.update_thought(thought_id, **changes)
     return {
         "thought": {
@@ -2214,6 +2381,11 @@ async def link_thoughts_impl(
         IntegrityError: If a caller-supplied ``edge_id`` collides with an
             existing edge's primary key.
         ValueError: If ``metadata`` serializes above the store's size limit.
+        ToolError: If ``store.create_edge`` raises a busy
+            ``sqlite3.OperationalError`` (:func:`_is_busy_error`), carrying
+            :data:`_LINK_THOUGHTS_BUSY_MESSAGE`. Raised directly, from a
+            guard around this one call only -- never around this function's
+            own argument handling.
 
     """
     record = EdgeRecord(
@@ -2225,7 +2397,19 @@ async def link_thoughts_impl(
         created_cycle=INITIAL_CYCLE,
         metadata=dict(metadata) if metadata else {},
     )
-    created = await store.create_edge(record)
+    # create_edge is one write unit begun BEGIN IMMEDIATE, with its journal
+    # append inside it, then one commit through the store's own recovery
+    # path, and nothing written after it -- so a busy error here, whether
+    # from acquiring the lock or from the commit itself (a reader blocking
+    # the upgrade, in rollback-journal mode), always means nothing was
+    # written. Anything else propagates unchanged to the caller's own
+    # _tool_errors, as before this guard existed.
+    try:
+        created = await store.create_edge(record)
+    except sqlite3.OperationalError as exc:
+        if not _is_busy_error(exc):
+            raise
+        raise ToolError(_LINK_THOUGHTS_BUSY_MESSAGE) from exc
     return {
         "edge": {
             "edge_id": created.edge_id,

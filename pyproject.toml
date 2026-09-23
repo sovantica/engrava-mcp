@@ -41,6 +41,12 @@ dependencies = [
     "mcp>=2.2,<3",
     # Used directly by server.py/config.py; declare instead of relying on mcp transitively.
     "anyio>=4.9",
+    # Used directly by config.py (connect, Connection, Row); declare instead of relying on
+    # engrava transitively.
+    "aiosqlite>=0.20.0",
+    # Used directly by server.py (Field, ValidationError); declare instead of relying on
+    # mcp / engrava transitively.
+    "pydantic>=2.12",
     # Default bundle for the bare `uvx engrava-mcp` (the registry one-click):
     # the vector backend plus the http-based embedding providers' dependency,
     # so semantic search and OpenAI/Ollama embeddings work out of the box once
@@ -63,6 +69,11 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=5.0.0",
     "mypy>=1.11.0",
+    # Used directly by the pyproject-parsing tests; declare instead of relying on pytest
+    # transitively.
+    "packaging>=22",
+    # Used directly by test_readme_claims.py to load the README's example config.
+    "PyYAML>=6.0",
     # Exact pin, not a floor: `[tool.ruff.lint] select = ["ALL"]` opts into
     # every rule a new ruff release adds, so a range lets CI and a developer
     # lint identical source with different rule sets and disagree.

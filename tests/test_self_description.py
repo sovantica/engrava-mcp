@@ -303,3 +303,60 @@ class TestServerJsonDescribesTheMcpSurfaceOnly:
         packages = manifest["packages"]
         assert isinstance(packages, list)
         assert packages[0]["version"] == project["version"]
+
+
+class TestGetEdgesLimitDescribedHonestly:
+    """The ``get_edges`` tool description and the README state ``limit``'s two halves.
+
+    Neither is pinned before this WS: at ``8cfc6ca`` the tool takes no ``limit`` at all
+    and the README says nothing about one, so both assertions below fail there.
+    """
+
+    def _get_edges_readme_sentence(self) -> str:
+        """Return only the README's ``get_edges`` sentence, whitespace-collapsed.
+
+        Extracts the text from the ``get_edges`` sentence up to — but not
+        including — the following ``list_edges`` sentence, so a match cannot be
+        satisfied by ``list_edges``'s own wording spilling in from the same
+        line-wrapped paragraph. Whitespace runs (including the source's line
+        wraps) are collapsed to single spaces so the assertion does not depend
+        on exactly where the paragraph happens to wrap.
+
+        Returns:
+            The ``get_edges`` sentence alone, with normalised whitespace.
+
+        """
+        text = _readme_text()
+        start = text.index("`get_edges` traverses")
+        end = text.index("`list_edges` browses", start)
+        return " ".join(text[start:end].split())
+
+    async def test_tool_description_states_both_halves(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv(DB_PATH_ENV_VAR, str(tmp_path / "get_edges_limit.db"))
+        monkeypatch.delenv(CONFIG_ENV_VAR, raising=False)
+        monkeypatch.delenv(READ_ONLY_ENV_VAR, raising=False)
+
+        server = build_server()
+        async with connect_client(server) as client:
+            tools = await client.list_tools()
+
+        get_edges = next(tool for tool in tools.tools if tool.name == "get_edges")
+        assert get_edges.description is not None
+        # The exact, condition-linked sentence: a reversed with/without pairing,
+        # or a rephrase dropping "at most" or "highest-weight", both fail this —
+        # unlike disconnected fragment checks, which either would pass.
+        assert (
+            "With limit, it returns at most that many edges, the highest-weight "
+            "ones first; without it, it returns every edge."
+        ) in get_edges.description
+
+    def test_readme_line_states_both_halves(self) -> None:
+        sentence = self._get_edges_readme_sentence()
+        assert (
+            "with `limit`, at most that many edges, the highest-weight ones first, "
+            "and without it, every edge."
+        ) in sentence

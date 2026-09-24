@@ -25,7 +25,7 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
 import pytest
-from engrava import EdgeType
+from engrava import EdgeRecord, EdgeType
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.exceptions import MCPError
@@ -40,6 +40,7 @@ from engrava_mcp.server import (
     OutOfRangeBoundError,
     StoreProvider,
     _tool_errors,
+    get_edges_impl,
     link_thoughts_impl,
     list_edges_impl,
     list_memory_impl,
@@ -371,6 +372,11 @@ class TestImplLevelBounds:
             await list_edges_impl(store, limit=limit)
 
     @pytest.mark.parametrize("limit", OUT_OF_RANGE_LIMITS)
+    async def test_get_edges_limit(self, store: SqliteEngravaCore, limit: int) -> None:
+        with pytest.raises(OutOfRangeBoundError):
+            await get_edges_impl(store, "thought-alpha", limit=limit)
+
+    @pytest.mark.parametrize("limit", OUT_OF_RANGE_LIMITS)
     async def test_query_memory_limit(self, store: SqliteEngravaCore, limit: int) -> None:
         with pytest.raises(OutOfRangeBoundError):
             await query_memory_impl(store, FIND_ALL, limit=limit)
@@ -574,6 +580,28 @@ class TestBoundsAdvertisedInToolSchema:
         assert bounded[0]["minimum"] == 1
         assert bounded[0]["maximum"] == MAX_PAGE_LIMIT
 
+    async def test_schema_publishes_bounds_on_the_nullable_get_edges_limit(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # get_edges' limit is optional, like query_memory's, so its bounds may
+        # sit inside a nullable union rather than on the property itself.
+        async with _client_for(store) as client:
+            tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+
+        schema = tools["get_edges"].input_schema
+        limit_schema = schema["properties"]["limit"]
+        branches = limit_schema.get("anyOf", [limit_schema])
+        bounded = [branch for branch in branches if "maximum" in branch]
+        assert bounded, f"no bounded branch in the advertised schema: {limit_schema!r}"
+        assert bounded[0]["minimum"] == 1
+        assert bounded[0]["maximum"] == MAX_PAGE_LIMIT
+        # The bounded branch is really the integer one, not merely a branch
+        # that happens to carry numeric-looking "minimum"/"maximum" keys.
+        assert bounded[0]["type"] == "integer"
+        # And the argument stays optional: omitting it must not be rejected as
+        # a missing required field.
+        assert "limit" not in schema.get("required", [])
+
     async def test_schema_publishes_bounds_on_the_nullable_cycle_filters(
         self, store: SqliteEngravaCore
     ) -> None:
@@ -632,3 +660,101 @@ class TestQueryObjectBoundary:
         )
         listed = await list_edges_impl(store, limit=1)
         assert listed["count"] == 1
+
+
+class TestGetEdgesLimitReachesTheStoreOnlyWhenValid:
+    """``get_edges``'s ``limit`` is engrava's own SQL cap, not a fetch-all sliced here.
+
+    Each test spies on the store's own ``get_edges`` by recording the ``limit`` it was
+    called with (while still delegating to the real method, so the surrounding
+    assertions have real data to check). A guard that only *looks* like it bounds the
+    query — e.g. one that fetches everything and slices the response — would still pass
+    a plain "the result has k rows" check; recording what reaches the store instead is
+    deletion- and regression-sensitive to that.
+    """
+
+    def _spy(
+        self,
+        store: SqliteEngravaCore,
+        monkeypatch: pytest.MonkeyPatch,
+        calls: list[int | None],
+    ) -> None:
+        """Wrap ``store.get_edges`` to record every ``limit`` it is called with.
+
+        Args:
+            store: The store whose ``get_edges`` to wrap.
+            monkeypatch: Fixture used to install the wrapped method.
+            calls: List that receives the ``limit`` from every call.
+
+        """
+        real_get_edges = store.get_edges
+
+        async def _recording_get_edges(
+            thought_id: str,
+            *,
+            direction: str = "BOTH",
+            limit: int | None = None,
+        ) -> list[EdgeRecord]:
+            calls.append(limit)
+            return await real_get_edges(thought_id, direction=direction, limit=limit)
+
+        monkeypatch.setattr(store, "get_edges", _recording_get_edges)
+
+    async def test_out_of_range_limit_raises_and_never_reaches_the_store(
+        self, store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[int | None] = []
+        self._spy(store, monkeypatch, calls)
+
+        with pytest.raises(OutOfRangeBoundError):
+            await get_edges_impl(store, "thought-alpha", limit=0)
+        with pytest.raises(OutOfRangeBoundError):
+            await get_edges_impl(store, "thought-alpha", limit=MAX_PAGE_LIMIT + 1)
+
+        assert calls == []
+
+    async def test_valid_limit_is_forwarded_to_the_store(
+        self, store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[int | None] = []
+        self._spy(store, monkeypatch, calls)
+
+        await get_edges_impl(store, "thought-alpha", limit=3)
+
+        assert calls == [3]
+
+    async def test_omitted_limit_still_calls_the_store_exactly_once_with_none(
+        self, store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[int | None] = []
+        self._spy(store, monkeypatch, calls)
+
+        await get_edges_impl(store, "thought-alpha")
+
+        # Deletion-sensitive to a guard that stops calling the store at all
+        # when limit is omitted, not only to what value it is called with.
+        assert calls == [None]
+
+    async def test_control_limit_succeeds_and_rejected_limits_never_reach_the_store_over_the_wire(
+        self, store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[int | None] = []
+        self._spy(store, monkeypatch, calls)
+
+        async with _client_for(store) as client:
+            control = await client.call_tool(
+                "get_edges", {"thought_id": "thought-alpha", "limit": 1}
+            )
+            rejected_zero = await client.call_tool(
+                "get_edges", {"thought_id": "thought-alpha", "limit": 0}
+            )
+            rejected_over = await client.call_tool(
+                "get_edges",
+                {"thought_id": "thought-alpha", "limit": MAX_PAGE_LIMIT + 1},
+            )
+
+        assert control.is_error is False
+        assert rejected_zero.is_error is True
+        assert rejected_over.is_error is True
+        # Only the accepted control call ever reached the store.
+        assert calls == [1]

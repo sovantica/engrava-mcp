@@ -2091,6 +2091,7 @@ async def get_edges_impl(
     thought_id: str,
     *,
     direction: EdgeDirection = "BOTH",
+    limit: int | None = None,
 ) -> dict[str, Any]:
     """Return the edges connected to a thought.
 
@@ -2106,13 +2107,24 @@ async def get_edges_impl(
         direction: Which edges to return — ``OUT`` for edges leaving the
             thought, ``IN`` for edges arriving at it, or ``BOTH`` for
             either.  An unknown ``thought_id`` simply has no edges.
+        limit: Optional cap on the number of edges returned.  When given,
+            at most this many edges are returned, the highest-weight ones
+            first — engrava's own ``ORDER BY weight DESC LIMIT`` does the
+            capping, not a fetch-all sorted and sliced here.  When
+            omitted, every matching edge is returned.
 
     Returns:
         A dict with an ``edges`` list of JSON-serialisable edge records
         (each including its ``metadata``) and their ``count``.
 
+    Raises:
+        OutOfRangeBoundError: If ``limit`` is given and outside its
+            accepted range.
+
     """
-    edges = await store.get_edges(thought_id, direction=direction)
+    if limit is not None:
+        _check_bound("limit", limit, minimum=1, maximum=MAX_PAGE_LIMIT)
+    edges = await store.get_edges(thought_id, direction=direction, limit=limit)
     serialised = [edge.model_dump(mode="json") for edge in edges]
     return {"edges": serialised, "count": len(serialised)}
 
@@ -3129,7 +3141,9 @@ def register_tools(server: MCPServer, provider: StoreProvider, *, read_only: boo
             "Fetch the edges connected to a thought by its identifier. Choose "
             "the direction: OUT for edges leaving the thought, IN for edges "
             "arriving at it, or BOTH (the default) for either. Returns full edge "
-            "records including their metadata, and a count. This is the read "
+            "records including their metadata, and a count. With limit, it "
+            "returns at most that many edges, the highest-weight ones first; "
+            "without it, it returns every edge. This is the read "
             "companion to link_thoughts and delete_edge."
         ),
         annotations=_READ_ONLY,
@@ -3137,9 +3151,12 @@ def register_tools(server: MCPServer, provider: StoreProvider, *, read_only: boo
     async def get_edges(
         thought_id: str,
         direction: EdgeDirection = "BOTH",
+        limit: PageLimit | None = None,
     ) -> dict[str, Any]:
         async with _tool_errors():
-            return await get_edges_impl(provider.require_read(), thought_id, direction=direction)
+            return await get_edges_impl(
+                provider.require_read(), thought_id, direction=direction, limit=limit
+            )
 
     @server.tool(
         name="list_edges",

@@ -160,12 +160,15 @@ class ReadOnlyMcpStore(Protocol):
         thought_id: str,
         *,
         direction: str = "BOTH",
+        limit: int | None = None,
     ) -> list[EdgeRecord]:
         """Retrieve the edges connected to a thought.
 
         Args:
             thought_id: Identifier of the thought whose edges to fetch.
             direction: ``"IN"``, ``"OUT"``, or ``"BOTH"``.
+            limit: Optional cap on the number of edges returned, the
+                highest-weight ones first.  ``None`` returns every edge.
 
         Returns:
             The matching edge records.
@@ -323,10 +326,11 @@ class ReadOnlyStore:
         thought_id: str,
         *,
         direction: str = "BOTH",
+        limit: int | None = None,
     ) -> list[EdgeRecord]:
         """Call directly on the wrapped store, suppressed; see :class:`ReadOnlyMcpStore`."""
         async with self._inner.suppress_access_tracking():
-            return await self._inner.get_edges(thought_id, direction=direction)
+            return await self._inner.get_edges(thought_id, direction=direction, limit=limit)
 
     async def list_edges(
         self,

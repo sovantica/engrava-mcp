@@ -194,7 +194,9 @@ uvx --from "engrava-mcp[ollama]" engrava-mcp   # Ollama embeddings deps
 command are rejected.
 
 `get_edges` traverses a thought's edges by direction (`IN` / `OUT` / `BOTH`);
-`list_edges` browses edges filtered by type, source, or metadata.
+with `limit`, at most that many edges, the highest-weight ones first, and
+without it, every edge. `list_edges` browses edges filtered by type, source,
+or metadata.
 
 `link_thoughts` accepts optional edge `metadata` (JSON fields that `list_edges`
 can filter on). `search_memory` accepts an optional `recency_now` (ISO-8601

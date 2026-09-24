@@ -189,6 +189,55 @@ async def edge_store() -> AsyncIterator[SqliteEngravaCore]:
         await connection.close()
 
 
+@pytest.fixture
+async def weighted_edge_store() -> AsyncIterator[SqliteEngravaCore]:
+    """Yield a store where a hub thought's edges all carry distinct weights.
+
+    ``hub`` has three outgoing edges (weights 0.9, 0.5, 0.1) and three
+    incoming edges (weights 0.8, 0.6, 0.2), all six weights distinct, so
+    ``limit`` has an unambiguous highest-weight ordering to prove in every
+    direction — including ``BOTH``, where the top two edges span both
+    directions (``out-a-edge`` at 0.9, ``in-x-edge`` at 0.8).
+
+    Yields:
+        A ``SqliteEngravaCore`` seeded for the ``get_edges`` limit tests.
+
+    """
+    connection = await aiosqlite.connect(":memory:")
+    connection.row_factory = aiosqlite.Row
+    await connection.execute("PRAGMA foreign_keys=ON")
+    backend = SqliteEngravaCore(connection)
+    await backend.ensure_schema()
+
+    for thought_id in ("hub", "out-a", "out-b", "out-c", "in-x", "in-y", "in-z"):
+        await backend.create_thought(_thought(thought_id))
+
+    edges = (
+        ("out-a-edge", "hub", "out-a", 0.9),
+        ("out-b-edge", "hub", "out-b", 0.5),
+        ("out-c-edge", "hub", "out-c", 0.1),
+        ("in-x-edge", "in-x", "hub", 0.8),
+        ("in-y-edge", "in-y", "hub", 0.6),
+        ("in-z-edge", "in-z", "hub", 0.2),
+    )
+    for edge_id, from_id, to_id, weight in edges:
+        await backend.create_edge(
+            EdgeRecord(
+                edge_id=edge_id,
+                from_thought_id=from_id,
+                to_thought_id=to_id,
+                edge_type=EdgeType.ASSOCIATED,
+                weight=weight,
+                created_cycle=0,
+            )
+        )
+
+    try:
+        yield backend
+    finally:
+        await connection.close()
+
+
 class TestGetEdges:
     """Tests for the ``get_edges`` tool."""
 
@@ -361,6 +410,73 @@ class TestEdgeToolsOverTheWire:
         assert result.is_error is False
         assert result.structured_content is not None
         assert {edge["edge_id"] for edge in result.structured_content["edges"]} == {"e1", "e3"}
+
+
+class TestGetEdgesLimitOverTheWire:
+    """``get_edges``'s optional ``limit`` bounds the result to the highest-weight edges.
+
+    Every case runs against :func:`weighted_edge_store`, whose six edges all carry
+    distinct weights, so "the k highest" has one unambiguous answer per direction.
+    """
+
+    async def test_out_direction_limit_returns_the_k_highest_weight_edges(
+        self, weighted_edge_store: SqliteEngravaCore
+    ) -> None:
+        async with _client_for(weighted_edge_store) as client:
+            result = await client.call_tool(
+                "get_edges", {"thought_id": "hub", "direction": "OUT", "limit": 2}
+            )
+        assert result.is_error is False
+        assert result.structured_content is not None
+        assert result.structured_content["count"] == 2
+        ordered = [edge["edge_id"] for edge in result.structured_content["edges"]]
+        assert ordered == ["out-a-edge", "out-b-edge"]
+
+    async def test_in_direction_limit_returns_the_k_highest_weight_edges(
+        self, weighted_edge_store: SqliteEngravaCore
+    ) -> None:
+        async with _client_for(weighted_edge_store) as client:
+            result = await client.call_tool(
+                "get_edges", {"thought_id": "hub", "direction": "IN", "limit": 2}
+            )
+        assert result.is_error is False
+        assert result.structured_content is not None
+        assert result.structured_content["count"] == 2
+        ordered = [edge["edge_id"] for edge in result.structured_content["edges"]]
+        assert ordered == ["in-x-edge", "in-y-edge"]
+
+    async def test_both_direction_limit_returns_the_k_highest_weight_edges(
+        self, weighted_edge_store: SqliteEngravaCore
+    ) -> None:
+        # The top two edges overall span both directions (out-a-edge at 0.9,
+        # in-x-edge at 0.8), so this is not reducible to either one-way case.
+        async with _client_for(weighted_edge_store) as client:
+            result = await client.call_tool(
+                "get_edges", {"thought_id": "hub", "direction": "BOTH", "limit": 2}
+            )
+        assert result.is_error is False
+        assert result.structured_content is not None
+        assert result.structured_content["count"] == 2
+        ordered = [edge["edge_id"] for edge in result.structured_content["edges"]]
+        assert ordered == ["out-a-edge", "in-x-edge"]
+
+    async def test_without_a_limit_every_edge_is_returned(
+        self, weighted_edge_store: SqliteEngravaCore
+    ) -> None:
+        async with _client_for(weighted_edge_store) as client:
+            result = await client.call_tool("get_edges", {"thought_id": "hub", "direction": "BOTH"})
+        assert result.is_error is False
+        assert result.structured_content is not None
+        assert result.structured_content["count"] == 6
+        ids = {edge["edge_id"] for edge in result.structured_content["edges"]}
+        assert ids == {
+            "out-a-edge",
+            "out-b-edge",
+            "out-c-edge",
+            "in-x-edge",
+            "in-y-edge",
+            "in-z-edge",
+        }
 
 
 class TestEdgeMetadataCrossesTheWire:

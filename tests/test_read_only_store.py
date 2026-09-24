@@ -29,6 +29,7 @@ Two questions are kept deliberately separate:
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -309,3 +310,51 @@ class TestAccessTrackingIsSuppressed:
             assert result["results"], "the search must actually hit the seeded thought"
         await backend.flush_access_buffer()
         assert await _access_count(connection, "tracked-1") == 3
+
+
+class TestGetEdgesLimitThroughTheView:
+    """``ReadOnlyStore.get_edges`` forwards ``limit`` and runs it under suppression.
+
+    Both the inner ``get_edges`` and the inner ``suppress_access_tracking`` are spied
+    on so the order of events is observable, not just the two facts independently: the
+    forwarded ``limit`` alone would not show the inner ``get_edges`` call actually
+    happened *inside* the suppression window rather than before or after it.
+    """
+
+    async def test_forwards_limit_and_calls_the_inner_store_while_suppressed(
+        self,
+        wrapped: tuple[SqliteEngravaCore, ReadOnlyStore],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        backend, view = wrapped
+        events: list[str] = []
+        calls: list[int | None] = []
+
+        real_get_edges = backend.get_edges
+        real_suppress = backend.suppress_access_tracking
+
+        async def _spy_get_edges(
+            thought_id: str,
+            *,
+            direction: str = "BOTH",
+            limit: int | None = None,
+        ) -> list[EdgeRecord]:
+            events.append("get_edges")
+            calls.append(limit)
+            return await real_get_edges(thought_id, direction=direction, limit=limit)
+
+        @asynccontextmanager
+        async def _spy_suppress() -> AsyncIterator[None]:
+            events.append("enter")
+            async with real_suppress():
+                yield
+            events.append("exit")
+
+        monkeypatch.setattr(backend, "get_edges", _spy_get_edges)
+        monkeypatch.setattr(backend, "suppress_access_tracking", _spy_suppress)
+
+        result = await view.get_edges("ro-alpha", direction="OUT", limit=1)
+
+        assert calls == [1]
+        assert events == ["enter", "get_edges", "exit"]
+        assert [edge.edge_id for edge in result] == ["ro-e1"]

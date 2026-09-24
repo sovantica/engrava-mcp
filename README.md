@@ -17,11 +17,14 @@ API. It is the one way to run Engrava as a memory server; the `engrava` library
 itself ships no MCP code.
 
 ```bash
-uvx engrava-mcp        # run the server (no install step)
-# or
-pip install engrava-mcp
-engrava-mcp            # spawned by your MCP client over stdio
+uv tool install engrava-mcp   # recommended for daily use: a persistent install
+engrava-mcp                   # spawned by your MCP client over stdio
 ```
+
+`uvx engrava-mcp` runs it without an install step, and `pip install engrava-mcp`
+works too. `uvx` keeps its environment in a cache. When that cache is cold, the
+first start waits for the download; see [Optional providers](#optional-providers)
+for the `[local]` extra, where the download is largest.
 
 Installing `engrava-mcp` pulls in `engrava` transitively, so you also get the
 `import engrava` library in the same environment.
@@ -145,8 +148,7 @@ Point your MCP client at the server over stdio. For example, a typical
 {
   "mcpServers": {
     "engrava": {
-      "command": "uvx",
-      "args": ["engrava-mcp"],
+      "command": "engrava-mcp",
       "env": {
         "ENGRAVA_MCP_CONFIG": "/absolute/path/to/engrava.yaml"
       }
@@ -154,6 +156,10 @@ Point your MCP client at the server over stdio. For example, a typical
   }
 }
 ```
+
+This assumes `uv tool install engrava-mcp`. If your client cannot find the
+command, give its absolute path; `uv tool dir --bin` prints the directory.
+Without an install, use `"command": "uvx", "args": ["engrava-mcp"]`.
 
 Use `ENGRAVA_DB_PATH` instead of `ENGRAVA_MCP_CONFIG` for the zero-config
 quick-start, and add `"ENGRAVA_MCP_READ_ONLY": "1"` for an app-writes /
@@ -169,6 +175,11 @@ python -m engrava_mcp.server # module run (server module directly)
 
 ## Optional providers
 
+For an MCP deployment, prefer an embedding provider that runs outside the
+server process: Ollama (`provider: ollama`) or an OpenAI-compatible endpoint
+(`provider: openai-compatible`). The default install already covers both, and
+the server then loads no embedding model itself.
+
 The default install supports the vector backend and HTTP-based embedding
 providers (OpenAI / Ollama) once configured in the `yaml`. Heavier providers are
 opt-in extras that mirror Engrava's own extras:
@@ -179,6 +190,12 @@ uvx --from "engrava-mcp[hf]"     engrava-mcp   # HuggingFace Inference API
 uvx --from "engrava-mcp[openai]" engrava-mcp   # OpenAI-compatible embeddings deps
 uvx --from "engrava-mcp[ollama]" engrava-mcp   # Ollama embeddings deps
 ```
+
+`[local]` runs the model inside the server process and installs PyTorch, which
+can add several gigabytes. A first start on a cold `uvx` cache waits for that
+download; later starts reuse the cache. `uv tool install "engrava-mcp[local]"`
+pays the download once, at install time. A model that is not already in the
+local model cache is downloaded when it is first loaded.
 
 ## The surface
 

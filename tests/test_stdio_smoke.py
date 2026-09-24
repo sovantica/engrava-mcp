@@ -93,3 +93,42 @@ async def test_stdio_subprocess_serves_tools(tmp_path: Path) -> None:
             assert result.structured_content["thought_count"] == 0
     except (FileNotFoundError, OSError) as exc:  # pragma: no cover - sandbox guard
         pytest.skip(f"stdio subprocess could not be spawned in this environment: {exc}")
+
+
+async def test_stdio_subprocess_logs_opening_line_to_errlog(tmp_path: Path) -> None:
+    """The startup progress line reaches a real ``errlog`` file, not stdout.
+
+    Passes the SDK's ``stdio_client`` a real temporary file as ``errlog`` --
+    the parameter it forwards to the subprocess's own stderr -- and asserts
+    that ``resolve_store``'s "opening the store from" line lands there, and
+    that the session still initialises and lists its tools exactly as the
+    other test in this module already proves. This test does not inspect raw
+    stdout at all: keeping the log lines off it rests on the MCP SDK's own
+    ``configure_logging`` call (``mcp.server.mcpserver.utilities.logging``),
+    not on anything asserted here.
+
+    Args:
+        tmp_path: Pytest temp directory holding the throwaway database file
+            and the errlog file.
+
+    """
+    params = _server_params(tmp_path / "smoke.sqlite")
+    errlog_path = tmp_path / "server-errlog.txt"
+
+    try:
+        with errlog_path.open("w", encoding="utf-8") as errlog:
+            async with (
+                stdio_client(params, errlog=errlog) as (read, write),
+                ClientSession(read, write) as session,
+            ):
+                init_result = await session.initialize()
+                assert init_result.server_info.name
+
+                tools = await session.list_tools()
+                names = {tool.name for tool in tools.tools}
+                assert names == EXPECTED_TOOL_NAMES
+    except (FileNotFoundError, OSError) as exc:  # pragma: no cover - sandbox guard
+        pytest.skip(f"stdio subprocess could not be spawned in this environment: {exc}")
+
+    errlog_text = errlog_path.read_text(encoding="utf-8")
+    assert "opening the store from ENGRAVA_DB_PATH" in errlog_text

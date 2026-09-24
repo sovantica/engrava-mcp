@@ -38,6 +38,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from typing import TYPE_CHECKING, NamedTuple
 
 import aiosqlite
@@ -244,6 +245,14 @@ async def resolve_store() -> ResolvedStore:
     Resolution honours :data:`CONFIG_ENV_VAR` first, then
     :data:`DB_PATH_ENV_VAR`.
 
+    Logs two ``INFO`` records on the ``engrava_mcp`` logger for whichever route
+    is taken: one immediately after the route is chosen, naming only the
+    environment variable's own name (``ENGRAVA_MCP_CONFIG`` or
+    ``ENGRAVA_DB_PATH``), and one once the store is constructed, giving the
+    time the store took to open. Neither record includes a path or anything
+    read from an ``engrava.yaml`` -- a path or a config value can carry a
+    secret, and the variable name alone tells an operator which route opened.
+
     Returns:
         A :class:`ResolvedStore` whose :meth:`~ResolvedStore.aclose` closes the
         store and, on the :data:`DB_PATH_ENV_VAR` launch, then the connection
@@ -256,10 +265,13 @@ async def resolve_store() -> ResolvedStore:
     """
     config_path = os.environ.get(CONFIG_ENV_VAR)
     if config_path:
+        start = monotonic()
+        logger.info("opening the store from %s", CONFIG_ENV_VAR)
         config = load_config(config_path)
         if config.embeddings is None or config.embeddings.provider is None:
             logger.warning(_NO_PROVIDER_WARNING)
         store = await SqliteEngravaCore.from_config(config_path)
+        logger.info("store ready in %.2f s", monotonic() - start)
 
         async def _closer() -> bool:
             """Close the store, reporting whether its own bound abandoned a wedged worker.
@@ -300,7 +312,11 @@ async def resolve_store() -> ResolvedStore:
 
     db_path = os.environ.get(DB_PATH_ENV_VAR)
     if db_path:
-        return await _resolve_from_db_path(db_path)
+        start = monotonic()
+        logger.info("opening the store from %s", DB_PATH_ENV_VAR)
+        resolved = await _resolve_from_db_path(db_path)
+        logger.info("store ready in %.2f s", monotonic() - start)
+        return resolved
 
     msg = (
         "No engrava store configured. Set "

@@ -12,6 +12,7 @@ and this project follows a one-way version mirror of [Engrava](https://github.co
 
 - Add an optional `limit` to `get_edges`, returning at most that many edges, the highest-weight ones first.
 - Add a `measured` flag to `memory_stats` and `engrava://stats`, which tells zero-filled placeholder metrics (metrics collection off) from a real measurement.
+- Log to stderr which configuration route the server is opening the store from, and when the store is ready.
 
 ### Changed
 
@@ -20,6 +21,7 @@ and this project follows a one-way version mirror of [Engrava](https://github.co
 - Cap `query_memory` at 5000 rows, and refuse a query whose own `LIMIT` is outside 1–5000 when no `limit` argument is passed.
 - Make `update_thought` fail with a conflict error, applying nothing, when another write changes or deletes the thought during the update; it is no longer annotated idempotent.
 - Declare `anyio`, `aiosqlite` and `pydantic` as direct dependencies instead of relying on other packages to install them.
+- Recommend `uv tool install engrava-mcp` for daily use, and an embedding provider outside the server process for MCP deployments.
 
 ### Fixed
 

@@ -191,7 +191,8 @@ uvx --from "engrava-mcp[ollama]" engrava-mcp   # Ollama embeddings deps
 - **Prompts (3):** `summarize_recent_memory`, `find_related`, `reflect_on_topic`.
 
 `query_memory` accepts only MindQL `FIND` queries; raw SQL and every other
-command are rejected.
+command are rejected. It returns at most 5000 rows. A `limit` argument replaces
+the query's own `LIMIT`; without one, a `LIMIT` outside 1–5000 is refused.
 
 `get_edges` traverses a thought's edges by direction (`IN` / `OUT` / `BOTH`);
 with `limit`, at most that many edges, the highest-weight ones first, and

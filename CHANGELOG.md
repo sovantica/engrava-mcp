@@ -6,6 +6,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows a one-way version mirror of [Engrava](https://github.com/sovantica/engrava)
 (`engrava-mcp X.Y.z` targets `engrava X.Y`).
 
+## [Unreleased]
+
+### Added
+
+- Add an optional `limit` to `get_edges`, returning at most that many edges, the highest-weight ones first.
+- Add a `measured` flag to `memory_stats` and `engrava://stats`, which tells zero-filled placeholder metrics (metrics collection off) from a real measurement.
+
+### Changed
+
+- **Breaking:** require the MCP SDK 2.x line (`mcp>=2.2,<3`); the 1.x line is no longer supported.
+- Target Engrava 0.7 — now requires `engrava >=0.7,<0.8`.
+- Cap `query_memory` at 5000 rows, and refuse a query whose own `LIMIT` is outside 1–5000 when no `limit` argument is passed.
+- Make `update_thought` fail with a conflict error, applying nothing, when another write changes or deletes the thought during the update; it is no longer annotated idempotent.
+- Declare `anyio`, `aiosqlite` and `pydantic` as direct dependencies instead of relying on other packages to install them.
+
+### Fixed
+
+- Find archived thoughts when searching with `lifecycle_status=ARCHIVED`, which previously returned nothing.
+- Keep reads in read-only mode from writing anything of their own, including deferred access-count updates.
+- Report this server's own version in the `initialize` handshake instead of the MCP SDK's.
+- Return clear tool errors for more library failures; when SQLite reports database contention, `link_thoughts`, `delete_thought` and `delete_edge` say that nothing changed and that a retry is safe.
+- Exit at shutdown instead of hanging when closing the database is stuck.
+- Stop describing results as newest-first (`list_memory`, `engrava://recent`, `summarize_recent_memory` and others): thoughts and edges written through this server all carry cycle 0, so the order among them is unspecified.
+- State in `delete_thought`'s description that the thought's edges, embeddings and action records are deleted with it.
+- Correct the README: the audit trail is available only through `ENGRAVA_MCP_CONFIG`; the `ENGRAVA_DB_PATH` route builds the store with no journal.
+- Stop advertising audit verification and action records in the MCP Registry description; this server exposes neither.
+- Fix the README's example `engrava.yaml`: `database.path` and `provider: openai-compatible` replace keys that were never loaded.
+- Document in the README that a thought this server stores gets an embedding only when `embeddings.auto_embed` is on (off by default), and that without it `update_thought` keeps a thought's existing embedding.
+- Bug fixes and stability improvements.
+
 ## [0.6.0]
 
 ### Added

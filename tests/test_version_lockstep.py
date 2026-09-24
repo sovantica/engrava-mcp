@@ -34,7 +34,7 @@ EXPECTED_SPECIFIER = SpecifierSet(EXPECTED_RANGE)
 ENGRAVA_CANONICAL_NAME = canonicalize_name("engrava")
 
 #: The package/manifest version this release declares everywhere.
-EXPECTED_VERSION = "0.6.0"
+EXPECTED_VERSION = "0.7.0"
 
 #: The exact set of engrava requirements the project must carry, keyed by
 #: ``(name, extras)``: the bare ``engrava`` dependency, the ``[vec]`` default

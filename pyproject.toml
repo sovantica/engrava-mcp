@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "engrava-mcp"
-version = "0.6.0"
+version = "0.7.0"
 description = "Model Context Protocol server for Engrava — expose an agent memory database to any MCP client over stdio."
 readme = "README.md"
 license = {text = "MIT"}
@@ -28,9 +28,9 @@ classifiers = [
 
 dependencies = [
     # Same-minor range on engrava's public API (engrava guarantees no breaking
-    # change within an X.Y.x patch range). 0.6.0 is the first release carrying
-    # the public API this server's 0.6 surface consumes (edge reads, edge
-    # metadata, transaction-time recency).
+    # change within an X.Y.x patch range). 0.7.0 is the first release carrying
+    # the public API this server's 0.7 surface consumes (for example
+    # `get_edges`' `limit` and the write-contention errors).
     "engrava>=0.7,<0.8",
     # Cap the MCP SDK major so a future incompatible release can't silently
     # break `uvx engrava-mcp`; widen only after testing a new major. The 1.x

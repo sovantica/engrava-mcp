@@ -12,14 +12,14 @@ permissions:
 # ---------------------------------------------------------------------------
 # engrava dependency resolution
 # ---------------------------------------------------------------------------
-# engrava-mcp depends on `engrava>=0.6,<0.7` (and the `engrava[vec]` extra).
+# engrava-mcp depends on `engrava>=0.7,<0.8` (and the `engrava[vec]` extra).
 # Every job resolves engrava (and engrava[vec]) as a dependency rather than from
 # a local checkout, so CI installs it the way an installing user's resolver
 # would rather than from a path only this workspace has.
 #
 # HARDENING (follow-up — not implemented yet): add a job that resolves the
 # LATEST in-range engrava from PyPI side by side with the pinned resolution, so a
-# stability-guarantee violation in an engrava 0.6.x patch is caught early.
+# stability-guarantee violation in an engrava 0.7.x patch is caught early.
 # ---------------------------------------------------------------------------
 
 jobs:

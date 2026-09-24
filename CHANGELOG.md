@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows a one-way version mirror of [Engrava](https://github.com/sovantica/engrava)
 (`engrava-mcp X.Y.z` targets `engrava X.Y`).
 
-## [Unreleased]
+## [0.7.0]
 
 ### Added
 
@@ -80,6 +80,7 @@ First standalone release of the Engrava MCP server.
 
 - Extracted from the former `engrava[mcp]` extra into this standalone package. Install `engrava-mcp` (or `uvx engrava-mcp`) instead of `pip install "engrava[mcp]"`, and update any pinned `engrava[mcp]` requirements to depend on `engrava-mcp`.
 
+[0.7.0]: https://github.com/sovantica/engrava-mcp/releases/tag/v0.7.0
 [0.6.0]: https://github.com/sovantica/engrava-mcp/releases/tag/v0.6.0
 [0.5.1]: https://github.com/sovantica/engrava-mcp/releases/tag/v0.5.1
 [0.5.0]: https://github.com/sovantica/engrava-mcp/releases/tag/v0.5.0

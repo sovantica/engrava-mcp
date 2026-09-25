@@ -36,6 +36,7 @@ and this project follows a one-way version mirror of [Engrava](https://github.co
 - Stop advertising audit verification and action records in the MCP Registry description; this server exposes neither.
 - Fix the README's example `engrava.yaml`: `database.path` and `provider: openai-compatible` replace keys that were never loaded.
 - Document in the README that a thought this server stores gets an embedding only when `embeddings.auto_embed` is on (off by default), and that without it `update_thought` keeps a thought's existing embedding.
+- Declare `ENGRAVA_DB_PATH` (required), `ENGRAVA_MCP_CONFIG` and `ENGRAVA_MCP_READ_ONLY` in the registry manifest, so a host that configures this server from the MCP Registry asks for a database path instead of starting a server that exits for lack of one.
 - Bug fixes and stability improvements.
 
 ## [0.6.0]

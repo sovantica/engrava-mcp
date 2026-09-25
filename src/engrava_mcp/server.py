@@ -1857,6 +1857,10 @@ async def query_memory_impl(
     so a caller that wants the query's own ``LIMIT`` honoured must omit the
     argument.
 
+    A query's own ``OFFSET`` is refused before execution when it falls outside
+    ``[0, SQLITE_MAX_BOUND_INT]``, the non-negative half of SQLite's signed
+    64-bit integer range.
+
     Args:
         store: The store to query.
         query: A MindQL ``FIND`` query string.
@@ -1876,7 +1880,8 @@ async def query_memory_impl(
             cannot be returned in a JSON tool result (see that error's
             docstring).
         OutOfRangeBoundError: If ``limit``, or an in-query ``LIMIT`` used in
-            its place, is outside its accepted range.
+            its place, is outside its accepted range; or if the query's own
+            ``OFFSET`` falls outside ``[0, SQLITE_MAX_BOUND_INT]``.
         MindQLParseError: If the query is malformed and its own verb is not
             classified as ``FIND`` (see :func:`_query_declares_find`).
         MalformedFindError: If the query's own verb classifies as ``FIND``
@@ -1920,6 +1925,18 @@ async def query_memory_impl(
     else:
         _check_bound("the query's LIMIT clause", parsed.limit, minimum=1, maximum=MAX_PAGE_LIMIT)
         effective = parsed
+
+    # None of the three branches above touches OFFSET -- _with_limit only
+    # replaces limit -- so effective.offset is always parsed.offset here, and
+    # one check after the branch covers all three limit paths at once.
+    # engrava's executor interpolates OFFSET into the SQL text after checking
+    # only that it is not negative, so a value outside SQLite's integer range
+    # would otherwise reach sqlite3 unguarded and raise a raw, unmapped error
+    # instead of this curated one.
+    if effective.offset is not None:
+        _check_bound(
+            "the query's OFFSET clause", effective.offset, minimum=0, maximum=SQLITE_MAX_BOUND_INT
+        )
 
     # Execute via the public store-level entry point. The store owns the
     # connection; this consumer must not reach into it. The FIND-only guard

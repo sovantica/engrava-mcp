@@ -40,6 +40,7 @@ and this project follows a one-way version mirror of [Engrava](https://github.co
 - Fix the README's example config to use an absolute database path, and say where `OPENAI_API_KEY` must be set.
 - Declare `ENGRAVA_DB_PATH` (required), `ENGRAVA_MCP_CONFIG` and `ENGRAVA_MCP_READ_ONLY` in the registry manifest, so a host that configures this server from the MCP Registry asks for a database path instead of starting a server that exits for lack of one.
 - Bug fixes and stability improvements.
+- `query_memory` refuses an `OFFSET` beyond SQLite's integer range with a clear message instead of an unexplained error.
 
 ## [0.6.0]
 

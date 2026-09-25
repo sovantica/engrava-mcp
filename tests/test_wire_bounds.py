@@ -105,6 +105,22 @@ OUT_OF_RANGE_CYCLE_BOUNDS = [
     -(2**63) - 1,
 ]
 
+#: A MindQL query matching both thoughts the shared ``store`` fixture seeds
+#: (they are ``ACTIVE``, not ``CREATED``, so :data:`FIND_ALL` would not match
+#: them -- that one is written for ``bulk_store``).
+FIND_ACTIVE = "FIND thoughts WHERE lifecycle_status = 'ACTIVE'"
+
+#: One past SQLite's integer range: an OFFSET that reaches sqlite3 unguarded
+#: (OFFSET is interpolated into the SQL text, not bound as a parameter)
+#: raises a raw, unmapped ``IntegrityError`` instead of a curated
+#: ``OutOfRangeBoundError``.
+OUT_OF_RANGE_QUERY_OFFSET = SQLITE_MAX_BOUND_INT + 1
+
+#: Far past that range still. Nothing in the MindQL grammar itself rejects an
+#: OFFSET this size -- it parses as a plain (very large) Python int -- so only
+#: the domain guard stands between it and the SQL text sqlite3 executes.
+HUGE_QUERY_OFFSET = 99999999999999999999999
+
 
 @asynccontextmanager
 async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[Client]:
@@ -283,6 +299,94 @@ class TestQueryMemoryOwnLimitIsBounded:
         # flip in either direction.
         overridden = await query_memory_impl(bulk_store, f"{FIND_ALL} LIMIT 5", limit=3)
         assert len(overridden["rows"]) == 3
+
+
+class TestQueryMemoryOwnOffsetIsBounded:
+    """``query_memory`` bounds the query text's own ``OFFSET``, on every limit path.
+
+    ``_with_limit`` only ever replaces ``limit`` (see :func:`_with_limit`), so the
+    parsed ``OFFSET`` reaches ``effective`` unchanged no matter which of the three
+    limit paths ran: the ``limit`` argument, the injected cap, or the query's own
+    ``LIMIT``. The out-of-range case is parameterized across all three -- a guard
+    placed in only one branch would still fail the other two.
+    """
+
+    @pytest.mark.parametrize(
+        ("query", "limit"),
+        [
+            pytest.param(
+                f"{FIND_ACTIVE} OFFSET {OUT_OF_RANGE_QUERY_OFFSET}",
+                1,
+                id="limit-argument",
+            ),
+            pytest.param(
+                f"{FIND_ACTIVE} OFFSET {OUT_OF_RANGE_QUERY_OFFSET}",
+                None,
+                id="injected-cap",
+            ),
+            pytest.param(
+                f"{FIND_ACTIVE} LIMIT 1 OFFSET {OUT_OF_RANGE_QUERY_OFFSET}",
+                None,
+                id="query-own-limit",
+            ),
+            pytest.param(
+                f"{FIND_ACTIVE} OFFSET {HUGE_QUERY_OFFSET}",
+                None,
+                id="far-past-the-ceiling",
+            ),
+        ],
+    )
+    async def test_out_of_range_offset_is_rejected_on_every_limit_path(
+        self, store: SqliteEngravaCore, query: str, limit: int | None
+    ) -> None:
+        # Without the guard, this OFFSET is interpolated into the SQL text
+        # unguarded and reaches sqlite3, raising a raw, unmapped
+        # IntegrityError instead of the curated bound error.
+        with pytest.raises(OutOfRangeBoundError) as exc_info:
+            await query_memory_impl(store, query, limit=limit)
+        assert "the query's OFFSET clause" in str(exc_info.value)
+
+    async def test_out_of_range_query_offset_is_rejected_over_the_wire_with_the_full_message(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # The parametrized test above calls query_memory_impl directly and
+        # checks only that the offending argument's name appears. This one
+        # drives the real MCP client end to end and checks the *complete*
+        # curated message -- the received value and the accepted range too.
+        # The expectations are independent literals, not derived from
+        # OutOfRangeBoundError's own formatting: deriving them that way would
+        # make the assertion tautological -- if the formatter dropped the
+        # argument, value, or range, both sides would change together and the
+        # test would still pass.
+        async with _client_for(store) as client:
+            result = await client.call_tool(
+                "query_memory",
+                {"query": f"FIND thoughts LIMIT 1 OFFSET {OUT_OF_RANGE_QUERY_OFFSET}"},
+            )
+        assert result.is_error is True
+        text = result.content[0].text  # type: ignore[union-attr]
+        assert "the query's OFFSET clause" in text
+        assert "received 9223372036854775808" in text
+        assert "between 0 and 9223372036854775807" in text
+        # The raw sqlite3 failure this guard prevents must never reach the
+        # client over the real MCP boundary either.
+        assert "IntegrityError" not in text
+        assert "datatype mismatch" not in text
+
+    async def test_offset_at_the_sqlite_ceiling_returns_zero_rows(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # The ceiling itself is in-domain (an inclusive bound), and a store
+        # this small holds nothing that far in -- an empty result proves the
+        # offset reached the query rather than being silently dropped.
+        result = await query_memory_impl(store, f"{FIND_ACTIVE} OFFSET {SQLITE_MAX_BOUND_INT}")
+        assert result["rows"] == []
+
+    async def test_offset_one_skips_the_first_of_two_thoughts(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        result = await query_memory_impl(store, f"{FIND_ACTIVE} OFFSET 1")
+        assert len(result["rows"]) == 1
 
 
 class TestImplLevelBounds:

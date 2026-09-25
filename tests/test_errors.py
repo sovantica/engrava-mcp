@@ -1234,12 +1234,11 @@ class TestOverflowingNumericBound:
         # Over the real MCP boundary this value is rejected by the advertised
         # schema before list_memory_impl ever runs -- a different layer from
         # the previous test, so only the rejection itself is asserted here.
-        # NOTE: MCPServer's own argument-schema rejection message leaks
-        # "pydantic" and a docs URL (confirmed pre-existing on every bound
-        # argument already annotated before this WS, e.g. limit=10**18, not
-        # something this change introduced) -- out of this WS's scope, which
-        # is the _tool_errors translation table, not MCPServer's own protocol-
-        # layer error formatting. Reported, not fixed here.
+        # NOTE: MCPServer's own argument-schema rejection message names
+        # "pydantic" and carries a docs URL, as it does for other annotated
+        # bound arguments (e.g. limit=10**18). That text is the SDK's
+        # protocol-layer formatting, not the _tool_errors translation table
+        # this file tests, so it is not asserted on here.
         async with _client_for(store) as client:
             result = await client.call_tool("list_memory", {"offset": 2**63})
         assert result.is_error is True
@@ -1904,8 +1903,8 @@ class _DeriveHooks(DefaultEngravaHooks):
     A real implementation of :class:`~engrava.DerivedRecordProducerProtocol`
     (detected structurally by ``isinstance`` -- it is a
     ``@runtime_checkable`` ``Protocol`` -- so no mock is needed), configured
-    per test to reproduce exactly one of the four failure shapes this WS
-    covers.
+    per test to reproduce exactly one of the four derived-record failure
+    shapes the tests below cover.
 
     ``derive_records`` only produces (or raises) anything for the one
     source content each test configures as its trigger; every other create
@@ -1945,7 +1944,7 @@ async def _derive_store(
     """Build a fresh in-memory store with derived records enabled and raising.
 
     ``on_error`` is always ``"raise"`` here -- the only policy under which
-    any of this WS's four cases reach a client at all; the default,
+    any of the four derived-record cases reach a client at all; the default,
     ``"log"``, swallows every one of them internally (logged, source left
     durable, remaining children/derivation simply skipped) and never raises
     through this path.
@@ -2848,9 +2847,8 @@ class TestToolErrorsChainsEveryMappingBranch:
 #: disappears from here only when a ``_tool_errors`` branch maps it -- never
 #: by silent deletion. Scoped to ``engrava.domain.exceptions`` specifically
 #: (not the MindQL parser's own exceptions, a materially smaller and already
-#: separately-tested surface) because that module is what "engrava's public
-#: exception types" means in the WS this sweep exists to serve: it is where
-#: the count of defined types was taken from, and where it must be re-taken.
+#: separately-tested surface) because that module is where engrava defines
+#: its domain exceptions, so it is where a newly added one appears.
 _OUT_OF_SCOPE: dict[str, str] = {
     "EngravaError": ("abstract base; engrava raises a concrete subclass, never this type itself"),
     "ActionNotFoundError": "no MCP tool touches the Action domain",
@@ -3005,8 +3003,8 @@ class TestExceptionSurfaceSweep:
     engrava's exception surface grows behind this server's back: a type added
     upstream that this table does not recognise crosses the wire as
     ``Error executing tool <name>: <internal message>`` unless and until
-    someone happens to probe it by hand -- exactly how the six cases this WS
-    closes were found. This test makes that discovery automatic instead of
+    someone happens to probe it by hand. This test makes that discovery
+    automatic instead of
     incidental: every class ``engrava.domain.exceptions`` defines must either
     be named in a ``_tool_errors`` except clause, or be listed in
     ``_OUT_OF_SCOPE`` with a reason. Silence is not a valid third state.

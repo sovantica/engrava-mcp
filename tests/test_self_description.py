@@ -24,14 +24,12 @@ Four classes of false self-description are covered:
   annotated idempotent.
 
 **A note on what this sweep cannot do.** ``_FORBIDDEN_RECENCY_PATTERNS`` and
-``_FORBIDDEN_TIE_ORDER_PATTERNS`` are phrase lists. Two correction rounds in
-a row fixed the exact wording a validator flagged and had a *different*
-wording flagged the next round — "newest first" became "insertion order"
-became "deterministic" — because a phrase list finds copies, not
-paraphrases: a grep for "insertion order" was never going to catch
-"deterministic", and neither will catch whatever a third rewrite of the
-same underlying claim (no ordering guarantee exists among cycle ties) might
-say next. This file does not claim to enumerate every way that claim could
+``_FORBIDDEN_TIE_ORDER_PATTERNS`` are phrase lists, and a phrase list finds
+copies, not paraphrases. The same claim can be worded "newest first",
+"insertion order" or "deterministic": a grep for "insertion order" will
+never catch "deterministic", and no phrase list is sure to catch a further
+rewording of the same claim (no ordering guarantee exists among cycle ties).
+This file does not claim to enumerate every way that claim could
 be phrased. What actually bounds the risk is that the honest wording is
 now centralised in :data:`~engrava_mcp.server._CYCLE_ORDERING_NOTE` and
 consumed by reference almost everywhere (:class:`TestOrderingDescriptionsAgree`
@@ -63,11 +61,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 #: Every MCP-created thought stamps ``created_cycle = updated_cycle = 0``, so
 #: nothing this server writes is ever genuinely "newest" or "most recently
 #: updated" — only "highest cognitive cycle", which the source must say
-#: instead. ``latest`` was added after a second round found "confirm the
-#: latest activity" and a "stays focused on the latest activity" comment
-#: making the same claim this list already existed to catch — a paraphrase a
-#: narrower pattern list missed. See the module docstring for why this list
-#: can never be complete.
+#: instead. ``latest`` is listed because "confirm the latest activity" and
+#: "stays focused on the latest activity" make the same claim in words the
+#: narrower patterns miss. See the module docstring for why this list can
+#: never be complete.
 _FORBIDDEN_RECENCY_PATTERNS = (
     re.compile(r"newest[- ]first", re.IGNORECASE),
     re.compile(r"most[- ]recently[- ]updated", re.IGNORECASE),
@@ -85,11 +82,10 @@ _FALSE_GRAMMAR_OFFSET_CLAIM = re.compile(r"grammar has no ``?OFFSET``?", re.IGNO
 #: underlying queries are ``ORDER BY <cycle column> DESC`` with no
 #: tiebreaker, so SQLite guarantees nothing about the relative order of
 #: equal values — observing one order in a probe is one execution, not a
-#: contract. ``insertion order`` is the defect a first correction round
-#: introduced while fixing the recency claim above. ``deterministic`` is the
-#: defect a *second* round found: the same guarantee, restated as a property
-#: of the browse itself ("Deterministic, unranked browse...") rather than of
-#: a named order — a paraphrase, not a repeat, which is exactly what a
+#: contract. ``insertion order`` names such an order outright.
+#: ``deterministic`` states the same guarantee as a property of the browse
+#: itself ("Deterministic, unranked browse...") rather than of a named
+#: order — a paraphrase, not a repeat, which is exactly what a
 #: phrase list cannot be trusted to catch in general (see the module
 #: docstring).
 _FORBIDDEN_TIE_ORDER_PATTERNS = (
@@ -306,11 +302,7 @@ class TestServerJsonDescribesTheMcpSurfaceOnly:
 
 
 class TestGetEdgesLimitDescribedHonestly:
-    """The ``get_edges`` tool description and the README state ``limit``'s two halves.
-
-    Neither is pinned before this WS: at ``8cfc6ca`` the tool takes no ``limit`` at all
-    and the README says nothing about one, so both assertions below fail there.
-    """
+    """The ``get_edges`` tool description and the README state ``limit``'s two halves."""
 
     def _get_edges_readme_sentence(self) -> str:
         """Return only the README's ``get_edges`` sentence, whitespace-collapsed.

@@ -500,10 +500,9 @@ class TestReadOnlyModeAccessTracking:
                 result = await client.call_tool("get_thought", {"thought_id": "seeded-1"})
                 assert result.is_error is False
             for _ in range(3):
-                # search_hybrid also buffers an access for a hit it returns — the
-                # path a prior round's validation found completely unguarded — so
-                # this transport-level check must exercise it too, not only
-                # get_thought.
+                # search_hybrid also buffers an access for a hit it returns, on a
+                # path separate from get_thought's, so this transport-level check
+                # must exercise it too.
                 searched = await client.call_tool("search_memory", {"query_text": "persisted"})
                 assert searched.is_error is False
                 assert searched.structured_content is not None

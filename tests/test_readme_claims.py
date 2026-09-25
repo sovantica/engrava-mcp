@@ -1,6 +1,6 @@
 """Tests that the README's checkable claims match the release it ships with.
 
-Three claims are checked, and the first two went stale once each because nothing tied
+Four claims are checked, and the first two went stale once each because nothing tied
 them to the code:
 
 * The compatibility table's newest row names the same ``engrava`` range as the dependency
@@ -13,6 +13,7 @@ them to the code:
   server's own path, not a value read off a dataclass in isolation -- so a change to
   either the loader's default or the example turns this claim red instead of quietly
   going stale.
+* The example ``engrava.yaml``'s ``database.path`` is an absolute path.
 
 None of the tests skip or pass vacuously: a table, example, or paragraph that cannot be
 found is a failure, because a claim that has gone missing is the same defect as one that
@@ -23,7 +24,7 @@ from __future__ import annotations
 
 import re
 import tomllib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 import yaml
@@ -294,3 +295,22 @@ def test_readme_says_which_writes_get_embedded(
     assert (
         "creating a thought, or changing its `essence` or `content`, also calls the provider"
     ) in paragraph
+
+
+def test_example_engrava_yaml_uses_an_absolute_database_path() -> None:
+    """The README's example ``engrava.yaml`` gives ``database.path`` as an absolute path.
+
+    A relative path resolves against the server process's working directory, which the
+    MCP client chooses, not against the yaml's folder.
+    """
+    parsed_example = yaml.safe_load(_example_config_yaml(_readme_text()))
+    assert isinstance(parsed_example, dict)
+    database_section = parsed_example.get("database")
+    assert isinstance(database_section, dict)
+    path = database_section.get("path")
+    assert isinstance(path, str)
+
+    assert PurePosixPath(path).is_absolute(), (
+        f"README's example engrava.yaml gives database.path as {path!r}, which is not "
+        "an absolute path"
+    )

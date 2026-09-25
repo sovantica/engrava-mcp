@@ -84,8 +84,8 @@ The server resolves its store from environment variables, in priority order:
 | Variable | Meaning |
 |---|---|
 | `ENGRAVA_MCP_CONFIG` | Path to an `engrava.yaml`. Built with the full configuration — embedding provider, vector backend, journal, TTL. The audit trail lives here: set `journal: enabled: true` to turn it on. **Recommended.** |
-| `ENGRAVA_DB_PATH` | Path to a bare SQLite database file. Zero-config quick-start; no embedding provider is configured, so semantic (vector) search is inert — full-text search, the graph, and MindQL still work. This route builds the store with no journal, so the audit trail is not available here; use `ENGRAVA_MCP_CONFIG` for that. "Zero-config" means Engrava's default search policy, so `search_memory`'s `recency_now` is honoured on this route too — recency is scored against the timestamp you supply, under Engrava's default search weights. |
-| `ENGRAVA_MCP_READ_ONLY` | When set to `1` / `true` / `yes`, the write tools are not registered and no read makes a write of its own — including a deferred access-count update a store with access tracking on would otherwise buffer and flush on close. Every tool's `readOnlyHint` annotation is therefore accurate under this mode, on every configuration route. |
+| `ENGRAVA_DB_PATH` | Path to a bare SQLite database file. Use an absolute path: a relative one resolves against the server's working directory, which the client chooses. Zero-config quick-start; no embedding provider is configured, so semantic (vector) search is inert — full-text search, the graph, and MindQL still work. This route builds the store with no journal, so the audit trail is not available here; use `ENGRAVA_MCP_CONFIG` for that. "Zero-config" means Engrava's default search policy, so `search_memory`'s `recency_now` is honoured on this route too — recency is scored against the timestamp you supply, under Engrava's default search weights. |
+| `ENGRAVA_MCP_READ_ONLY` | When set to `1` / `true` / `yes`, the write tools are not registered and no read makes a write of its own — including a deferred access-count update a store with access tracking on would otherwise buffer and flush on close. Every tool's `readOnlyHint` annotation is therefore accurate under this mode, on every configuration route. Read-only mode governs the tools, not how the database is opened. At startup the server still opens the file read-write, creates it if it is missing, and upgrades its schema to the one its Engrava version uses, so a database file the server cannot write cannot be served in this mode either. |
 
 **Recommended:** give the MCP server the same `engrava.yaml` your application
 uses. The `yaml` is the only place to declare an embedding provider (and its
@@ -132,12 +132,15 @@ hooks:
 
 ```yaml
 database:
-  path: ./memory.db
+  path: /absolute/path/to/memory.db
 embeddings:
   provider: openai-compatible # or: ollama, sentence-transformer, huggingface
   model: text-embedding-3-small
   api_key: ${OPENAI_API_KEY}
 ```
+
+A relative `database.path` resolves against the server process's working directory,
+which the MCP client chooses, not against the yaml's folder.
 
 ## Client setup
 
@@ -156,6 +159,10 @@ Point your MCP client at the server over stdio. For example, a typical
   }
 }
 ```
+
+A `${VAR}` value in the `engrava.yaml`, such as `${OPENAI_API_KEY}`, is read from the
+server's own environment, so add that variable to the same `env` block, unless the
+client is known to pass its own environment through.
 
 This assumes `uv tool install engrava-mcp`. If your client cannot find the
 command, give its absolute path; `uv tool dir --bin` prints the directory.

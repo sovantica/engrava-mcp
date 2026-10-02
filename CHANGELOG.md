@@ -32,7 +32,7 @@ and this project follows a one-way version mirror of [Engrava](https://github.co
 - Exit at shutdown instead of hanging when closing the database is stuck.
 - Stop describing results as newest-first (`list_memory`, `engrava://recent`, `summarize_recent_memory` and others): thoughts and edges written through this server all carry cycle 0, so the order among them is unspecified.
 - State in `delete_thought`'s description that the thought's edges, embeddings and action records are deleted with it.
-- Correct the README: the audit trail is available only through `ENGRAVA_MCP_CONFIG`; the `ENGRAVA_DB_PATH` route builds the store with no journal.
+- Correct the README: the journal is available only through `ENGRAVA_MCP_CONFIG`; the `ENGRAVA_DB_PATH` route builds the store with no journal.
 - Stop advertising audit verification and action records in the MCP Registry description; this server exposes neither.
 - Fix the README's example `engrava.yaml`: `database.path` and `provider: openai-compatible` replace keys that were never loaded.
 - Document in the README that a thought this server stores gets an embedding only when `embeddings.auto_embed` is on (off by default), and that without it `update_thought` keeps a thought's existing embedding.

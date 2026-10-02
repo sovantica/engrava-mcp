@@ -67,8 +67,8 @@ BUSY_TIMEOUT_MS = 5000
 
 #: Message logged at startup when no embedding provider is resolved, so the
 #: operator understands that semantic (vector) search is inert and how to
-#: enable it.  Lexical FTS, the graph, and MindQL are unaffected.  The audit
-#: trail is a separate knob (``journal: enabled: true`` in an
+#: enable it.  Lexical FTS, the graph, and MindQL are unaffected.  The
+#: journal is a separate knob (``journal: enabled: true`` in an
 #: ``engrava.yaml``) this message deliberately does not claim either way:
 #: it fires on the bare :data:`DB_PATH_ENV_VAR` route too, and that route
 #: never has a journal at all.

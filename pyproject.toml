@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "engrava-mcp"
 version = "0.7.0"
-description = "Model Context Protocol server for Engrava — expose an agent memory database to any MCP client over stdio."
+description = "Model Context Protocol server for Engrava - expose an agent memory database to any MCP client over stdio."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.11"

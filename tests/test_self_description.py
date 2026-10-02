@@ -7,9 +7,9 @@ code does not back up.
 
 Four classes of false self-description are covered:
 
-* The audit trail is not reachable on the bare ``ENGRAVA_DB_PATH`` route —
-  not in the README, and not in the startup warning that repeats the same
-  claim at every no-provider launch.
+* The README's ``ENGRAVA_DB_PATH`` row says that route builds no journal;
+  neither configuration row nor the no-provider startup warning's text
+  calls anything an audit trail.
 * ``server.json`` describes only what the MCP surface actually exposes —
   MindQL, search, and the thought graph — not audit verification or Action
   Records, which live in the library and the CLI only.
@@ -235,12 +235,10 @@ class TestReadmeBareRouteCapabilities:
                 return line
         pytest.fail("README is missing the ENGRAVA_DB_PATH configuration row")
 
-    def test_bare_route_row_does_not_claim_the_audit_trail(self) -> None:
+    def test_bare_route_row_says_it_has_no_journal(self) -> None:
         row = self._db_path_row()
-        assert "audit trail" not in row.lower() or "not available" in row.lower()
-        # More precisely: the row must not claim the audit trail *works*.
-        assert "audit trail still work" not in row
-        assert "the audit trail is not available" in row
+        assert "builds the store with no journal" in row
+        assert "audit trail" not in row.lower()
 
     def test_bare_route_row_still_lists_its_real_capabilities(self) -> None:
         row = self._db_path_row()
@@ -252,12 +250,13 @@ class TestReadmeBareRouteCapabilities:
         for line in _readme_text().splitlines():
             if line.startswith("| `ENGRAVA_MCP_CONFIG`"):
                 assert "journal" in line.lower()
+                assert "audit trail" not in line.lower()
                 return
         pytest.fail("README is missing the ENGRAVA_MCP_CONFIG configuration row")
 
 
 class TestStartupWarningDoesNotClaimTheAuditTrail:
-    """The no-provider startup warning must not repeat the README's false claim."""
+    """The no-provider startup warning does not mention an audit trail."""
 
     def test_warning_does_not_mention_the_audit_trail(self) -> None:
         assert "audit trail" not in _NO_PROVIDER_WARNING.lower()
@@ -299,6 +298,24 @@ class TestServerJsonDescribesTheMcpSurfaceOnly:
         packages = manifest["packages"]
         assert isinstance(packages, list)
         assert packages[0]["version"] == project["version"]
+
+    def test_description_does_not_label_the_memory_embedded(self) -> None:
+        description = self._server_json()["description"]
+        assert isinstance(description, str)
+        assert "embedded" not in description.lower()
+
+    def test_no_environment_variable_calls_the_journal_an_audit(self) -> None:
+        packages = self._server_json()["packages"]
+        assert isinstance(packages, list)
+        for package in packages:
+            assert isinstance(package, dict)
+            variables = package["environmentVariables"]
+            assert isinstance(variables, list)
+            for variable in variables:
+                assert isinstance(variable, dict)
+                description = variable["description"]
+                assert isinstance(description, str)
+                assert "audit" not in description.lower()
 
 
 class TestGetEdgesLimitDescribedHonestly:

@@ -1,20 +1,40 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "ai.sovantica/engrava",
-  "description": "Tamper-evident audit, MindQL, and Action Records — embedded memory database for AI agents.",
+  "description": "MindQL queries, hybrid search, and a thought graph - read/write memory for AI agents.",
   "repository": {
     "url": "https://github.com/sovantica/engrava-mcp",
     "source": "github"
   },
-  "version": "0.6.0",
+  "version": "0.7.0",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "engrava-mcp",
-      "version": "0.6.0",
+      "version": "0.7.0",
       "transport": {
         "type": "stdio"
-      }
+      },
+      "environmentVariables": [
+        {
+          "name": "ENGRAVA_DB_PATH",
+          "description": "Absolute path to the SQLite database file. Created if missing; its directory must exist. Enough on its own: full-text search, the graph and MindQL work, but vector search needs ENGRAVA_MCP_CONFIG.",
+          "isRequired": true,
+          "format": "filepath"
+        },
+        {
+          "name": "ENGRAVA_MCP_CONFIG",
+          "description": "Absolute path to an engrava.yaml, for an embedding provider (vector search) and the thought/edge journal. When set, it takes precedence and ENGRAVA_DB_PATH is not read.",
+          "isRequired": false,
+          "format": "filepath"
+        },
+        {
+          "name": "ENGRAVA_MCP_READ_ONLY",
+          "description": "Set to true to register no write tools.",
+          "isRequired": false,
+          "format": "boolean"
+        }
+      ]
     }
   ]
 }

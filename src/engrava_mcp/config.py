@@ -23,9 +23,11 @@ Two environment variables are recognised, in priority order:
 
 :func:`resolve_store` returns a :class:`ResolvedStore` that bundles the
 store with an :meth:`~ResolvedStore.aclose` coroutine.  Closing the
-``ResolvedStore`` always releases the underlying connection regardless of
-which resolution path produced it, so callers never depend on store
-connection-ownership internals.
+``ResolvedStore`` closes the store and, on the ``ENGRAVA_DB_PATH`` route, then
+the connection this server opened for it (on the other route the store owns its
+connection), so callers need not depend on store connection-ownership
+internals.  What happens when that close does not go cleanly is described on
+:meth:`ResolvedStore.aclose`.
 """
 
 from __future__ import annotations
@@ -36,10 +38,12 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from typing import TYPE_CHECKING, NamedTuple
 
 import aiosqlite
-from engrava import SearchConfig, SqliteEngravaCore, load_config
+import anyio
+from engrava import ConnectionQuarantinedError, SearchConfig, SqliteEngravaCore, load_config
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
@@ -63,15 +67,35 @@ BUSY_TIMEOUT_MS = 5000
 
 #: Message logged at startup when no embedding provider is resolved, so the
 #: operator understands that semantic (vector) search is inert and how to
-#: enable it.  Lexical FTS, the graph, MindQL, and the audit trail are
-#: unaffected.
+#: enable it.  Lexical FTS, the graph, and MindQL are unaffected.  The
+#: journal is a separate knob (``journal: enabled: true`` in an
+#: ``engrava.yaml``) this message deliberately does not claim either way:
+#: it fires on the bare :data:`DB_PATH_ENV_VAR` route too, and that route
+#: never has a journal at all.
 _NO_PROVIDER_WARNING = (
     "No embedding provider configured: semantic (vector) search is inert; "
     "queries fall back to lexical full-text search. Full-text search, the "
-    "graph, MindQL, and the audit trail are unaffected. To enable semantic "
-    "search, declare an embedding provider in an engrava.yaml and point "
+    "graph, and MindQL are unaffected. To enable semantic search, declare "
+    "an embedding provider in an engrava.yaml and point "
     f"{CONFIG_ENV_VAR} at it."
 )
+
+#: How long the connection close is waited on, in seconds.  Equal to the
+#: library's default close bound.
+_CONNECTION_CLOSE_TIMEOUT_SECONDS = 30.0
+
+#: Logged when the store's close raised
+#: :class:`~engrava.ConnectionQuarantinedError`.  The reason is the library's own
+#: description of why the connection was quarantined, and is logged as given.
+_STORE_QUARANTINED_AT_SHUTDOWN = "Closing the store reported a quarantined connection: %s"
+
+#: Logged when the connection close did not finish within the bound.
+_CONNECTION_CLOSE_TIMED_OUT = (
+    "The database connection did not close within %s seconds; abandoning it."
+)
+
+#: Logged when closing the connection raised while the store's own close was failing.
+_CONNECTION_CLOSE_FAILED = "Database connection cleanup also raised after the store close failed."
 
 #: Entry-point group through which engrava extensions advertise themselves.
 #: An extension that hooks the store is wired through the engrava config's
@@ -89,16 +113,18 @@ _EXTENSION_DISCOVERY_FAILED = (
 )
 
 
-def _warn_softly(message: str, *args: object) -> None:
-    """Emit a startup warning without letting the diagnostic break the launch.
+def _warn_softly(message: str, *args: object, exc_info: bool = False) -> None:
+    """Emit a warning without letting the diagnostic change the outcome.
 
-    Used by the two extension diagnostics only, deliberately.  They are pure
-    advice — they explain a working configuration, never a broken one — so
-    neither is worth failing a resolution that has otherwise succeeded, and an
+    Used by the two extension diagnostics and by the shutdown warnings,
+    deliberately.  The extension diagnostics are non-fatal: they report
+    extension wiring or discovery without invalidating a store resolution that
+    has otherwise succeeded.  Neither is worth failing a resolution, and an
     operator who cannot be told about an unwired extension is better off than
-    one whose server refuses to start over it.  Handlers and filters are
-    supplied by the embedding application and can raise, so emission is
-    attempted rather than assumed.
+    one whose server refuses to start over it.  The shutdown warnings are used
+    for the same reason: a diagnostic is not worth changing an outcome.
+    Handlers and filters are supplied by the embedding application and can
+    raise, so emission is attempted rather than assumed.
 
     :data:`_NO_PROVIDER_WARNING` deliberately does **not** go through here: it
     predates these diagnostics and an embedding application may be relying on
@@ -106,19 +132,21 @@ def _warn_softly(message: str, *args: object) -> None:
 
     Delivery is therefore **best effort**.  What this guarantees is narrow and
     worth stating exactly: an :class:`Exception` raised while emitting cannot
-    fail a resolution that has otherwise succeeded.  It does not guarantee that
-    a line reaches anyone — that depends on a logging configuration this process
-    does not own.
+    change the outcome of the operation that emitted the warning.  It does not
+    guarantee that a line reaches anyone — that depends on a logging
+    configuration this process does not own.
 
     Args:
         message: Warning message, possibly carrying ``%``-style placeholders.
         args: Values for those placeholders, formatted lazily by ``logging``.
+        exc_info: Attach the exception being handled to the record, as
+            ``logger.warning(..., exc_info=True)`` does.
 
     """
     # Suppressed rather than logged, because the logging channel is what
     # failed: there is nowhere left to report it to.
     with contextlib.suppress(Exception):
-        logger.warning(message, *args)
+        logger.warning(message, *args, exc_info=exc_info)
 
 
 class StoreResolutionError(RuntimeError):
@@ -136,16 +164,79 @@ class ResolvedStore:
 
     Attributes:
         store: The schema-ready ``SqliteEngravaCore`` to serve queries.
-        _closer: Async callback that releases the underlying connection.
+        _closer: Async callback that closes the store and, on the
+            :data:`DB_PATH_ENV_VAR` launch, then the connection this server
+            opened for it.  Reports whether that connection close abandoned a
+            wedged worker rather than closing cleanly (see :meth:`aclose`).
 
     """
 
     store: SqliteEngravaCore
-    _closer: Callable[[], Awaitable[None]]
+    _closer: Callable[[], Awaitable[bool]]
 
-    async def aclose(self) -> None:
-        """Release the underlying database connection."""
-        await self._closer()
+    async def aclose(self) -> bool:
+        """Close the store, then the underlying database connection.
+
+        On the :data:`DB_PATH_ENV_VAR` launch the store is built around a
+        connection this server opened and the store does not own, so the
+        connection is closed here, after the store.  Its close is attempted
+        whichever way the store's close ends, and that attempt is bounded: when
+        the bound expires the connection is abandoned, a warning is logged, and
+        this method stops waiting for it.  On the :data:`CONFIG_ENV_VAR` launch
+        the store owns its connection and closing the store is all this method
+        does.
+
+        If closing the store raises
+        :class:`~engrava.ConnectionQuarantinedError`, a best-effort warning
+        carrying the library's reason is emitted and this method returns
+        ``False`` instead of raising it -- but only when that close does not
+        leave a wedged worker thread behind.  On the :data:`CONFIG_ENV_VAR`
+        launch it can: the store owns its connection there, so its own close
+        applies its own internal bound on the very same worker, and the
+        library's own :class:`~engrava.ConnectionQuarantinedError` raised
+        *from that close* is verified (at the library's own source) to mean
+        exactly that bound expiring with the physical close still not done --
+        never a benign quarantine for some unrelated reason.  That case is
+        caught and reported ``True`` before it ever reaches this method (see
+        :func:`resolve_store`'s own closer for the :data:`CONFIG_ENV_VAR`
+        launch); what reaches this ``except`` clause is therefore only ever
+        the :data:`DB_PATH_ENV_VAR` launch's own residual case, where the
+        store never owned the connection this server is asking about at all,
+        so a quarantine reported here carries no relationship to it.
+
+        Warnings are best effort: an :class:`Exception` raised while emitting
+        one is dropped and changes nothing else about the outcome.
+
+        Returns:
+            Whether the connection close abandoned a worker thread that never
+            answered within its bound, rather than closing cleanly -- either
+            :data:`_CONNECTION_CLOSE_TIMEOUT_SECONDS` on the
+            :data:`DB_PATH_ENV_VAR` launch, or the store's own
+            ``close_timeout_seconds`` on the :data:`CONFIG_ENV_VAR` launch.
+            ``False`` on a clean close, and on the
+            :class:`~engrava.ConnectionQuarantinedError` path above (the
+            :data:`DB_PATH_ENV_VAR` launch's residual case only -- see it for
+            why).  This is the fact ``server.py``'s ``lifespan`` uses to
+            decide whether the worker is genuinely wedged and the process
+            must force its own exit — callers that do not need that decision
+            (every test in ``tests/test_shutdown.py`` that calls this method
+            directly) are free to ignore it.
+
+        Raises:
+            Exception: Anything the store's close raises other than
+                :class:`~engrava.ConnectionQuarantinedError`; and, when the
+                store closed cleanly, anything the connection's own close
+                raises.  If the connection's close also raises an
+                :class:`Exception` while the store's close is failing, that
+                exception does not replace the store's; anything else it
+                raises does.
+
+        """
+        try:
+            return await self._closer()
+        except ConnectionQuarantinedError as exc:
+            _warn_softly(_STORE_QUARANTINED_AT_SHUTDOWN, exc.reason)
+            return False
 
 
 async def resolve_store() -> ResolvedStore:
@@ -154,9 +245,18 @@ async def resolve_store() -> ResolvedStore:
     Resolution honours :data:`CONFIG_ENV_VAR` first, then
     :data:`DB_PATH_ENV_VAR`.
 
+    Logs two ``INFO`` records on the ``engrava_mcp`` logger for whichever route
+    is taken: one immediately after the route is chosen, naming only the
+    environment variable's own name (``ENGRAVA_MCP_CONFIG`` or
+    ``ENGRAVA_DB_PATH``), and one once the store is constructed, giving the
+    time the store took to open. Neither record includes a path or anything
+    read from an ``engrava.yaml`` -- a path or a config value can carry a
+    secret, and the variable name alone tells an operator which route opened.
+
     Returns:
-        A :class:`ResolvedStore` whose connection is released by
-        :meth:`ResolvedStore.aclose`.
+        A :class:`ResolvedStore` whose :meth:`~ResolvedStore.aclose` closes the
+        store and, on the :data:`DB_PATH_ENV_VAR` launch, then the connection
+        this server opened for it.
 
     Raises:
         StoreResolutionError: If neither environment variable is set.
@@ -165,15 +265,58 @@ async def resolve_store() -> ResolvedStore:
     """
     config_path = os.environ.get(CONFIG_ENV_VAR)
     if config_path:
+        start = monotonic()
+        logger.info("opening the store from %s", CONFIG_ENV_VAR)
         config = load_config(config_path)
         if config.embeddings is None or config.embeddings.provider is None:
             logger.warning(_NO_PROVIDER_WARNING)
         store = await SqliteEngravaCore.from_config(config_path)
-        return ResolvedStore(store=store, _closer=store.close)
+        logger.info("store ready in %.2f s", monotonic() - start)
+
+        async def _closer() -> bool:
+            """Close the store, reporting whether its own bound abandoned a wedged worker.
+
+            The store owns its connection here, so ``store.close()`` performs
+            the whole close, including its own internal bound on that same
+            non-daemon aiosqlite worker thread.  Verified at the library's own
+            source (``SqliteEngravaCore.close`` / ``_finish_close_wait``): the
+            *only* place ``close()`` raises
+            :class:`~engrava.ConnectionQuarantinedError` from within itself is
+            when its own wait for the physical close exceeds
+            ``close_timeout_seconds`` with that task still not done -- the
+            task is never cancelled, only abandoned, so it keeps running (or
+            not) in the background exactly like :func:`_close_connection`
+            leaves the :data:`DB_PATH_ENV_VAR` route's own connection.  There
+            is therefore no other, benign reason for ``close()`` itself to
+            raise this here, and it is caught and reported as a wedge rather
+            than left to :meth:`ResolvedStore.aclose`'s own catch, which is
+            the correct default only for a caller that cannot make this same
+            guarantee (see the :data:`DB_PATH_ENV_VAR` route, where
+            ``store.close()`` never owns the connection at all).
+
+            Returns:
+                ``True`` when ``store.close()`` raised
+                :class:`~engrava.ConnectionQuarantinedError` -- always a report
+                of its own bound expiring with the worker not answering.
+                ``False`` on a clean close.
+
+            """
+            try:
+                await store.close()
+            except ConnectionQuarantinedError as exc:
+                _warn_softly(_STORE_QUARANTINED_AT_SHUTDOWN, exc.reason)
+                return True
+            return False
+
+        return ResolvedStore(store=store, _closer=_closer)
 
     db_path = os.environ.get(DB_PATH_ENV_VAR)
     if db_path:
-        return await _resolve_from_db_path(db_path)
+        start = monotonic()
+        logger.info("opening the store from %s", DB_PATH_ENV_VAR)
+        resolved = await _resolve_from_db_path(db_path)
+        logger.info("store ready in %.2f s", monotonic() - start)
+        return resolved
 
     msg = (
         "No engrava store configured. Set "
@@ -306,6 +449,30 @@ async def _configure_connection(connection: aiosqlite.Connection) -> None:
     connection.row_factory = aiosqlite.Row
 
 
+async def _close_connection(connection: aiosqlite.Connection) -> bool:
+    """Close a connection, giving up the wait after the bound.
+
+    The bound is :data:`_CONNECTION_CLOSE_TIMEOUT_SECONDS`.  When it expires a
+    warning is logged and the connection is abandoned.  Anything the close
+    itself raises propagates.
+
+    Args:
+        connection: The connection to close.
+
+    Returns:
+        Whether the bound expired before the close finished -- an abandoned
+        wait on a worker that never answered, not a clean close.  The caller
+        decides what abandoning it means; this function only reports whether
+        it happened.
+
+    """
+    with anyio.move_on_after(_CONNECTION_CLOSE_TIMEOUT_SECONDS) as scope:
+        await connection.close()
+    if scope.cancelled_caught:
+        _warn_softly(_CONNECTION_CLOSE_TIMED_OUT, _CONNECTION_CLOSE_TIMEOUT_SECONDS)
+    return scope.cancelled_caught
+
+
 async def _resolve_from_db_path(db_path: str) -> ResolvedStore:
     """Open a database file and build a store over it.
 
@@ -375,4 +542,38 @@ async def _resolve_from_db_path(db_path: str) -> ResolvedStore:
         with contextlib.suppress(Exception):
             await connection.close()
         raise
-    return ResolvedStore(store=store, _closer=connection.close)
+
+    async def _closer() -> bool:
+        """Close the store, then the connection this server opened for it.
+
+        The connection goes second so a pending flush still has an open
+        connection to write through. An attempt to close it is made whichever
+        way the store's close ends, because the store's close will not: the
+        constructor above never marks the store as owning it. With engrava 0.7
+        the store's close does nothing on this route (it neither owns the
+        connection nor tracks accesses), so the cleanup is written not to depend
+        on that. The attempt is bounded; when the bound expires the connection
+        is abandoned with a warning. If the store's close raised and the
+        connection close then raises an :class:`Exception`, that is reported in
+        a warning and the store's exception is what ``_closer`` raises; anything
+        else the connection close raises propagates instead.
+
+        Returns:
+            Whether the connection close abandoned the connection at its bound
+            (see :func:`_close_connection`).  Not reported when the store's own
+            close raises -- this function re-raises that instead, and
+            :meth:`ResolvedStore.aclose` decides what to report for that case.
+
+        """
+        try:
+            await store.close()
+        except BaseException:
+            # The store's exception must not be replaced by an ordinary cleanup failure.
+            try:
+                await _close_connection(connection)
+            except Exception:  # noqa: BLE001 - reported below; the store's error is re-raised
+                _warn_softly(_CONNECTION_CLOSE_FAILED, exc_info=True)
+            raise
+        return await _close_connection(connection)
+
+    return ResolvedStore(store=store, _closer=_closer)

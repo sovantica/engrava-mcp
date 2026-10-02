@@ -6,6 +6,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows a one-way version mirror of [Engrava](https://github.com/sovantica/engrava)
 (`engrava-mcp X.Y.z` targets `engrava X.Y`).
 
+## [0.7.0]
+
+### Added
+
+- Add an optional `limit` to `get_edges`, returning at most that many edges, the highest-weight ones first.
+- Add a `measured` flag to `memory_stats` and `engrava://stats`, which tells zero-filled placeholder metrics (metrics collection off) from a real measurement.
+- Log to stderr which configuration route the server is opening the store from, and when the store is ready.
+
+### Changed
+
+- **Breaking:** require the MCP SDK 2.x line (`mcp>=2.2,<3`); the 1.x line is no longer supported.
+- Target Engrava 0.7 — now requires `engrava >=0.7,<0.8`.
+- Cap `query_memory` at 5000 rows, and refuse a query whose own `LIMIT` is outside 1–5000 when no `limit` argument is passed.
+- Make `update_thought` fail with a conflict error, applying nothing, when another write changes or deletes the thought during the update; it is no longer annotated idempotent.
+- Declare `anyio`, `aiosqlite` and `pydantic` as direct dependencies instead of relying on other packages to install them.
+- Recommend `uv tool install engrava-mcp` for daily use, and an embedding provider outside the server process for MCP deployments.
+
+### Fixed
+
+- Find archived thoughts when searching with `lifecycle_status=ARCHIVED`, which previously returned nothing.
+- Keep reads in read-only mode from writing anything of their own, including deferred access-count updates.
+- Report this server's own version in the `initialize` handshake instead of the MCP SDK's.
+- Return clear tool errors for more library failures; when SQLite reports database contention, `link_thoughts`, `delete_thought` and `delete_edge` say that nothing changed and that a retry is safe.
+- Exit at shutdown instead of hanging when closing the database is stuck.
+- Stop describing results as newest-first (`list_memory`, `engrava://recent`, `summarize_recent_memory` and others): thoughts and edges written through this server all carry cycle 0, so the order among them is unspecified.
+- State in `delete_thought`'s description that the thought's edges, embeddings and action records are deleted with it.
+- Correct the README: the journal is available only through `ENGRAVA_MCP_CONFIG`; the `ENGRAVA_DB_PATH` route builds the store with no journal.
+- Stop advertising audit verification and action records in the MCP Registry description; this server exposes neither.
+- Fix the README's example `engrava.yaml`: `database.path` and `provider: openai-compatible` replace keys that were never loaded.
+- Document in the README that a thought this server stores gets an embedding only when `embeddings.auto_embed` is on (off by default), and that without it `update_thought` keeps a thought's existing embedding.
+- Document in the README that read-only mode still opens the database read-write, creates it, and upgrades its schema at startup.
+- Fix the README's example config to use an absolute database path, and say where `OPENAI_API_KEY` must be set.
+- Declare `ENGRAVA_DB_PATH` (required), `ENGRAVA_MCP_CONFIG` and `ENGRAVA_MCP_READ_ONLY` in the registry manifest, so a host that configures this server from the MCP Registry asks for a database path instead of starting a server that exits for lack of one.
+- Bug fixes and stability improvements.
+- `query_memory` refuses an `OFFSET` beyond SQLite's integer range with a clear message instead of an unexplained error.
+
 ## [0.6.0]
 
 ### Added
@@ -48,6 +84,7 @@ First standalone release of the Engrava MCP server.
 
 - Extracted from the former `engrava[mcp]` extra into this standalone package. Install `engrava-mcp` (or `uvx engrava-mcp`) instead of `pip install "engrava[mcp]"`, and update any pinned `engrava[mcp]` requirements to depend on `engrava-mcp`.
 
+[0.7.0]: https://github.com/sovantica/engrava-mcp/releases/tag/v0.7.0
 [0.6.0]: https://github.com/sovantica/engrava-mcp/releases/tag/v0.6.0
 [0.5.1]: https://github.com/sovantica/engrava-mcp/releases/tag/v0.5.1
 [0.5.0]: https://github.com/sovantica/engrava-mcp/releases/tag/v0.5.0

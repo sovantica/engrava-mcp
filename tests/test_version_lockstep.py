@@ -23,7 +23,7 @@ from engrava_mcp import _compat
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 #: The engrava range every engrava pin and the compat constants must agree on.
-EXPECTED_RANGE = ">=0.6,<0.7"
+EXPECTED_RANGE = ">=0.7,<0.8"
 
 #: The same range as a parsed specifier, compared semantically so format
 #: variants (extra whitespace, clause order) do not matter and a stale range
@@ -34,7 +34,7 @@ EXPECTED_SPECIFIER = SpecifierSet(EXPECTED_RANGE)
 ENGRAVA_CANONICAL_NAME = canonicalize_name("engrava")
 
 #: The package/manifest version this release declares everywhere.
-EXPECTED_VERSION = "0.6.0"
+EXPECTED_VERSION = "0.7.0"
 
 #: The exact set of engrava requirements the project must carry, keyed by
 #: ``(name, extras)``: the bare ``engrava`` dependency, the ``[vec]`` default
@@ -130,8 +130,8 @@ def test_engrava_requirement_set_is_exact_and_pins_the_expected_range() -> None:
 
 def test_compat_constants_match_the_expected_range() -> None:
     """The parsed ``_compat`` constants match the pinned range."""
-    assert _compat.ENGRAVA_MIN_VERSION == (0, 6)
-    assert _compat.ENGRAVA_MAX_VERSION_EXCLUSIVE == (0, 7)
+    assert _compat.ENGRAVA_MIN_VERSION == (0, 7)
+    assert _compat.ENGRAVA_MAX_VERSION_EXCLUSIVE == (0, 8)
     assert _compat.ENGRAVA_SUPPORTED_RANGE == EXPECTED_RANGE
 
 

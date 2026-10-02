@@ -25,20 +25,22 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
 import pytest
-from engrava import EdgeType
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
-from mcp.shared.exceptions import McpError
-from mcp.shared.memory import create_connected_server_and_client_session as connect_client
+from engrava import EdgeRecord, EdgeType
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.shared.exceptions import MCPError
 
 import engrava_mcp.server as server_module
 from engrava_mcp.server import (
     MAX_PAGE_LIMIT,
     MAX_TOP_K,
     SERVER_NAME,
+    SQLITE_MAX_BOUND_INT,
+    SQLITE_MIN_BOUND_INT,
     OutOfRangeBoundError,
     StoreProvider,
     _tool_errors,
+    get_edges_impl,
     link_thoughts_impl,
     list_edges_impl,
     list_memory_impl,
@@ -50,12 +52,13 @@ from engrava_mcp.server import (
     search_memory_impl,
     store_thought_impl,
 )
+from tests.inprocess_client import connect_client
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
     from engrava import SqliteEngravaCore
-    from mcp import ClientSession
+    from mcp import Client
 
 #: A FIND query matching every thought the ``bulk_store`` fixture seeds.
 FIND_ALL = "FIND thoughts WHERE lifecycle_status = 'CREATED'"
@@ -85,9 +88,42 @@ OUT_OF_RANGE_LIMITS = [-1, 0, MAX_PAGE_LIMIT + 1, 10**18]
 #: The same, for the ranked-window bound.
 OUT_OF_RANGE_TOP_K = [-1, 0, MAX_TOP_K + 1, 10**18]
 
+#: Values that must be rejected for ``offset``: negatives (unchanged), and now
+#: also anything above SQLite's own signed-64-bit bind ceiling -- 2**63 is the
+#: exact value the deep scan probed, which used to reach sqlite3's bind call
+#: and raise a raw, unmapped ``OverflowError``.
+OUT_OF_RANGE_OFFSETS = [-1, SQLITE_MAX_BOUND_INT + 1, 2**63, 2**64]
+
+#: Values that must be rejected for ``min_cycle`` / ``max_cycle``: unlike
+#: ``offset`` these accept a negative value (see ``CycleFilterBound``'s
+#: docstring), so only values outside SQLite's own bind range are rejected,
+#: in either direction.
+OUT_OF_RANGE_CYCLE_BOUNDS = [
+    SQLITE_MAX_BOUND_INT + 1,
+    SQLITE_MIN_BOUND_INT - 1,
+    2**63,
+    -(2**63) - 1,
+]
+
+#: A MindQL query matching both thoughts the shared ``store`` fixture seeds
+#: (they are ``ACTIVE``, not ``CREATED``, so :data:`FIND_ALL` would not match
+#: them -- that one is written for ``bulk_store``).
+FIND_ACTIVE = "FIND thoughts WHERE lifecycle_status = 'ACTIVE'"
+
+#: One past SQLite's integer range: an OFFSET that reaches sqlite3 unguarded
+#: (OFFSET is interpolated into the SQL text, not bound as a parameter)
+#: raises a raw, unmapped ``IntegrityError`` instead of a curated
+#: ``OutOfRangeBoundError``.
+OUT_OF_RANGE_QUERY_OFFSET = SQLITE_MAX_BOUND_INT + 1
+
+#: Far past that range still. Nothing in the MindQL grammar itself rejects an
+#: OFFSET this size -- it parses as a plain (very large) Python int -- so only
+#: the domain guard stands between it and the SQL text sqlite3 executes.
+HUGE_QUERY_OFFSET = 99999999999999999999999
+
 
 @asynccontextmanager
-async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[ClientSession]:
+async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[Client]:
     """Open a connected client whose tools and prompts query the given store.
 
     Args:
@@ -98,10 +134,10 @@ async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[ClientSession]:
         boundary, so pydantic's schema validation and ``_tool_errors`` both run.
 
     """
-    server: FastMCP = FastMCP(SERVER_NAME)
+    server: MCPServer = MCPServer(SERVER_NAME)
     provider = StoreProvider()
-    provider.set(store)
-    register_tools(server, provider)
+    provider.set(store, read_store=store)
+    register_tools(server, provider, read_only=False)
     register_prompts(server, provider)
     async with connect_client(server) as client:
         yield client
@@ -209,6 +245,150 @@ class TestOutOfRangeBoundsAreRejectedAndPagingStaysExact:
             await list_memory_impl(bulk_store, limit=10**18)
 
 
+class TestQueryMemoryOwnLimitIsBounded:
+    """``query_memory`` bounds the query text's own ``LIMIT``, not just the argument.
+
+    Before this guard, the ``limit`` *argument* was checked against
+    :data:`MAX_PAGE_LIMIT`, but a ``LIMIT`` written into the query text itself
+    was executed as-is -- including no ``LIMIT`` at all, which ran unbounded.
+    Each test here pairs a deletion-sensitive rejection or injection with an
+    exact row count against ``bulk_store`` (more rows than any capped page
+    size used below), so the cap's reality is observable rather than assumed.
+    """
+
+    async def test_no_limit_in_query_is_capped_not_unbounded(
+        self, bulk_store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # bulk_store holds more CREATED rows than this lowered cap, so an
+        # injected LIMIT is observable without building a 5000+ row store.
+        monkeypatch.setattr(server_module, "MAX_PAGE_LIMIT", 5)
+
+        # FIND_ALL carries no LIMIT clause and no `limit` argument is passed:
+        # without injection this returns every CREATED row (CREATED_ROWS),
+        # not the cap.
+        result = await query_memory_impl(bulk_store, FIND_ALL)
+        assert len(result["rows"]) == 5
+
+    async def test_over_cap_in_query_limit_is_refused(self, bulk_store: SqliteEngravaCore) -> None:
+        # The real MAX_PAGE_LIMIT is used here (no monkeypatch needed): the
+        # rejection happens before the store is ever touched, so the store's
+        # actual size is irrelevant to this assertion.
+        with pytest.raises(OutOfRangeBoundError) as exc_info:
+            await query_memory_impl(bulk_store, f"{FIND_ALL} LIMIT {MAX_PAGE_LIMIT + 1}")
+        # Same bound message shape every other tool uses, naming the cap.
+        assert str(MAX_PAGE_LIMIT) in str(exc_info.value)
+
+        with pytest.raises(OutOfRangeBoundError):
+            await query_memory_impl(bulk_store, f"{FIND_ALL} LIMIT 100000")
+
+    async def test_in_range_in_query_limit_is_honoured_when_no_argument(
+        self, bulk_store: SqliteEngravaCore
+    ) -> None:
+        # An in-query LIMIT within range, with no `limit` argument, still
+        # works -- the new cap-checking path is not itself a regression.
+        result = await query_memory_impl(bulk_store, f"{FIND_ALL} LIMIT 5")
+        assert len(result["rows"]) == 5
+
+    async def test_limit_argument_overrides_in_query_limit(
+        self, bulk_store: SqliteEngravaCore
+    ) -> None:
+        # Precedence: the `limit` argument always wins over a LIMIT already
+        # in the query text -- it replaces it rather than being compared
+        # against it. The in-query LIMIT (5) would produce a different count
+        # than the argument (3), so this is deletion-sensitive to a precedence
+        # flip in either direction.
+        overridden = await query_memory_impl(bulk_store, f"{FIND_ALL} LIMIT 5", limit=3)
+        assert len(overridden["rows"]) == 3
+
+
+class TestQueryMemoryOwnOffsetIsBounded:
+    """``query_memory`` bounds the query text's own ``OFFSET``, on every limit path.
+
+    ``_with_limit`` only ever replaces ``limit`` (see :func:`_with_limit`), so the
+    parsed ``OFFSET`` reaches ``effective`` unchanged no matter which of the three
+    limit paths ran: the ``limit`` argument, the injected cap, or the query's own
+    ``LIMIT``. The out-of-range case is parameterized across all three -- a guard
+    placed in only one branch would still fail the other two.
+    """
+
+    @pytest.mark.parametrize(
+        ("query", "limit"),
+        [
+            pytest.param(
+                f"{FIND_ACTIVE} OFFSET {OUT_OF_RANGE_QUERY_OFFSET}",
+                1,
+                id="limit-argument",
+            ),
+            pytest.param(
+                f"{FIND_ACTIVE} OFFSET {OUT_OF_RANGE_QUERY_OFFSET}",
+                None,
+                id="injected-cap",
+            ),
+            pytest.param(
+                f"{FIND_ACTIVE} LIMIT 1 OFFSET {OUT_OF_RANGE_QUERY_OFFSET}",
+                None,
+                id="query-own-limit",
+            ),
+            pytest.param(
+                f"{FIND_ACTIVE} OFFSET {HUGE_QUERY_OFFSET}",
+                None,
+                id="far-past-the-ceiling",
+            ),
+        ],
+    )
+    async def test_out_of_range_offset_is_rejected_on_every_limit_path(
+        self, store: SqliteEngravaCore, query: str, limit: int | None
+    ) -> None:
+        # Without the guard, this OFFSET is interpolated into the SQL text
+        # unguarded and reaches sqlite3, raising a raw, unmapped
+        # IntegrityError instead of the curated bound error.
+        with pytest.raises(OutOfRangeBoundError) as exc_info:
+            await query_memory_impl(store, query, limit=limit)
+        assert "the query's OFFSET clause" in str(exc_info.value)
+
+    async def test_out_of_range_query_offset_is_rejected_over_the_wire_with_the_full_message(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # The parametrized test above calls query_memory_impl directly and
+        # checks only that the offending argument's name appears. This one
+        # drives the real MCP client end to end and checks the *complete*
+        # curated message -- the received value and the accepted range too.
+        # The expectations are independent literals, not derived from
+        # OutOfRangeBoundError's own formatting: deriving them that way would
+        # make the assertion tautological -- if the formatter dropped the
+        # argument, value, or range, both sides would change together and the
+        # test would still pass.
+        async with _client_for(store) as client:
+            result = await client.call_tool(
+                "query_memory",
+                {"query": f"FIND thoughts LIMIT 1 OFFSET {OUT_OF_RANGE_QUERY_OFFSET}"},
+            )
+        assert result.is_error is True
+        text = result.content[0].text  # type: ignore[union-attr]
+        assert "the query's OFFSET clause" in text
+        assert "received 9223372036854775808" in text
+        assert "between 0 and 9223372036854775807" in text
+        # The raw sqlite3 failure this guard prevents must never reach the
+        # client over the real MCP boundary either.
+        assert "IntegrityError" not in text
+        assert "datatype mismatch" not in text
+
+    async def test_offset_at_the_sqlite_ceiling_returns_zero_rows(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # The ceiling itself is in-domain (an inclusive bound), and a store
+        # this small holds nothing that far in -- an empty result proves the
+        # offset reached the query rather than being silently dropped.
+        result = await query_memory_impl(store, f"{FIND_ACTIVE} OFFSET {SQLITE_MAX_BOUND_INT}")
+        assert result["rows"] == []
+
+    async def test_offset_one_skips_the_first_of_two_thoughts(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        result = await query_memory_impl(store, f"{FIND_ACTIVE} OFFSET 1")
+        assert len(result["rows"]) == 1
+
+
 class TestImplLevelBounds:
     """Every wire-supplied bound is domain-validated in its implementation."""
 
@@ -236,10 +416,69 @@ class TestImplLevelBounds:
         result = await list_memory_impl(store, offset=0)
         assert result["offset"] == 0
 
+    @pytest.mark.parametrize("offset", OUT_OF_RANGE_OFFSETS)
+    async def test_list_memory_offset_above_sqlite_bind_ceiling(
+        self, store: SqliteEngravaCore, offset: int
+    ) -> None:
+        # offset used to have no upper bound at all: 2**63 reached sqlite3's
+        # own bind call and raised a raw OverflowError there instead of a
+        # domain error here.
+        with pytest.raises(OutOfRangeBoundError):
+            await list_memory_impl(store, offset=offset)
+
+    async def test_list_memory_offset_at_the_sqlite_ceiling_is_valid(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # The ceiling itself is inside the domain (an inclusive bound).
+        result = await list_memory_impl(store, offset=SQLITE_MAX_BOUND_INT)
+        assert result["offset"] == SQLITE_MAX_BOUND_INT
+
+    @pytest.mark.parametrize("cycle_bound", OUT_OF_RANGE_CYCLE_BOUNDS)
+    async def test_list_memory_min_cycle_outside_sqlite_bind_range(
+        self, store: SqliteEngravaCore, cycle_bound: int
+    ) -> None:
+        # min_cycle / max_cycle had no bound at all before this fix -- neither
+        # a floor nor a ceiling -- so either extreme reached sqlite3's bind
+        # call unguarded.
+        with pytest.raises(OutOfRangeBoundError):
+            await list_memory_impl(store, min_cycle=cycle_bound)
+
+    @pytest.mark.parametrize("cycle_bound", OUT_OF_RANGE_CYCLE_BOUNDS)
+    async def test_list_memory_max_cycle_outside_sqlite_bind_range(
+        self, store: SqliteEngravaCore, cycle_bound: int
+    ) -> None:
+        with pytest.raises(OutOfRangeBoundError):
+            await list_memory_impl(store, max_cycle=cycle_bound)
+
+    async def test_list_memory_negative_min_cycle_is_valid_and_excludes_nothing(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # Unlike offset, a negative min_cycle is in-domain rather than
+        # rejected: as a lower bound it is trivially satisfied by any
+        # updated_cycle (always >= 0), so it behaves the same as omitting the
+        # filter entirely -- both seeded thoughts still come back.
+        with_bound = await list_memory_impl(store, min_cycle=-5)
+        without_bound = await list_memory_impl(store)
+        assert with_bound["count"] == without_bound["count"] == 2
+
+    async def test_list_memory_negative_max_cycle_is_valid_and_excludes_everything(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # A negative max_cycle is also in-domain, but as an upper bound it is
+        # never satisfied (updated_cycle is always >= 0) -- a legitimate,
+        # non-error way to get an empty page, not a bound violation.
+        result = await list_memory_impl(store, max_cycle=-1)
+        assert result["count"] == 0
+
     @pytest.mark.parametrize("limit", OUT_OF_RANGE_LIMITS)
     async def test_list_edges_limit(self, store: SqliteEngravaCore, limit: int) -> None:
         with pytest.raises(OutOfRangeBoundError):
             await list_edges_impl(store, limit=limit)
+
+    @pytest.mark.parametrize("limit", OUT_OF_RANGE_LIMITS)
+    async def test_get_edges_limit(self, store: SqliteEngravaCore, limit: int) -> None:
+        with pytest.raises(OutOfRangeBoundError):
+            await get_edges_impl(store, "thought-alpha", limit=limit)
 
     @pytest.mark.parametrize("limit", OUT_OF_RANGE_LIMITS)
     async def test_query_memory_limit(self, store: SqliteEngravaCore, limit: int) -> None:
@@ -259,8 +498,9 @@ class TestImplLevelBounds:
         )
 
     async def test_query_memory_without_limit_still_works(self, store: SqliteEngravaCore) -> None:
-        # An omitted limit is not a bound to validate; the store's own default
-        # applies and the call must not be rejected.
+        # An omitted limit is not itself a bound to validate; MAX_PAGE_LIMIT is
+        # injected instead of reaching the store unbounded (see
+        # TestQueryMemoryOwnLimitIsBounded), and the call must not be rejected.
         result = await query_memory_impl(store, FIND_ALL)
         assert isinstance(result["rows"], list)
 
@@ -292,6 +532,10 @@ class TestBoundErrorsAreCleanAtTheBoundary:
             ("query_memory", {"query": FIND_ALL, "limit": -1}),
             ("list_memory", {"limit": 10**18}),
             ("search_keywords", {"query": "coffee", "top_k": MAX_TOP_K + 1}),
+            ("list_memory", {"offset": SQLITE_MAX_BOUND_INT + 1}),
+            ("list_memory", {"offset": 2**63}),
+            ("list_memory", {"min_cycle": SQLITE_MAX_BOUND_INT + 1}),
+            ("list_memory", {"max_cycle": SQLITE_MIN_BOUND_INT - 1}),
         ],
     )
     async def test_out_of_range_bound_is_rejected_over_the_wire(
@@ -305,15 +549,15 @@ class TestBoundErrorsAreCleanAtTheBoundary:
         # than an unbounded result.
         async with _client_for(store) as client:
             result = await client.call_tool(tool, arguments)
-        assert result.isError is True
+        assert result.is_error is True
 
     async def test_valid_bounds_still_succeed_over_the_wire(self, store: SqliteEngravaCore) -> None:
         # The guard is presentation-only for in-domain values.
         async with _client_for(store) as client:
             result = await client.call_tool("list_memory", {"limit": 2, "offset": 0})
-        assert result.isError is False
-        assert result.structuredContent is not None
-        assert result.structuredContent["limit"] == 2
+        assert result.is_error is False
+        assert result.structured_content is not None
+        assert result.structured_content["limit"] == 2
 
     async def test_negative_prompt_limit_is_rejected_before_the_body_runs(
         self,
@@ -324,7 +568,7 @@ class TestBoundErrorsAreCleanAtTheBoundary:
         # by the advertised annotation, and by the domain guard inside the body
         # for the paths where the protocol layer does not apply. The claim here
         # is the first of those — and the error alone cannot carry it, because
-        # the in-body guard also surfaces as an McpError mentioning "limit".
+        # the in-body guard also surfaces as an MCPError mentioning "limit".
         #
         # What tells them apart is whether the body ran at all. The store call
         # the body makes is recorded, so with the bound dropped from the
@@ -341,7 +585,7 @@ class TestBoundErrorsAreCleanAtTheBoundary:
         monkeypatch.setattr(server_module, "recent_thoughts_impl", _recording_recent_thoughts)
 
         async with _client_for(store) as client:
-            with pytest.raises(McpError) as excinfo:
+            with pytest.raises(MCPError) as excinfo:
                 await client.get_prompt("summarize_recent_memory", {"limit": "-1"})
             # Control: an in-range limit does reach the body through the same
             # recorder, so the emptiness asserted below is the rejection and not
@@ -362,9 +606,9 @@ class TestBoundErrorsAreCleanAtTheBoundary:
         # handler's unwrapped function bypasses pydantic's argument validation,
         # exactly as a caller reaching the body without that layer would.
         # Unguarded, this surfaces a raw OutOfRangeBoundError to the client.
-        server: FastMCP = FastMCP(SERVER_NAME)
+        server: MCPServer = MCPServer(SERVER_NAME)
         provider = StoreProvider()
-        provider.set(store)
+        provider.set(store, read_store=store)
         register_prompts(server, provider)
 
         registered = {prompt.name: prompt for prompt in server._prompt_manager.list_prompts()}
@@ -384,9 +628,9 @@ class TestBoundErrorsAreCleanAtTheBoundary:
         self, store: SqliteEngravaCore
     ) -> None:
         # The guard is presentation-only on the happy path.
-        server: FastMCP = FastMCP(SERVER_NAME)
+        server: MCPServer = MCPServer(SERVER_NAME)
         provider = StoreProvider()
-        provider.set(store)
+        provider.set(store, read_store=store)
         register_prompts(server, provider)
 
         registered = {prompt.name: prompt for prompt in server._prompt_manager.list_prompts()}
@@ -404,22 +648,23 @@ class TestBoundsAdvertisedInToolSchema:
         async with _client_for(store) as client:
             tools = {tool.name: tool for tool in (await client.list_tools()).tools}
 
-        list_memory_schema = tools["list_memory"].inputSchema["properties"]
+        list_memory_schema = tools["list_memory"].input_schema["properties"]
         assert list_memory_schema["limit"]["minimum"] == 1
         assert list_memory_schema["limit"]["maximum"] == MAX_PAGE_LIMIT
         assert list_memory_schema["offset"]["minimum"] == 0
+        assert list_memory_schema["offset"]["maximum"] == SQLITE_MAX_BOUND_INT
 
-        keywords_schema = tools["search_keywords"].inputSchema["properties"]
+        keywords_schema = tools["search_keywords"].input_schema["properties"]
         assert keywords_schema["top_k"]["minimum"] == 1
         assert keywords_schema["top_k"]["maximum"] == MAX_TOP_K
 
         # search_memory carries the same ranked-window bound as search_keywords.
-        memory_schema = tools["search_memory"].inputSchema["properties"]
+        memory_schema = tools["search_memory"].input_schema["properties"]
         assert memory_schema["top_k"]["minimum"] == 1
         assert memory_schema["top_k"]["maximum"] == MAX_TOP_K
 
         # Both ends of the edge-listing page size, not just the ceiling.
-        edges_schema = tools["list_edges"].inputSchema["properties"]
+        edges_schema = tools["list_edges"].input_schema["properties"]
         assert edges_schema["limit"]["minimum"] == 1
         assert edges_schema["limit"]["maximum"] == MAX_PAGE_LIMIT
 
@@ -432,12 +677,53 @@ class TestBoundsAdvertisedInToolSchema:
         async with _client_for(store) as client:
             tools = {tool.name: tool for tool in (await client.list_tools()).tools}
 
-        limit_schema = tools["query_memory"].inputSchema["properties"]["limit"]
+        limit_schema = tools["query_memory"].input_schema["properties"]["limit"]
         branches = limit_schema.get("anyOf", [limit_schema])
         bounded = [branch for branch in branches if "maximum" in branch]
         assert bounded, f"no bounded branch in the advertised schema: {limit_schema!r}"
         assert bounded[0]["minimum"] == 1
         assert bounded[0]["maximum"] == MAX_PAGE_LIMIT
+
+    async def test_schema_publishes_bounds_on_the_nullable_get_edges_limit(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # get_edges' limit is optional, like query_memory's, so its bounds may
+        # sit inside a nullable union rather than on the property itself.
+        async with _client_for(store) as client:
+            tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+
+        schema = tools["get_edges"].input_schema
+        limit_schema = schema["properties"]["limit"]
+        branches = limit_schema.get("anyOf", [limit_schema])
+        bounded = [branch for branch in branches if "maximum" in branch]
+        assert bounded, f"no bounded branch in the advertised schema: {limit_schema!r}"
+        assert bounded[0]["minimum"] == 1
+        assert bounded[0]["maximum"] == MAX_PAGE_LIMIT
+        # The bounded branch is really the integer one, not merely a branch
+        # that happens to carry numeric-looking "minimum"/"maximum" keys.
+        assert bounded[0]["type"] == "integer"
+        # And the argument stays optional: omitting it must not be rejected as
+        # a missing required field.
+        assert "limit" not in schema.get("required", [])
+
+    async def test_schema_publishes_bounds_on_the_nullable_cycle_filters(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # min_cycle / max_cycle are optional, like query_memory's limit, so
+        # their bounds may sit inside a nullable union rather than on the
+        # property itself. Assert both ends of SQLite's own bind range are
+        # advertised for each.
+        async with _client_for(store) as client:
+            tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+
+        properties = tools["list_memory"].input_schema["properties"]
+        for name in ("min_cycle", "max_cycle"):
+            field_schema = properties[name]
+            branches = field_schema.get("anyOf", [field_schema])
+            bounded = [branch for branch in branches if "maximum" in branch]
+            assert bounded, f"no bounded branch advertised for {name}: {field_schema!r}"
+            assert bounded[0]["minimum"] == SQLITE_MIN_BOUND_INT
+            assert bounded[0]["maximum"] == SQLITE_MAX_BOUND_INT
 
     async def test_prompt_argument_is_advertised(self, store: SqliteEngravaCore) -> None:
         # The prompt's limit crosses the wire, so a client can supply it and it
@@ -478,3 +764,101 @@ class TestQueryObjectBoundary:
         )
         listed = await list_edges_impl(store, limit=1)
         assert listed["count"] == 1
+
+
+class TestGetEdgesLimitReachesTheStoreOnlyWhenValid:
+    """``get_edges``'s ``limit`` is engrava's own SQL cap, not a fetch-all sliced here.
+
+    Each test spies on the store's own ``get_edges`` by recording the ``limit`` it was
+    called with (while still delegating to the real method, so the surrounding
+    assertions have real data to check). A guard that only *looks* like it bounds the
+    query — e.g. one that fetches everything and slices the response — would still pass
+    a plain "the result has k rows" check; recording what reaches the store instead is
+    deletion- and regression-sensitive to that.
+    """
+
+    def _spy(
+        self,
+        store: SqliteEngravaCore,
+        monkeypatch: pytest.MonkeyPatch,
+        calls: list[int | None],
+    ) -> None:
+        """Wrap ``store.get_edges`` to record every ``limit`` it is called with.
+
+        Args:
+            store: The store whose ``get_edges`` to wrap.
+            monkeypatch: Fixture used to install the wrapped method.
+            calls: List that receives the ``limit`` from every call.
+
+        """
+        real_get_edges = store.get_edges
+
+        async def _recording_get_edges(
+            thought_id: str,
+            *,
+            direction: str = "BOTH",
+            limit: int | None = None,
+        ) -> list[EdgeRecord]:
+            calls.append(limit)
+            return await real_get_edges(thought_id, direction=direction, limit=limit)
+
+        monkeypatch.setattr(store, "get_edges", _recording_get_edges)
+
+    async def test_out_of_range_limit_raises_and_never_reaches_the_store(
+        self, store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[int | None] = []
+        self._spy(store, monkeypatch, calls)
+
+        with pytest.raises(OutOfRangeBoundError):
+            await get_edges_impl(store, "thought-alpha", limit=0)
+        with pytest.raises(OutOfRangeBoundError):
+            await get_edges_impl(store, "thought-alpha", limit=MAX_PAGE_LIMIT + 1)
+
+        assert calls == []
+
+    async def test_valid_limit_is_forwarded_to_the_store(
+        self, store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[int | None] = []
+        self._spy(store, monkeypatch, calls)
+
+        await get_edges_impl(store, "thought-alpha", limit=3)
+
+        assert calls == [3]
+
+    async def test_omitted_limit_still_calls_the_store_exactly_once_with_none(
+        self, store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[int | None] = []
+        self._spy(store, monkeypatch, calls)
+
+        await get_edges_impl(store, "thought-alpha")
+
+        # Deletion-sensitive to a guard that stops calling the store at all
+        # when limit is omitted, not only to what value it is called with.
+        assert calls == [None]
+
+    async def test_control_limit_succeeds_and_rejected_limits_never_reach_the_store_over_the_wire(
+        self, store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[int | None] = []
+        self._spy(store, monkeypatch, calls)
+
+        async with _client_for(store) as client:
+            control = await client.call_tool(
+                "get_edges", {"thought_id": "thought-alpha", "limit": 1}
+            )
+            rejected_zero = await client.call_tool(
+                "get_edges", {"thought_id": "thought-alpha", "limit": 0}
+            )
+            rejected_over = await client.call_tool(
+                "get_edges",
+                {"thought_id": "thought-alpha", "limit": MAX_PAGE_LIMIT + 1},
+            )
+
+        assert control.is_error is False
+        assert rejected_zero.is_error is True
+        assert rejected_over.is_error is True
+        # Only the accepted control call ever reached the store.
+        assert calls == [1]

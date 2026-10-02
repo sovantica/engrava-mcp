@@ -12,7 +12,7 @@ updates:
       prefix: "chore"
       include: scope
     ignore:
-      # engrava is pinned to a deliberate one-way mirror range (engrava>=0.5,<0.6);
+      # engrava is pinned to a deliberate one-way mirror range (engrava>=0.7,<0.8);
       # the range is widened by hand only after the new engrava minor is tested.
       # Dependabot must not try to bump engrava out of that range.
       - dependency-name: "engrava"

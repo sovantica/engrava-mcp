@@ -17,11 +17,14 @@ API. It is the one way to run Engrava as a memory server; the `engrava` library
 itself ships no MCP code.
 
 ```bash
-uvx engrava-mcp        # run the server (no install step)
-# or
-pip install engrava-mcp
-engrava-mcp            # spawned by your MCP client over stdio
+uv tool install engrava-mcp   # recommended for daily use: a persistent install
+engrava-mcp                   # spawned by your MCP client over stdio
 ```
+
+`uvx engrava-mcp` runs it without an install step, and `pip install engrava-mcp`
+works too. `uvx` keeps its environment in a cache. When that cache is cold, the
+first start waits for the download; see [Optional providers](#optional-providers)
+for the `[local]` extra, where the download is largest.
 
 Installing `engrava-mcp` pulls in `engrava` transitively, so you also get the
 `import engrava` library in the same environment.
@@ -37,10 +40,11 @@ are independent.
 |---|---|
 | `0.5.x` | `>=0.5,<0.6` |
 | `0.6.x` | `>=0.6,<0.7` |
+| `0.7.x` | `>=0.7,<0.8` |
 
 The dependency range is the source of truth. Normal installs resolve a compatible
 `engrava` automatically; if you pin `engrava` yourself, keep it within that range. If no
-matching `engrava-mcp` exists yet for a newer `engrava` (e.g. a fresh `engrava 0.7`), that
+matching `engrava-mcp` exists yet for an `engrava` newer than the table's last row, that
 pairing is **not yet verified/supported** — not broken; stay on a supported pair until a
 matching `engrava-mcp` ships.
 
@@ -79,15 +83,24 @@ The server resolves its store from environment variables, in priority order:
 
 | Variable | Meaning |
 |---|---|
-| `ENGRAVA_MCP_CONFIG` | Path to an `engrava.yaml`. Built with the full configuration — embedding provider, vector backend, journal, TTL. **Recommended.** |
-| `ENGRAVA_DB_PATH` | Path to a bare SQLite database file. Zero-config quick-start; no embedding provider is configured, so semantic (vector) search is inert — full-text search, the graph, MindQL, and the audit trail still work. "Zero-config" means Engrava's default search policy, so `search_memory`'s `recency_now` is honoured on this route too — recency is scored against the timestamp you supply, under Engrava's default search weights. |
-| `ENGRAVA_MCP_READ_ONLY` | When set to `1` / `true` / `yes`, the write tools are not registered, so the server exposes a read-only surface. |
+| `ENGRAVA_MCP_CONFIG` | Path to an `engrava.yaml`. Built with the full configuration — embedding provider, vector backend, journal, TTL. The thought/edge journal is configured here: set `journal: enabled: true` to turn it on. **Recommended.** |
+| `ENGRAVA_DB_PATH` | Path to a bare SQLite database file. Use an absolute path: a relative one resolves against the server's working directory, which the client chooses. Zero-config quick-start; no embedding provider is configured, so semantic (vector) search is inert — full-text search, the graph, and MindQL still work. This route builds the store with no journal; use `ENGRAVA_MCP_CONFIG` for that. "Zero-config" means Engrava's default search policy, so `search_memory`'s `recency_now` is honoured on this route too — recency is scored against the timestamp you supply, under Engrava's default search weights. |
+| `ENGRAVA_MCP_READ_ONLY` | When set to `1` / `true` / `yes`, the write tools are not registered and no read makes a write of its own — including a deferred access-count update a store with access tracking on would otherwise buffer and flush on close. Every tool's `readOnlyHint` annotation is therefore accurate under this mode, on every configuration route. Read-only mode governs the tools, not how the database is opened. At startup the server still opens the file read-write, creates it if it is missing, and upgrades its schema to the one its Engrava version uses, so a database file the server cannot write cannot be served in this mode either. |
 
 **Recommended:** give the MCP server the same `engrava.yaml` your application
 uses. The `yaml` is the only place to declare an embedding provider (and its
 model / key), which the server needs to embed a *new query* at search time for
 semantic search. With only `ENGRAVA_DB_PATH` set, the server emits a startup
 warning that semantic search is inert and points you at `ENGRAVA_MCP_CONFIG`.
+
+At search time, the server embeds the query with the provider this `yaml`
+declares. Whether this server's writes embed anything is decided by the same
+`yaml`'s `embeddings.auto_embed`, which Engrava leaves off by default. With it
+off, a thought created through `store_thought` gets no embedding, so
+`search_memory`'s vector ranking cannot match it — its keyword ranking still
+can — and an `update_thought` leaves whatever embedding the thought already had
+as it was, not refreshed. With it on, creating a thought, or changing its
+`essence` or `content`, also calls the provider.
 
 ### Store-hook extensions need the config path
 
@@ -118,12 +131,16 @@ hooks:
 ### Example `engrava.yaml`
 
 ```yaml
-db_path: ./memory.db
+database:
+  path: /absolute/path/to/memory.db
 embeddings:
-  provider: openai            # or: ollama, sentence-transformer, huggingface
+  provider: openai-compatible # or: ollama, sentence-transformer, huggingface
   model: text-embedding-3-small
   api_key: ${OPENAI_API_KEY}
 ```
+
+A relative `database.path` resolves against the server process's working directory,
+which the MCP client chooses, not against the yaml's folder.
 
 ## Client setup
 
@@ -134,8 +151,7 @@ Point your MCP client at the server over stdio. For example, a typical
 {
   "mcpServers": {
     "engrava": {
-      "command": "uvx",
-      "args": ["engrava-mcp"],
+      "command": "engrava-mcp",
       "env": {
         "ENGRAVA_MCP_CONFIG": "/absolute/path/to/engrava.yaml"
       }
@@ -143,6 +159,14 @@ Point your MCP client at the server over stdio. For example, a typical
   }
 }
 ```
+
+A `${VAR}` value in the `engrava.yaml`, such as `${OPENAI_API_KEY}`, is read from the
+server's own environment, so add that variable to the same `env` block, unless the
+client is known to pass its own environment through.
+
+This assumes `uv tool install engrava-mcp`. If your client cannot find the
+command, give its absolute path; `uv tool dir --bin` prints the directory.
+Without an install, use `"command": "uvx", "args": ["engrava-mcp"]`.
 
 Use `ENGRAVA_DB_PATH` instead of `ENGRAVA_MCP_CONFIG` for the zero-config
 quick-start, and add `"ENGRAVA_MCP_READ_ONLY": "1"` for an app-writes /
@@ -158,6 +182,11 @@ python -m engrava_mcp.server # module run (server module directly)
 
 ## Optional providers
 
+For an MCP deployment, prefer an embedding provider that runs outside the
+server process: Ollama (`provider: ollama`) or an OpenAI-compatible endpoint
+(`provider: openai-compatible`). The default install already covers both, and
+the server then loads no embedding model itself.
+
 The default install supports the vector backend and HTTP-based embedding
 providers (OpenAI / Ollama) once configured in the `yaml`. Heavier providers are
 opt-in extras that mirror Engrava's own extras:
@@ -168,6 +197,12 @@ uvx --from "engrava-mcp[hf]"     engrava-mcp   # HuggingFace Inference API
 uvx --from "engrava-mcp[openai]" engrava-mcp   # OpenAI-compatible embeddings deps
 uvx --from "engrava-mcp[ollama]" engrava-mcp   # Ollama embeddings deps
 ```
+
+`[local]` runs the model inside the server process and installs PyTorch, which
+can add several gigabytes. A first start on a cold `uvx` cache waits for that
+download; later starts reuse the cache. `uv tool install "engrava-mcp[local]"`
+pays the download once, at install time. A model that is not already in the
+local model cache is downloaded when it is first loaded.
 
 ## The surface
 
@@ -180,10 +215,13 @@ uvx --from "engrava-mcp[ollama]" engrava-mcp   # Ollama embeddings deps
 - **Prompts (3):** `summarize_recent_memory`, `find_related`, `reflect_on_topic`.
 
 `query_memory` accepts only MindQL `FIND` queries; raw SQL and every other
-command are rejected.
+command are rejected. It returns at most 5000 rows. A `limit` argument replaces
+the query's own `LIMIT`; without one, a `LIMIT` outside 1–5000 is refused.
 
 `get_edges` traverses a thought's edges by direction (`IN` / `OUT` / `BOTH`);
-`list_edges` browses edges filtered by type, source, or metadata.
+with `limit`, at most that many edges, the highest-weight ones first, and
+without it, every edge. `list_edges` browses edges filtered by type, source,
+or metadata.
 
 `link_thoughts` accepts optional edge `metadata` (JSON fields that `list_edges`
 can filter on). `search_memory` accepts an optional `recency_now` (ISO-8601

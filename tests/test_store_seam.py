@@ -33,13 +33,16 @@ observable change and no black-box test can fail on it:
 ``journal_mode`` and ``synchronous`` have no such backstop: deleting either line
 changes the connection and fails these tests directly.
 
-The seam also carries the promise this module's docstring makes about *cleanup*:
-closing the ``ResolvedStore`` releases the underlying connection whichever path
-produced it.  ``TestConnectionRelease`` observes the release on the connection
-itself rather than the call that is supposed to perform it — closing the store
-object instead of the connection is a plausible refactor (a caller-supplied
-connection is not owned by the store, so ``store.close()`` is a documented
-no-op) and leaves every "``aclose`` was called" assertion green.
+The seam also carries this module's own description of *cleanup*: closing the
+``ResolvedStore`` on a clean close releases the underlying connection,
+whichever path produced it.  A close that instead hits the connection-close
+bound on a genuinely wedged worker is a different case entirely, covered by
+``tests/test_shutdown.py`` rather than by anything here, so nothing below
+speaks to it.  ``TestConnectionRelease`` observes the release on the
+connection itself rather than the call that is supposed to perform it —
+closing the store object instead of the connection is a plausible refactor (a
+caller-supplied connection is not owned by the store, so ``store.close()`` is
+a documented no-op) and leaves every "``aclose`` was called" assertion green.
 
 The same seam carries the **search policy** the bare-database launch runs under.
 A store built with no ``SearchConfig`` resolves its recency fusion weight to
@@ -244,7 +247,12 @@ class TestBareDatabasePragmas:
 
 
 class TestConnectionRelease:
-    """Closing the resolved store releases the connection it was built over."""
+    """A clean close of the resolved store releases the connection it was built over.
+
+    The close this test drives never hits the connection-close bound, so it says
+    nothing about the wedged-worker case -- that one is pinned in
+    ``tests/test_shutdown.py`` instead, where the bound is exercised directly.
+    """
 
     async def test_closing_the_resolved_store_releases_the_connection(
         self, monkeypatch: pytest.MonkeyPatch, bare_db_env: None
@@ -269,6 +277,42 @@ class TestConnectionRelease:
             await captured.connection.execute("PRAGMA foreign_keys;")
         with pytest.raises(Exception):
             await captured.resolved.store.count_thoughts()
+
+
+class TestBareStoreCloseOrder:
+    """The bare-path closer flushes the store before releasing its connection.
+
+    ``store.close()`` flushes any pending access-buffer writes but is a no-op on the
+    connection itself here: the manual constructor the bare path uses never marks a
+    store as owning its connection, so closing the connection afterwards remains the
+    closer's job. This pins the order directly: a regression back to closing only the
+    connection (the pre-fix closer) drops the ``"store"`` entry entirely, and a
+    regression that reorders the two would close the connection while a flush might
+    still want to write through it.
+    """
+
+    async def test_store_close_runs_before_the_connection_closes(
+        self, monkeypatch: pytest.MonkeyPatch, bare_db_env: None
+    ) -> None:
+        order: list[str] = []
+        real_store_close = SqliteEngravaCore.close
+        real_connection_close = aiosqlite.Connection.close
+
+        async def _tracking_store_close(self: SqliteEngravaCore) -> None:
+            order.append("store")
+            await real_store_close(self)
+
+        async def _tracking_connection_close(self: aiosqlite.Connection) -> None:
+            order.append("connection")
+            await real_connection_close(self)
+
+        monkeypatch.setattr(SqliteEngravaCore, "close", _tracking_store_close)
+        monkeypatch.setattr(aiosqlite.Connection, "close", _tracking_connection_close)
+
+        resolved = await resolve_store()
+        await resolved.aclose()
+
+        assert order == ["store", "connection"]
 
 
 class TestResolvedStoreBehaviour:

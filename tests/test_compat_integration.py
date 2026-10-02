@@ -37,8 +37,7 @@ from engrava import (
     SqliteEngravaCore,
     ThoughtType,
 )
-from mcp.server.fastmcp import FastMCP
-from mcp.shared.memory import create_connected_server_and_client_session as connect_client
+from mcp.server.mcpserver import MCPServer
 
 from engrava_mcp.server import (
     SERVER_NAME,
@@ -53,6 +52,7 @@ from engrava_mcp.server import (
     search_memory_impl,
     store_thought_impl,
 )
+from tests.inprocess_client import connect_client
 from tests.recency_corpus import (
     RECENCY_EXPECTED_ORDER,
     RECENCY_NOW,
@@ -64,7 +64,7 @@ from tests.recency_corpus import (
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-    from mcp import ClientSession
+    from mcp import Client
 
 #: The cycle MCP writes stamp: the origin, not the store's high-water mark.
 #: A literal rather than the server's own constant, so the expectation is
@@ -150,7 +150,7 @@ async def _raise_high_water(store: SqliteEngravaCore) -> None:
 
 
 @asynccontextmanager
-async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[ClientSession]:
+async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[Client]:
     """Open a connected client whose tools query the given store.
 
     Args:
@@ -158,13 +158,13 @@ async def _client_for(store: SqliteEngravaCore) -> AsyncIterator[ClientSession]:
 
     Yields:
         A connected client session wired to ``store`` through the real tool
-        boundary (so FastMCP's error wrapping and ``_tool_errors`` run).
+        boundary (so MCPServer's error wrapping and ``_tool_errors`` run).
 
     """
-    server: FastMCP = FastMCP(SERVER_NAME)
+    server: MCPServer = MCPServer(SERVER_NAME)
     provider = StoreProvider()
-    provider.set(store)
-    register_tools(server, provider)
+    provider.set(store, read_store=store)
+    register_tools(server, provider, read_only=False)
     async with connect_client(server) as client:
         yield client
 
@@ -310,9 +310,9 @@ class TestFtsNormalizationRegression:
         # syntactically-odd-but-handled query surfaces no ToolError.
         async with _client_for(store) as client:
             result = await client.call_tool("search_keywords", {"query": "foo AND"})
-        assert result.isError is False
-        assert result.structuredContent is not None
-        assert isinstance(result.structuredContent["results"], list)
+        assert result.is_error is False
+        assert result.structured_content is not None
+        assert isinstance(result.structured_content["results"], list)
 
     async def test_risky_fts_query_through_tool_errors_guard(
         self, store: SqliteEngravaCore
@@ -326,5 +326,5 @@ class TestFtsNormalizationRegression:
         # D4 lock: the public stats surface exposes exactly these metric groups
         # and never the concrete store's fts_match_failure_count diagnostic.
         stats = await memory_stats_impl(store)
-        assert set(stats["metrics"]) == {"thoughts", "edges", "storage_total_bytes"}
+        assert set(stats["metrics"]) == {"thoughts", "edges", "storage_total_bytes", "measured"}
         assert "fts_match_failure_count" not in json.dumps(stats)

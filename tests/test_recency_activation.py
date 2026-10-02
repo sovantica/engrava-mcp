@@ -56,11 +56,11 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from mcp.server.fastmcp import FastMCP
-from mcp.shared.memory import create_connected_server_and_client_session as connect_client
+from mcp.server.mcpserver import MCPServer
 
 from engrava_mcp.config import CONFIG_ENV_VAR, DB_PATH_ENV_VAR, resolve_store
 from engrava_mcp.server import SERVER_NAME, StoreProvider, register_tools
+from tests.inprocess_client import connect_client
 from tests.recency_corpus import (
     RECENCY_EXPECTED_ORDER,
     RECENCY_NOW,
@@ -73,7 +73,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
     from pathlib import Path
 
-    from mcp import ClientSession
+    from mcp import Client
 
 #: The backend name engrava reports for the lexical arm.  Present on every
 #: launch here, so it serves as the positive control that the search ran at all.
@@ -127,7 +127,7 @@ def launch_route(
 
 
 @asynccontextmanager
-async def _client_on_the_resolved_store() -> AsyncIterator[ClientSession]:
+async def _client_on_the_resolved_store() -> AsyncIterator[Client]:
     """Open a client session over a freshly resolved, seeded store.
 
     Yields:
@@ -138,17 +138,17 @@ async def _client_on_the_resolved_store() -> AsyncIterator[ClientSession]:
     resolved = await resolve_store()
     try:
         await seed_recency_corpus(resolved.store)
-        server: FastMCP = FastMCP(SERVER_NAME)
+        server: MCPServer = MCPServer(SERVER_NAME)
         provider = StoreProvider()
-        provider.set(resolved.store)
-        register_tools(server, provider)
+        provider.set(resolved.store, read_store=resolved.store)
+        register_tools(server, provider, read_only=False)
         async with connect_client(server) as client:
             yield client
     finally:
         await resolved.aclose()
 
 
-async def _search(client: ClientSession, **arguments: Any) -> dict[str, Any]:  # noqa: ANN401
+async def _search(client: Client, **arguments: Any) -> dict[str, Any]:  # noqa: ANN401
     """Call ``search_memory`` over the wire and return its structured payload.
 
     Args:
@@ -160,9 +160,9 @@ async def _search(client: ClientSession, **arguments: Any) -> dict[str, Any]:  #
 
     """
     result = await client.call_tool("search_memory", {"query_text": RECENCY_QUERY, **arguments})
-    assert result.isError is False
-    assert result.structuredContent is not None
-    return dict(result.structuredContent)
+    assert result.is_error is False
+    assert result.structured_content is not None
+    return dict(result.structured_content)
 
 
 class TestRecencyIsReportedOnlyWhenTheTimestampIsSupplied:

@@ -12,6 +12,7 @@ that independence directly.
 from __future__ import annotations
 
 import json
+import urllib.parse
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -22,11 +23,11 @@ from engrava import (
     SqliteEngravaCore,
     ThoughtType,
 )
-from mcp.shared.memory import create_connected_server_and_client_session as connect_client
 
 from engrava_mcp import build_server
 from engrava_mcp.config import CONFIG_ENV_VAR, DB_PATH_ENV_VAR
 from engrava_mcp.server import READ_ONLY_ENV_VAR
+from tests.inprocess_client import connect_client
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -83,6 +84,49 @@ async def _seed_two_thoughts(path: Path) -> None:
     await connection.close()
 
 
+#: Ids and essences used to pin percent-decoding at the resource
+#: boundary. Essences differ per id, so a resource handler that resolves
+#: the wrong thought is caught by the essence assertion, not just by the
+#: id it already knew to ask for.
+_RESERVED_CHARACTER_THOUGHTS: tuple[tuple[str, str], ...] = (
+    ("a/b", "Slash-bearing id"),
+    ("a%2Fb", "Literal percent-two-F id"),
+    ("x y?z", "Space and query-mark id"),
+    ("plain-id", "Plain control id"),
+)
+
+
+async def _seed_reserved_character_thoughts(path: Path) -> None:
+    """Create a database seeded with :data:`_RESERVED_CHARACTER_THOUGHTS`.
+
+    Covers a literal slash, a literal percent-encoded slash, a space plus
+    a question mark, and a plain control id, each with its own essence.
+
+    Args:
+        path: Filesystem path for the new database.
+
+    """
+    connection = await aiosqlite.connect(str(path))
+    connection.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(connection)
+    await store.ensure_schema()
+    for cycle, (thought_id, essence) in enumerate(_RESERVED_CHARACTER_THOUGHTS, start=1):
+        await store.create_thought(
+            CoreThoughtRecord(
+                thought_id=thought_id,
+                thought_type=ThoughtType.BELIEF,
+                essence=essence,
+                content="Seeded to pin resource-URI percent-decoding.",
+                priority=Priority.P2,
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                created_cycle=cycle,
+                updated_cycle=cycle,
+                source="test",
+            )
+        )
+    await connection.close()
+
+
 def _decode_single(result: object) -> dict[str, object]:
     """Parse the single JSON text payload of a ``read_resource`` result.
 
@@ -97,7 +141,7 @@ def _decode_single(result: object) -> dict[str, object]:
     contents = result.contents  # type: ignore[attr-defined]
     assert len(contents) == 1
     block = contents[0]
-    assert block.mimeType == "application/json"
+    assert block.mime_type == "application/json"
     decoded = json.loads(block.text)
     assert isinstance(decoded, dict)
     return decoded
@@ -134,7 +178,7 @@ class TestResourceListing:
         async with connect_client(server) as client:
             listed = await client.list_resource_templates()
 
-        templates = {template.uriTemplate for template in listed.resourceTemplates}
+        templates = {template.uri_template for template in listed.resource_templates}
         assert THOUGHT_TEMPLATE_URI in templates
 
 
@@ -220,11 +264,76 @@ class TestResourceReads:
             tool_result = await client.call_tool("memory_stats", {})
 
         resource_payload = _decode_single(resource_result)
-        assert tool_result.structuredContent is not None
+        assert tool_result.structured_content is not None
         # The resource and the memory_stats tool share memory_stats_impl,
         # so they must agree field-for-field (no duplicate stats logic).
-        assert resource_payload == tool_result.structuredContent
+        assert resource_payload == tool_result.structured_content
         assert resource_payload["thought_count"] == 2
+
+
+class TestThoughtResourceUriDecoding:
+    """Pin that a thought id round-trips through its resource URI.
+
+    The resource boundary decodes the id exactly once. These tests read
+    through the real resource path with ids that carry reserved URI
+    characters, so a regression in encoding or decoding shows up as the
+    wrong thought (or none) coming back, not just a raised error.
+    """
+
+    async def test_quoted_ids_round_trip_to_the_right_thought(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "reserved.db"
+        await _seed_reserved_character_thoughts(db_path)
+        monkeypatch.setenv(DB_PATH_ENV_VAR, str(db_path))
+        monkeypatch.delenv(CONFIG_ENV_VAR, raising=False)
+
+        server = build_server()
+        async with connect_client(server) as client:
+            for thought_id, essence in _RESERVED_CHARACTER_THOUGHTS:
+                # Built the way a real client would build it: percent-encode
+                # the whole id, then let the server decode it once.
+                quoted = urllib.parse.quote(thought_id, safe="")
+                result = await client.read_resource(f"engrava://thought/{quoted}")
+                payload = _decode_single(result)
+                assert payload["found"] is True
+                thought = payload["thought"]
+                assert isinstance(thought, dict)
+                assert thought["thought_id"] == thought_id
+                assert thought["essence"] == essence
+
+    async def test_percent_collision_ids_are_not_mixed_up(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "collision.db"
+        await _seed_reserved_character_thoughts(db_path)
+        monkeypatch.setenv(DB_PATH_ENV_VAR, str(db_path))
+        monkeypatch.delenv(CONFIG_ENV_VAR, raising=False)
+
+        server = build_server()
+        # Hand-written, so the exact bytes that trigger the collision are
+        # pinned in the test source, not only produced by quote().
+        async with connect_client(server) as client:
+            slash_result = await client.read_resource("engrava://thought/a%2Fb")
+            literal_percent_result = await client.read_resource("engrava://thought/a%252Fb")
+
+        slash_payload = _decode_single(slash_result)
+        assert slash_payload["found"] is True
+        slash_thought = slash_payload["thought"]
+        assert isinstance(slash_thought, dict)
+        assert slash_thought["thought_id"] == "a/b"
+        assert slash_thought["essence"] == "Slash-bearing id"
+
+        literal_percent_payload = _decode_single(literal_percent_result)
+        assert literal_percent_payload["found"] is True
+        literal_percent_thought = literal_percent_payload["thought"]
+        assert isinstance(literal_percent_thought, dict)
+        assert literal_percent_thought["thought_id"] == "a%2Fb"
+        assert literal_percent_thought["essence"] == "Literal percent-two-F id"
 
 
 class TestResourcesInReadOnlyMode:
@@ -247,7 +356,7 @@ class TestResourcesInReadOnlyMode:
         # Read-only mode hides the write tools but must not hide resources.
         assert {str(resource.uri) for resource in static.resources} == STATIC_RESOURCE_URIS
         assert THOUGHT_TEMPLATE_URI in {
-            template.uriTemplate for template in templates.resourceTemplates
+            template.uri_template for template in templates.resource_templates
         }
 
     async def test_resources_readable_in_read_only_mode(

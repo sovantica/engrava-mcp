@@ -43,7 +43,7 @@ dependencies = [
     "anyio>=4.9",
     # Used directly by config.py (connect, Connection, Row); declare instead of relying on
     # engrava transitively.
-    "aiosqlite>=0.20.0",
+    "aiosqlite>=0.22.1",
     # Used directly by server.py (Field, ValidationError); declare instead of relying on
     # mcp / engrava transitively.
     "pydantic>=2.12",

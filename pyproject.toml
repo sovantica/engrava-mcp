@@ -65,7 +65,7 @@ ollama = ["engrava[embeddings-ollama]>=0.7,<0.8"]
 hf = ["engrava[embeddings-hf]>=0.7,<0.8"]
 local = ["engrava[embeddings-local]>=0.7,<0.8"]
 dev = [
-    "pytest>=8.0.0",
+    "pytest>=9.1.1",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=5.0.0",
     "mypy>=1.11.0",
@@ -150,7 +150,7 @@ addopts = "--strict-markers -m 'not external'"
 # `pytest -m external` still runs them on purpose.
 # Set alongside the addopts flag, not instead of it. Measured 2026-09-01 in isolated venvs
 # on one unregistered marker: pytest 8.4.2 honours the flag and ignores this key, 9.0.3
-# does the reverse, 9.1.1 honours both. This project's floor is pytest>=8.0.0, so neither
+# does the reverse, 9.1.1 honours both. This project's floor is pytest>=9.1.1, so neither
 # setting alone enforces across the range it admits.
 strict_markers = true
 markers = [

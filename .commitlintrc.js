@@ -54,6 +54,7 @@ module.exports = {
         "config",
         "docs",
         "deps",
+        "deps-dev",
         "release",
         "ci",
         "build",

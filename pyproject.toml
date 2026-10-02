@@ -68,7 +68,7 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=5.0.0",
-    "mypy>=1.11.0",
+    "mypy>=2.3.1",
     # Used directly by the pyproject-parsing tests; declare instead of relying on pytest
     # transitively.
     "packaging>=22",

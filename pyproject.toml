@@ -40,7 +40,7 @@ dependencies = [
     # transitively constrains pydantic>=2.12,<3.
     "mcp>=2.2,<3",
     # Used directly by server.py/config.py; declare instead of relying on mcp transitively.
-    "anyio>=4.9",
+    "anyio>=4.15.1",
     # Used directly by config.py (connect, Connection, Row); declare instead of relying on
     # engrava transitively.
     "aiosqlite>=0.20.0",
